@@ -1,0 +1,401 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#0f1115">
+<title>NaivePanel</title>
+<style>
+  :root { --bg:#0f1115; --fg:#e6e6e6; --mut:#9aa; --acc:#5dd2a4; --err:#ff7070; --card:#181b22; }
+  html { color-scheme: dark; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;
+         background:var(--bg); color:var(--fg); }
+  header { padding:14px 18px; border-bottom:1px solid #2a2f38; display:flex; gap:16px; align-items:center; }
+  header h1 { font-size:16px; margin:0; }
+  #status { color:var(--mut); margin-left:auto; }
+  .on { color:var(--acc); } .off { color:var(--err); }
+  main { display:grid; grid-template-columns: 280px 1fr; gap:16px; padding:16px; }
+  @media (max-width:800px) { main { grid-template-columns: 1fr; } }
+  .card { background:var(--card); border:1px solid #2a2f38; border-radius:8px; padding:14px; }
+  .card h2 { margin:0 0 10px; font-size:13px; text-transform:uppercase; letter-spacing:.08em; color:var(--mut); }
+  ul.presets { list-style:none; padding:0; margin:0; }
+  ul.presets li { border:1px solid #2a2f38; border-radius:6px; margin-bottom:6px;
+                  display:flex; flex-wrap:wrap; align-items:center; }
+  ul.presets li:hover { border-color:var(--acc); }
+  ul.presets li.selected { border-color:#57606e; background:rgba(255,255,255,.04); }
+  /* active (запущенный) важнее selected — его зелёная рамка переопределяет */
+  ul.presets li.active { border-color:var(--acc); background:rgba(93,210,164,.07); }
+  ul.presets .sel { flex:1 1 auto; min-width:0; display:flex; align-items:center; gap:6px 8px;
+                    padding:8px 4px 8px 10px; background:none; border:none; color:inherit;
+                    font:inherit; text-align:left; cursor:pointer; border-radius:6px; }
+  ul.presets .sel:hover { background:rgba(255,255,255,.05); }
+  ul.presets .name { font-weight:600; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  ul.presets .proxy { flex-basis:100%; color:var(--mut); font-size:12px; padding:0 10px 8px;
+                      overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  ul.presets .badge { font-size:11px; padding:2px 6px; border-radius:10px;
+                      background:rgba(93,210,164,.18); color:var(--acc); white-space:nowrap; }
+  ul.presets .badge.listen { background:rgba(154,170,170,.18); color:var(--mut); }
+  ul.presets .acts { margin-left:auto; display:flex; gap:4px; padding-right:6px; }
+  ul.presets .act { font-size:12px; color:var(--acc); background:none; border:none; cursor:pointer;
+                    padding:4px 6px; border-radius:4px; }
+  ul.presets .del { background:none; border:none; color:var(--err); cursor:pointer;
+                    padding:4px 6px; border-radius:4px; }
+  ul.presets .act:hover, ul.presets .del:hover { background:rgba(255,255,255,.08); }
+  button { background:var(--acc); color:#0f1115; border:none; border-radius:6px; padding:7px 12px; cursor:pointer; font-weight:600; }
+  button:hover:not(:disabled) { filter:brightness(1.15); }
+  button.ghost { background:transparent; color:var(--fg); border:1px solid #2a2f38; }
+  button.ghost:hover:not(:disabled) { border-color:var(--acc); }
+  button.danger { background:var(--err); color:#0f1115; }
+  button.wide { width:100%; }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  button:focus-visible, input:focus-visible, textarea:focus-visible, summary:focus-visible {
+    outline:2px solid var(--acc); outline-offset:1px; }
+  label { display:block; font-size:12px; color:var(--mut); margin-top:10px; }
+  input,textarea { width:100%; padding:8px 10px; background:#0f1115; color:var(--fg);
+                   border:1px solid #2a2f38; border-radius:6px; font:13px/1.4 ui-monospace,Menlo,monospace; }
+  textarea { min-height:120px; resize:vertical; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; margin-top:12px; }
+  .actions { display:flex; gap:8px; flex-wrap:wrap; margin-top:14px; }
+  pre.log { background:#000; color:#bfe; padding:10px; border-radius:6px;
+            max-height:260px; overflow:auto; font:12px/1.5 ui-monospace,Menlo,monospace; white-space:pre-wrap; }
+  .msg { padding:8px 10px; border-radius:6px; margin-top:10px; font-size:13px; display:none; }
+  .msg.ok { background:rgba(93,210,164,.12); color:var(--acc); display:block; }
+  .msg.err { background:rgba(255,112,112,.12); color:var(--err); display:block; }
+</style>
+</head>
+<body>
+<header>
+  <h1>NaivePanel</h1>
+  <span id="status" aria-live="polite">…</span>
+</header>
+<main>
+  <section class="card">
+    <h2>Сервис</h2>
+    <div class="actions">
+      <button onclick="svc('start')">Запуск</button>
+      <button class="ghost" onclick="svc('stop')">Стоп</button>
+      <button class="ghost" onclick="svc('restart')">Рестарт</button>
+    </div>
+    <h2 style="margin-top:18px">Пресеты</h2>
+    <ul class="presets" id="presets"></ul>
+    <div class="actions" style="margin-top:10px">
+      <button class="ghost" onclick="newPreset()">+ Новый</button>
+    </div>
+    <h2 style="margin-top:18px">Панель</h2>
+    <div class="actions" style="margin-top:10px">
+      <button class="ghost wide" onclick="panelRestart()" title="Перезапуск веб-панели (после обновления файлов)">Перезапуск</button>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2 id="editorTitle">Редактор</h2>
+    <form id="editor" style="display:none" onsubmit="save(event)">
+      <label for="f_name">Имя пресета (a-z 0-9 _ - .)</label>
+      <input id="f_name" pattern="[a-zA-Z0-9_\-.]{1,64}" autocomplete="off" spellcheck="false">
+
+      <label for="f_listen">Listen — один или несколько адресов</label>
+      <textarea id="f_listen" rows="2" placeholder="127.0.0.1:1080&#10;http://127.0.0.1:8080" style="min-height:48px"></textarea>
+      <div style="font-size:11px;color:var(--mut);margin-top:4px">
+        По одному на строку или через запятую. Без схемы добавляется
+        <code style="color:var(--acc)">socks://</code>;
+        <code style="color:var(--acc)">http://</code> /
+        <code style="color:var(--acc)">quic://</code> сохраняются как есть.
+        2+ адресов → массив в JSON.
+      </div>
+
+      <label for="f_upstream">Upstream URL (https://host или полный proxy URL)</label>
+      <input id="f_upstream" placeholder="https://proxy.example.com" autocomplete="off" spellcheck="false">
+
+      <label for="f_username">Username (basic_auth)</label>
+      <input id="f_username" autocomplete="off" spellcheck="false">
+
+      <label for="f_password">Password (basic_auth)</label>
+      <input id="f_password" type="password" autocomplete="off">
+
+      <details>
+        <summary style="cursor:pointer;color:var(--mut);margin-top:10px">Дополнительно</summary>
+        <label for="f_log">log (путь к лог-файлу)</label>
+        <input id="f_log" placeholder="/opt/var/log/naiveproxy.log" autocomplete="off" spellcheck="false">
+
+        <label for="f_host_resolver_rules">host-resolver-rules</label>
+        <input id="f_host_resolver_rules" placeholder="MAP proxy.example.com 1.2.3.4" autocomplete="off" spellcheck="false">
+
+        <label for="f_extra_headers">extra-headers (одна строка, \r\n между)</label>
+        <textarea id="f_extra_headers"></textarea>
+
+        <label for="f_insecure_concurrency">insecure-concurrency (1..4)</label>
+        <input id="f_insecure_concurrency" type="number" min="1" max="4" inputmode="numeric">
+      </details>
+
+      <div class="row">
+        <button type="submit" id="btnSave">Сохранить</button>
+        <button type="button" class="ghost" onclick="activate()">Сделать активным</button>
+        <button type="button" class="danger" onclick="del()">Удалить</button>
+      </div>
+    </form>
+    <div id="msg" class="msg" aria-live="polite"></div>
+
+    <h2 style="margin-top:18px">Лог</h2>
+    <pre class="log" id="log">…</pre>
+    <div class="actions"><button class="ghost" onclick="loadLog()">Обновить лог</button></div>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let current = null; // выбранный пресет (имя) или null
+let dirty = false;  // есть несохранённые правки в редакторе
+
+async function jget(url, tries = 2) {
+  // GET идемпотентен: при сетевом сбое (не HTTP-ошибке) — одна повторная
+  // попытка через 800мс. Сглаживает transient-гонки сразу после рестарта панели.
+  for (let i = 0; ; i++) {
+    let r;
+    try { r = await fetch(url); }
+    catch (e) {
+      if (i + 1 >= tries) throw e;
+      await new Promise(res => setTimeout(res, 800));
+      continue;
+    }
+    return handle(r);
+  }
+}
+async function jpost(url, body) {
+  const r = await fetch(url, {method:'POST',
+    headers: body ? {'Content-Type':'application/json'} : {},
+    body: body ? JSON.stringify(body) : null});
+  return handle(r);
+}
+async function jput(url, body) {
+  const r = await fetch(url, {method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+  return handle(r);
+}
+async function jdel(url) { const r = await fetch(url, {method:'DELETE'}); return handle(r); }
+
+async function handle(r) {
+  const txt = await r.text();
+  let data; try { data = JSON.parse(txt); } catch { data = {raw:txt}; }
+  if (!r.ok) throw new Error(data.description || data.message || (data.raw || ('HTTP '+r.status)));
+  return data;
+}
+
+function flash(msg, ok) {
+  const m = $('msg'); m.textContent = msg;
+  // Пустое сообщение — прячем плашку (иначе висит пустой цветной баннер).
+  m.className = msg ? 'msg ' + (ok ? 'ok' : 'err') : 'msg';
+}
+
+function setHash(name) {
+  history.replaceState(null, '', name ? '#preset='+encodeURIComponent(name) : location.pathname);
+}
+
+function maybeDiscard() {
+  return !dirty || confirm('Есть несохранённые изменения. Отбросить?');
+}
+
+async function refreshAll() {
+  try {
+    const [st, ps] = await Promise.all([jget('/api/status'), jget('/api/configs')]);
+    $('status').innerHTML = st.active
+      ? '<span class="on">● работает</span> · пресет: <b>'+escapeHtml(st.current||'?')+'</b>'
+      : '<span class="off">● остановлен</span>' + (st.current ? ' · пресет: '+escapeHtml(st.current) : '');
+    renderPresets(ps);
+    loadLog();
+  } catch (e) { flash(e.message, false); }
+}
+
+let lastPresets = []; // кэш для перерисовки при смене selected без лишнего запроса
+
+function renderPresets(presets) {
+  lastPresets = presets;
+  const ul = $('presets'); ul.innerHTML = '';
+  if (!presets.length) { ul.innerHTML = '<li style="color:var(--mut);border:none;padding:8px 10px">нет пресетов</li>'; return; }
+  for (const p of presets) {
+    const li = document.createElement('li');
+    li.className = (p.active ? 'active' : '') + (p.name === current ? ' selected' : '');
+    li.innerHTML = '<button class="sel" '+(p.name === current ? 'aria-current="true" ' : '')
+      + 'onclick="selectPreset(decodeURIComponent(\''+encodeURIComponent(p.name)+'\'))">'
+      + '<span class="name">'+escapeHtml(p.name)+'</span>'
+      + (p.active ? '<span class="badge">активен</span>' : '')
+      + (p.listen_count > 1 ? '<span class="badge listen" title="слушает '+p.listen_count+' адреса(ов)">×'+p.listen_count+'</span>' : '')
+      + '</button>'
+      + '<span class="acts">'
+      + (!p.active ? '<button class="act" aria-label="Активировать '+escapeHtml(p.name)+'" onclick="event.stopPropagation();activate(decodeURIComponent(\''+encodeURIComponent(p.name)+'\'))">→</button>' : '')
+      + '<button class="del" aria-label="Удалить '+escapeHtml(p.name)+'" onclick="event.stopPropagation();del(decodeURIComponent(\''+encodeURIComponent(p.name)+'\'))">✕</button>'
+      + '</span>'
+      + '<span class="proxy">'+escapeHtml(p.proxy.replace(/:\/\/[^@]+@/,'://***@'))+'</span>';
+    ul.appendChild(li);
+  }
+}
+
+function escapeHtml(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+async function selectPreset(name) {
+  if (name !== current && !maybeDiscard()) return;
+  current = name;
+  try {
+    const cfg = await jget('/api/configs/'+encodeURIComponent(name));
+    const listen = Array.isArray(cfg.listen) ? cfg.listen.join('\n') : (cfg.listen || '');
+    const proxy  = Array.isArray(cfg.proxy) ? cfg.proxy[0] : (cfg.proxy || '');
+    $('editorTitle').textContent = 'Редактор — '+name;
+    $('editor').style.display = 'block';
+    $('f_name').value = name;
+    $('f_name').disabled = true;
+    $('f_listen').value = listen.replace(/^socks:\/\//gm, '');
+    const m = proxy.match(/^https?:\/\/([^:@/]+):([^@]+)@(.+)$/);
+    $('f_upstream').value = m ? m[3] : proxy;
+    $('f_username').value = m ? m[1] : '';
+    $('f_password').value = m ? m[2] : '';
+    $('f_log').value = cfg.log || '';
+    $('f_host_resolver_rules').value = cfg['host-resolver-rules'] || '';
+    $('f_extra_headers').value = cfg['extra-headers'] || '';
+    $('f_insecure_concurrency').value = cfg['insecure-concurrency'] || '';
+    dirty = false;
+    setHash(name);
+    renderPresets(lastPresets); // подсветить выбранный
+    flash('', true);
+  } catch (e) { flash(e.message, false); }
+}
+
+function newPreset() {
+  if (!maybeDiscard()) return;
+  current = null;
+  $('editorTitle').textContent = 'Редактор — новый';
+  $('editor').style.display = 'block';
+  $('f_name').disabled = false;
+  ['f_name','f_listen','f_upstream','f_username','f_password','f_log','f_host_resolver_rules','f_extra_headers','f_insecure_concurrency']
+    .forEach(id => $(id).value = '');
+  dirty = false;
+  setHash(null);
+  renderPresets(lastPresets); // снять подсветку выбора
+  $('f_name').focus();
+}
+
+async function save(ev) {
+  if (ev) ev.preventDefault();
+  const btn = $('btnSave');
+  const payload = formPayload();
+  btn.disabled = true; btn.textContent = 'Сохранение…';
+  try {
+    if (current) {
+      await jput('/api/configs/'+encodeURIComponent(current), payload);
+      flash('Сохранено: '+current, true);
+    } else {
+      await jpost('/api/configs', payload);
+      current = payload.name;
+      $('f_name').disabled = true;
+      setHash(current);
+      flash('Создан: '+current, true);
+    }
+    dirty = false;
+    await refreshAll();
+  } catch (e) { flash(e.message, false); }
+  finally { btn.disabled = false; btn.textContent = 'Сохранить'; }
+}
+
+function formPayload() {
+  return {
+    name: $('f_name').value.trim(),
+    listen: $('f_listen').value.split(/[\n,]+/).map(s => s.trim()).filter(Boolean),
+    upstream: $('f_upstream').value.trim(),
+    username: $('f_username').value,
+    password: $('f_password').value,
+    log: $('f_log').value.trim(),
+    host_resolver_rules: $('f_host_resolver_rules').value.trim(),
+    extra_headers: $('f_extra_headers').value,
+    insecure_concurrency: $('f_insecure_concurrency').value.trim(),
+  };
+}
+
+async function activate(name) {
+  const n = name || current;
+  if (!n) return;
+  try {
+    await jpost('/api/configs/'+encodeURIComponent(n)+'/activate', null);
+    flash('Активирован: '+n, true);
+    await refreshAll();
+  } catch (e) { flash(e.message, false); }
+}
+
+async function del(name) {
+  const n = name || current;
+  if (!n) return;
+  if (!confirm('Удалить пресет '+n+'?')) return;
+  try {
+    await jdel('/api/configs/'+encodeURIComponent(n));
+    if (current === n) { current = null; dirty = false; $('editor').style.display='none'; setHash(null); }
+    flash('Удалён: '+n, true);
+    await refreshAll();
+  } catch (e) { flash(e.message, false); }
+}
+
+const SVC_VERBS = {start:'запущен', stop:'остановлен', restart:'перезапущен'};
+async function svc(action) {
+  try { await jpost('/api/service/'+action, null); flash('Сервис '+(SVC_VERBS[action]||action), true); await refreshAll(); }
+  catch (e) { flash(e.message, false); }
+}
+
+async function panelRestart() {
+  if (!confirm('Перезапустить саму панель? Страница перезагрузится, когда сервер поднимется.')) return;
+  try {
+    const r = await fetch('/api/panel/restart', {method:'POST'});
+    if (!(r.ok || r.status === 202)) { flash(await r.text(), false); return; }
+  } catch (e) {
+    flash('Не удалось отправить команду: '+e.message, false); return;
+  }
+  flash('Панель перезапускается…', true);
+  // Ждём перехода «сервер упал → поднялся» (а не фиксированную паузу),
+  // затем перезагружаем страницу, чтобы подхватить новые HTML/JS.
+  let wentDown = false;
+  const deadline = Date.now() + 30000;
+  while (Date.now() < deadline) {
+    await new Promise(res => setTimeout(res, 700));
+    let up = false;
+    try { up = (await fetch('/api/status', {cache:'no-store'})).ok; }
+    catch (e) { /* сервер ещё лежит */ }
+    if (!up) wentDown = true;
+    else if (wentDown) { location.reload(); return; }
+  }
+  flash('Сервер не поднялся за 30с — обновите страницу вручную', false);
+}
+
+let lastLog = null;   // кэш — не трогаем DOM, если контент не изменился
+let logStuck = true;  // «прилип» к низу лога — автоскролл только когда true
+
+async function loadLog() {
+  const pre = $('log');
+  let content;
+  try {
+    const r = await jget('/api/logs?lines=100');
+    content = r.content || '(пусто)';
+  } catch (e) {
+    content = 'log error: '+e.message;
+  }
+  if (content !== lastLog) {
+    lastLog = content;
+    pre.textContent = content;
+  }
+  if (logStuck) pre.scrollTop = pre.scrollHeight;
+}
+
+$('editor').addEventListener('input', () => { dirty = true; });
+window.addEventListener('beforeunload', (e) => { if (dirty) { e.preventDefault(); e.returnValue = ''; } });
+
+// Следим за «прилипанием»: пользователь у самого низа → автоскролл включён,
+// проскроллил вверх читать → выключен, пока не вернётся вниз.
+$('log').addEventListener('scroll', () => {
+  const pre = $('log');
+  logStuck = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 20;
+});
+
+// Автообновление лога: раз в 3с, только на видимой вкладке.
+setInterval(() => { if (!document.hidden) loadLog(); }, 3000);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) loadLog(); });
+
+refreshAll();
+const hashMatch = location.hash.match(/^#preset=(.+)$/);
+if (hashMatch) selectPreset(decodeURIComponent(hashMatch[1]));
+</script>
+</body>
+</html>

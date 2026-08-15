@@ -1,0 +1,16 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Python syntax (ast.parse)
+        run: python3 -c "import ast; ast.parse(open('naivepanel.py').read())"
+      - name: Shell syntax (sh -n)
+        run: sh -n S99naiveproxy && sh -n S99naivepanel && sh -n install.sh

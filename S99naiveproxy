@@ -1,0 +1,105 @@
+#!/bin/sh
+# /opt/etc/init.d/S99naiveproxy
+# Init-скрипт для клиента NaiveProxy на Entware (Keenetic).
+#
+# Ожидает:
+#   /opt/etc/naiveproxy/config.json   — активная конфигурация (создаётся NaivePanel)
+#   /opt/bin/naive                    — бинарник из пакета naive-proxy в Entware
+#   /opt/var/log/naiveproxy.log       — лог
+#   /opt/var/run/naiveproxy.pid       — pid
+#
+# Команды: start | stop | restart | status | reload
+
+ENABLED=yes
+PROG=naive
+DAEMON=/opt/bin/$PROG
+DAEMON_OPTS=/opt/etc/naiveproxy/config.json
+PIDFILE=/opt/var/run/naiveproxy.pid
+LOGFILE=/opt/var/log/naiveproxy.log
+
+[ -f /opt/etc/naiveproxy/config.json ] || DAEMON_OPTS=
+
+# --- helpers ---------------------------------------------------------------
+log()  { logger -t naiveproxy "$@"; echo "$@"; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+running() {
+    [ -f "$PIDFILE" ] || return 1
+    local pid
+    pid=$(cat "$PIDFILE" 2>/dev/null) || return 1
+    kill -0 "$pid" 2>/dev/null
+}
+
+start() {
+    if running; then
+        log "already running (pid=$(cat "$PIDFILE"))"
+        return 0
+    fi
+    if [ ! -f "$DAEMON" ]; then
+        log "daemon not found: $DAEMON"
+        return 1
+    fi
+    if [ ! -r "$DAEMON_OPTS" ]; then
+        log "config not readable: $DAEMON_OPTS"
+        return 1
+    fi
+    [ -d /opt/var/log ] || mkdir -p /opt/var/log
+    [ -d /opt/var/run ] || mkdir -p /opt/var/run
+    log "starting $PROG with $DAEMON_OPTS"
+    # nohup + & для отвязки от init; перенаправляем stdout/stderr → log-файл
+    nohup "$DAEMON" "$DAEMON_OPTS" >>"$LOGFILE" 2>&1 &
+    echo $! > "$PIDFILE"
+    sleep 1
+    if running; then
+        log "started (pid=$(cat "$PIDFILE"))"
+        return 0
+    else
+        log "failed to start; see $LOGFILE"
+        rm -f "$PIDFILE"
+        return 1
+    fi
+}
+
+stop() {
+    if ! running; then
+        log "not running"
+        rm -f "$PIDFILE"
+        return 0
+    fi
+    local pid
+    pid=$(cat "$PIDFILE")
+    log "stopping pid=$pid"
+    kill -TERM "$pid" 2>/dev/null
+    # даём до 10 сек на чистый shutdown
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 1
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        log "force-killing pid=$pid"
+        kill -KILL "$pid" 2>/dev/null
+    fi
+    rm -f "$PIDFILE"
+    return 0
+}
+
+status() {
+    if running; then
+        echo "$PROG is running (pid=$(cat "$PIDFILE"))"
+        return 0
+    else
+        echo "$PROG is NOT running"
+        return 1
+    fi
+}
+
+case "$1" in
+    start)   start ;;
+    stop)    stop ;;
+    restart) stop; start ;;
+    reload)  stop; start ;;
+    status)  status ;;
+    *) echo "Usage: $0 {start|stop|restart|reload|status}"; exit 1 ;;
+esac
+
+exit $?
