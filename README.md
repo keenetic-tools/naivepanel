@@ -52,7 +52,44 @@ NAIVEPANEL_BIND=127.0.0.1:8089 \
 Переменные окружения позволяют запускать панель где угодно без root —
 главное, чтобы каталог пресетов существовал и был writable.
 
-## Деплой на Keenetic (Entware)
+## Установка (install.sh)
+
+Рекомендуемый способ — автоустановщик. Запускается **на роутере** (нужен
+Entware с `opkg`). Скачивает файлы, закреплённые за тегом релиза, сверяет
+контрольные суммы (`SHA256SUMS`), ставит init-скрипты и запускает панель:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/v0.1.0/install.sh | sh -s -- --with-auth
+```
+
+Флаги:
+
+| Флаг | Что делает |
+|------|------------|
+| `--with-auth` | интерактивно создаёт `/opt/etc/naivepanel/admin.pass` (HTTP Basic) |
+| `--bind HOST:PORT` | пишет `NAIVEPANEL_BIND` в `/opt/etc/init.d/rc.conf` |
+| `--hosts LIST` | пишет `NAIVEPANEL_HOSTS` (allowlist Host-заголовков) |
+| `--ref TAG` | устанавливает конкретный тег (по умолчанию `v0.1.0`) |
+| `--no-naive-init` | не ставить `S99naiveproxy` (если свой init-скрипт уже есть) |
+| `--yes` | неинтерактивный режим (без подтверждения) |
+| `--uninstall` | остановить сервисы и удалить файлы |
+| `--purge` | вместе с `--uninstall` — снести и конфиги (`admin.pass`, `conf.d`) |
+
+Установщик идемпотентен: повторный запуск = обновление. Файлы панели
+обновляются, а `admin.pass` и пресеты в `conf.d/` остаются нетронутыми.
+
+Зависимости ставятся через `opkg`, а не pip: `python3` (если < 3.10),
+`python3-flask`, при `--with-auth` — `python3-bcrypt`. Отсутствие бинарника
+`naive` не блокирует установку — только предупреждение.
+
+Пример с LAN-доступом:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/v0.1.0/install.sh \
+  | sh -s -- --with-auth --bind 192.168.1.1:8089 --hosts '192.168.1.1:8089,router.local:8089'
+```
+
+## Ручной деплой на Keenetic (Entware)
 
 > Требуется установленный пакет `naive-proxy` в Entware и, опционально,
 > `python3` (если Python < 3.10 — ставим пакет `python3`). На Keenetic
