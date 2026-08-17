@@ -152,8 +152,26 @@ if [ "$WITH_AUTH" = 1 ]; then
     fi
 fi
 
-command -v /opt/bin/naive >/dev/null 2>&1 \
-    || warn "naive binary not found — install the naive-proxy package (opkg install naive-proxy)"
+# --- naive binary check -----------------------------------------------------
+
+NAIVE_PATH=""
+for cand in /opt/bin/naive /opt/bin/naiveproxy /opt/naiveproxy/bin/naiveproxy; do
+    [ -x "$cand" ] && NAIVE_PATH="$cand" && break
+done
+[ -z "$NAIVE_PATH" ] && command -v naive >/dev/null 2>&1 && NAIVE_PATH="$(command -v naive)"
+
+if [ -z "$NAIVE_PATH" ]; then
+    warn "naive binary not found (the panel does NOT install it)"
+    echo "  Download a prebuilt client from klzgrad/naiveproxy releases:"
+    echo "    https://github.com/klzgrad/naiveproxy/releases"
+    echo "  Pick the openwrt-* asset matching your router CPU (prefer -static), then:"
+    echo "    tar -xJf naiveproxy-v*-openwrt-*.tar.xz"
+    echo "    cp naiveproxy-v*/naive /opt/bin/naive && chmod +x /opt/bin/naive"
+    echo "  See README «Установка бинарника naive» for CPU/asset matching."
+elif [ "$NAIVE_PATH" != "/opt/bin/naive" ]; then
+    warn "naive found at $NAIVE_PATH, but S99naiveproxy expects /opt/bin/naive"
+    echo "  Fix with: ln -sf '$NAIVE_PATH' /opt/bin/naive"
+fi
 
 # --- download + verify -----------------------------------------------------
 

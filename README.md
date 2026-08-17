@@ -89,6 +89,35 @@ curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/v0.1.0/in
   | sh -s -- --with-auth --bind 192.168.1.1:8089 --hosts '192.168.1.1:8089,router.local:8089'
 ```
 
+### Установка бинарника naive
+
+Панель управляет клиентом `naive`, но сам бинарник не ставит. Если его нет,
+скачай готовую сборку с [klzgrad/naiveproxy releases](https://github.com/klzgrad/naiveproxy/releases):
+
+1. Определи архитектуру роутера:
+
+   ```bash
+   uname -m          # mips / armv7l / aarch64 / x86_64
+   cat /proc/cpuinfo # уточни модель ядра (mips 24kc, cortex-a7/a53/a72…)
+   ```
+
+2. Выбери `openwrt-*`-asset под свой CPU. Для Entware предпочтительны
+   **`-static`** сборки — они musl-static и не зависят от библиотек в `/opt/lib`.
+
+3. Распакуй и положи бинарник как `/opt/bin/naive` (имя, которое ждёт
+   `S99naiveproxy`):
+
+   ```bash
+   tar -xJf naiveproxy-v*-openwrt-*.tar.xz
+   cp naiveproxy-v*/naive /opt/bin/naive && chmod +x /opt/bin/naive
+   ```
+
+   Если бинарник уже лежит в другом месте — достаточно symlink:
+
+   ```bash
+   ln -sf /opt/naiveproxy/bin/naiveproxy /opt/bin/naive
+   ```
+
 ## Ручной деплой на Keenetic (Entware)
 
 > Требуется установленный пакет `naive-proxy` в Entware и, опционально,
