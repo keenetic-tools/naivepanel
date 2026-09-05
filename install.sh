@@ -3,7 +3,7 @@
 # firmware with Entware). Runs ON the router.
 #
 # Bootstrap (pin to a release tag, not `main`):
-#   curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/v0.3.0/install.sh | sh -s -- --with-auth
+#   curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/v0.4.0/install.sh | sh -s -- --with-auth
 #
 # Safe to pipe into `sh`: the confirmation and password prompts read the
 # terminal (/dev/tty), never the piped stdin. Add --yes to skip confirmation.
@@ -24,7 +24,7 @@
 set -u
 
 REPO="keenetic-tools/naivepanel"
-REF="v0.3.0"
+REF="v0.4.0"
 BIND=""
 HOSTS=""
 WITH_AUTH=0
@@ -75,6 +75,23 @@ rc_conf_set() {  # $1=VAR $2=value
     echo "$1=\"$2\"" >>"$RC_CONF"
 }
 
+gen_admin_pass() {  # -> stdout: `admin:<bcrypt-hash>`; пароль спрашивается дважды
+    "$PYTHON" - <<'PY'
+import bcrypt, getpass, sys
+for _ in range(3):
+    pw = getpass.getpass("password: ")
+    if not pw:
+        print("empty password is not allowed", file=sys.stderr)
+        continue
+    if pw != getpass.getpass("confirm: "):
+        print("passwords do not match", file=sys.stderr)
+        continue
+    sys.stdout.write("admin:" + bcrypt.hashpw(pw.encode(), bcrypt.gensalt()).decode() + "\n")
+    sys.exit(0)
+sys.exit(1)
+PY
+}
+
 # --- arg parsing -----------------------------------------------------------
 
 while [ $# -gt 0 ]; do
@@ -92,6 +109,17 @@ while [ $# -gt 0 ]; do
     esac
     shift
 done
+
+# --- validate values (они попадают в rc.conf, который sourced'ится шеллом) ---
+
+if [ -n "$BIND" ]; then
+    echo "$BIND" | grep -Eq '^\[?[A-Za-z0-9.:-]+\]?:[0-9]+$' \
+        || die "--bind: expected HOST:PORT (e.g. 192.168.1.1:8089), got '$BIND'"
+fi
+if [ -n "$HOSTS" ]; then
+    echo "$HOSTS" | grep -Eq '^(\[?[A-Za-z0-9.:-]+\]?(:[0-9]+)?)(,\[?[A-Za-z0-9.:-]+\]?(:[0-9]+)?)*$' \
+        || die "--hosts: expected comma-separated HOST[:PORT] list, got '$HOSTS'"
+fi
 
 # --- uninstall -------------------------------------------------------------
 
@@ -292,8 +320,10 @@ if [ "$WITH_AUTH" = 1 ]; then
         die "--with-auth needs an interactive terminal for the password prompt"
     fi
     info "setting up panel password (stored in $PANEL_DIR/admin.pass)"
-    "$PYTHON" -c 'import bcrypt,getpass,sys; sys.stdout.write("admin:"+bcrypt.hashpw(getpass.getpass("password: ").encode(), bcrypt.gensalt()).decode()+"\n")' \
-        >"$PANEL_DIR/admin.pass" || die "bcrypt hash generation failed"
+    if ! gen_admin_pass >"$PANEL_DIR/admin.pass"; then
+        rm -f "$PANEL_DIR/admin.pass"
+        die "password setup failed"
+    fi
     chmod 0600 "$PANEL_DIR/admin.pass"
 fi
 
@@ -334,4 +364,5 @@ echo ""
 echo "Reminders:"
 echo "  - auth: add a password with --with-auth if the panel is reachable from LAN"
 echo "  - LAN bind: use --bind 192.168.1.1:8089 --hosts '192.168.1.1:8089,router.local:8089'"
+echo "  - reverse proxy: add its hostname via --hosts (other Host headers get 403)"
 echo "  - firewall: only expose the port to trusted devices"

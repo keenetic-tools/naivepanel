@@ -11,7 +11,7 @@ HTML page — no CDN, no build step. MIT-licensed.
 
 ## Что это
 
-- **Flask-приложение** (~390 строк, одна HTML-страница, без CDN / без build step).
+- **Flask-приложение** (одна HTML-страница, без CDN / без build step).
 - Хранит **N пресетов** конфигурации клиента в `/opt/etc/naive/proxy/conf.d/<name>.json`.
 - По activate копирует пресет в `/opt/etc/naive/proxy/config.json` (`chmod 0600`)
   и перезапускает `/opt/etc/init.d/S99naiveproxy`.
@@ -26,7 +26,7 @@ HTML page — no CDN, no build step. MIT-licensed.
 | `GET` | `/api/configs` | список пресетов `{name, active, listen, proxy, username}` |
 | `GET` | `/api/configs/<name>` | полный JSON-конфиг пресета |
 | `POST` | `/api/configs` | создать пресет |
-| `PUT` | `/api/configs/<name>` | обновить (если активный — propagate в `config.json`) |
+| `PUT` | `/api/configs/<name>` | обновить (если активный — propagate в `config.json` **и restart**; ответ содержит `restart:{rc,...}`) |
 | `DELETE` | `/api/configs/<name>` | удалить (если не активный) |
 | `POST` | `/api/configs/<name>/activate` | сделать активным + restart |
 | `POST` | `/api/service/{start,stop,restart}` | управление через S99naiveproxy |
@@ -59,7 +59,7 @@ Entware с `opkg`). Скачивает файлы, закреплённые за
 контрольные суммы (`SHA256SUMS`), ставит init-скрипты и запускает панель:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/v0.3.0/install.sh | sh -s -- --with-auth
+curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/v0.4.0/install.sh | sh -s -- --with-auth
 ```
 
 Запуск через пайп безопасен: подтверждение установки и ввод пароля читаются
@@ -73,7 +73,7 @@ curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/v0.3.0/in
 | `--with-auth` | интерактивно создаёт `/opt/etc/naive/panel/admin.pass` (HTTP Basic) |
 | `--bind HOST:PORT` | пишет `NAIVEPANEL_BIND` в `/opt/etc/init.d/rc.conf` |
 | `--hosts LIST` | пишет `NAIVEPANEL_HOSTS` (allowlist Host-заголовков) |
-| `--ref TAG` | устанавливает конкретный тег (по умолчанию `v0.3.0`) |
+| `--ref TAG` | устанавливает конкретный тег (по умолчанию `v0.4.0`) |
 | `--no-naive-init` | не ставить `S99naiveproxy` (если свой init-скрипт уже есть) |
 | `--yes` | неинтерактивный режим (без подтверждения) |
 | `--uninstall` | остановить сервисы и удалить файлы |
@@ -97,7 +97,7 @@ curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/v0.3.0/in
 Пример с LAN-доступом:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/v0.3.0/install.sh \
+curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/v0.4.0/install.sh \
   | sh -s -- --with-auth --bind 192.168.1.1:8089 --hosts '192.168.1.1:8089,router.local:8089'
 ```
 
@@ -184,6 +184,14 @@ naivepanel.local.lan {
 }
 ```
 
+Панель за reverse proxy видит чужой `Host` (`naivepanel.local.lan`) — добавь
+его в allowlist, иначе 403 (см. «Безопасность»):
+
+```bash
+# в /opt/etc/init.d/rc.conf
+NAIVEPANEL_HOSTS=naivepanel.local.lan
+```
+
 Или просто SSH-туннель: `ssh -L 8089:127.0.0.1:8089 root@router`.
 
 ### Доступ из LAN без reverse proxy
@@ -200,7 +208,9 @@ python3 -c 'import bcrypt,getpass; print("admin:"+bcrypt.hashpw(getpass.getpass(
 chmod 0600 /opt/etc/naive/panel/admin.pass
 
 # 2. Bind на LAN-адрес (НЕ 0.0.0.0 — иначе торчим и в WAN/VPN/guest-сегменты)
-#    и allowlist Host-заголовков (анти-DNS-rebinding), в /opt/etc/init.d/rc.conf:
+#    и allowlist Host-заголовков (анти-DNS-rebinding), в /opt/etc/init.d/rc.conf.
+#    Без NAIVEPANEL_HOSTS разрешены только адрес bind и loopback-алиасы —
+#    доступ по имени роутера (router.lan и т.п.) потребует явного allowlist.
 NAIVEPANEL_BIND=192.168.1.1:8089
 NAIVEPANEL_HOSTS=192.168.1.1:8089,router.local:8089
 
@@ -255,9 +265,14 @@ NaivePanel собирает минимальный JSON, совместимый 
 - Если есть `/opt/etc/naive/panel/admin.pass` — **каждый** запрос требует HTTP Basic
   auth (bcrypt, формат htpasswd `user:$2y$…`). Без пакета `python3-bcrypt` в
   Entware auth fail-closed (401 на любой запрос + ошибка в лог).
-- Если задан `NAIVEPANEL_HOSTS` (список через запятую, точные строки Host с
-  портом) — запросы с чужим Host-заголовком отклоняются (403). Защита от
-  DNS rebinding: обязательна при LAN-bind без reverse proxy.
+- Успешная Basic-проверка кэшируется на 5 минут (сбрасывается сразу при
+  изменении `admin.pass`) — поллинг UI каждые 3с не гоняет bcrypt постоянно.
+- **Host-allowlist включён всегда** (с v0.4.0). Если задан `NAIVEPANEL_HOSTS`
+  (список через запятую, точные строки Host с портом) — пропускаются только
+  они. Если не задан — адрес bind + loopback-алиасы (`127.0.0.1[:8089]`,
+  `localhost[:8089]`, IPv6-формы). Прочие Host — 403: чужое имя хоста —
+  маркер DNS-rebinding. Поэтому reverse proxy со своим именем требует явного
+  `NAIVEPANEL_HOSTS`.
 - Активация пресета валидирует имя: `^[a-zA-Z0-9_\-.]{1,64}$` (нет path-traversal).
 - Bind на `0.0.0.0` — warning в лог: на роутере это ещё и WAN/VPN/guest-сегменты.
 - 401 (auth failed) и 403 (host rejected) пишутся в лог панели.
@@ -267,7 +282,14 @@ NaivePanel собирает минимальный JSON, совместимый 
   замедляется на 0.5с (анти-перебор).
 - Пароли upstream через API не возвращаются: `GET /api/configs/<name>` отдаёт
   upstream/username разобранными, но без пароля; пустое поле пароля в форме
-  при сохранении означает «оставить прежний».
+  при сохранении означает «оставить прежний». Креденшалы в proxy-URI
+  percent-encode'ятся (`@ : /` и т.п. в пароле не ломают URI).
+- `/api/logs` маскирует креды в URI (`scheme://user:pass@host` →
+  `scheme://user:***@host`) и читает лог с конца файла, а не целиком.
+- PUT активного пресета применяет изменения сразу (перезаписывает
+  `config.json` и рестартует сервис, как activate); ответ содержит результат
+  рестарта, UI показывает сбой, если он случился.
+- Размер тела запроса ограничен 256 КБ (`MAX_CONTENT_LENGTH`).
 - Пароль панели и `admin.pass` НЕ коммитить в git.
 
 ## Что НЕ реализовано (по спеке wiki)
@@ -283,13 +305,16 @@ NaivePanel собирает минимальный JSON, совместимый 
 
 ```
 naiveproxy-panel/
-├── naivepanel.py            # Flask backend (~280 строк)
+├── naivepanel.py            # Flask backend
 ├── templates/
 │   └── index.html           # UI (vanilla HTML + JS, без CDN)
+├── install.sh               # установщик для Entware (curl | sh, checksums)
 ├── S99naiveproxy            # init: бинарник naive
 ├── S99naivepanel            # init: Flask-приложение
-├── README.md                # этот файл
-└── .venv/                   # dev venv (в .gitignore)
+├── tests/test_naivepanel.py # pytest: API-семантика без сети
+├── docker-e2e.sh            # E2E: install.sh в Docker с настоящим Entware
+├── SHA256SUMS               # контрольные суммы файлов релиза
+└── README.md                # этот файл
 ```
 
 ## Разработка

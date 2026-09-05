@@ -11,6 +11,7 @@ Bind по умолчанию 127.0.0.1:8089 — публикация через 
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -18,8 +19,10 @@ import subprocess
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote, unquote
 
 from flask import Flask, Response, abort, jsonify, make_response, render_template, request
+from werkzeug.exceptions import HTTPException
 
 # --- Конфигурация путей (на Keenetic/Entware) -----------------------------
 
@@ -39,11 +42,45 @@ PANEL_INIT = Path(os.environ.get("NAIVEPANEL_INIT", "/opt/etc/init.d/S99naivepan
 
 NAME_RE = re.compile(r"^[a-zA-Z0-9_\-.]{1,64}$")
 
-APP_VERSION = "0.3.0"
+APP_VERSION = "0.4.0"
 
 
 def _ensure_dirs() -> None:
     CONF_D.mkdir(parents=True, exist_ok=True)
+
+
+def _parse_bind(bind: str) -> tuple[str, int]:
+    """`HOST:PORT` → (host, port); понимает `[::1]:8089` и голый IPv6.
+
+    Порт не задан или не числовой → 8089. Голый IPv6 (`::1`) ловим по лишнему
+    `:` — rpartition иначе отрезал бы кусок адреса.
+    """
+    if bind.startswith("[") and "]" in bind:
+        host = bind[1:bind.index("]")]
+        rest = bind[bind.index("]") + 1:].lstrip(":")
+        return host, (int(rest) if rest.isdigit() else 8089)
+    host, sep, port = bind.rpartition(":")
+    if host.count(":") > 0 or not sep or not port.isdigit():
+        return bind or "127.0.0.1", 8089
+    return host or "127.0.0.1", int(port)
+
+
+def _default_allowed_hosts(bind: str) -> set[str]:
+    """Host-заголовки, разрешённые без явного NAIVEPANEL_HOSTS.
+
+    Прямой доступ из браузера всегда идёт на адрес bind (или loopback-алиас),
+    поэтому их разрешаем; чужое имя хоста — маркер DNS-rebinding → 403.
+    Reverse proxy со своим именем требует явного NAIVEPANEL_HOSTS (README).
+    """
+    host, port = _parse_bind(bind)
+    hosts = {
+        host, f"{host}:{port}",
+        "localhost", f"localhost:{port}",
+        "127.0.0.1", f"127.0.0.1:{port}",
+    }
+    if ":" in host:  # IPv6-браузеры шлют Host в квадратных скобках
+        hosts |= {f"[{host}]", f"[{host}]:{port}"}
+    return hosts
 
 
 # --- Работа с конфигами ---------------------------------------------------
@@ -94,9 +131,10 @@ def _active_name() -> str | None:
 def _split_proxy(proxy: str) -> tuple[str, str, str | None]:
     """Разбирает proxy-URI на (upstream, username, password).
 
-    Зеркально _build_payload: тот собирает строго `https://user:pass@host`,
-    поэтому тут пароль выделяется от последнего `@` (в пароле бывает `@`),
-    username — до первого `:` в кредах. Если URI не https:// или кредов нет —
+    Зеркально _build_payload: тот собирает строго `https://user:pass@host`
+    (креденшалы percent-encoded), поэтому тут пароль выделяется от последнего
+    `@` (легаси-конфиги с raw `@` в пароле тоже читаются), username — до первого
+    `:` в кредах, затем оба unquote. Если URI не https:// или кредов нет —
     upstream возвращается целиком, password=None (кредов не выделить).
     """
     if proxy.startswith("https://"):
@@ -106,7 +144,7 @@ def _split_proxy(proxy: str) -> tuple[str, str, str | None]:
             creds, host = rest[:at], rest[at + 1:]
             colon = creds.find(":")
             if colon != -1:
-                return host, creds[:colon], creds[colon + 1:]
+                return host, unquote(creds[:colon]), unquote(creds[colon + 1:])
     return proxy, "", None
 
 
@@ -139,7 +177,7 @@ def _summary(cfg: dict[str, Any]) -> dict[str, Any]:
         creds = proxy_uri.split("@", 1)[0]
         if "://" in creds:
             creds = creds.rsplit("://", 1)[-1]
-        user = creds.split(":", 1)[0]
+        user = unquote(creds.split(":", 1)[0])
     return {
         "listen": listen_uri,
         "listen_count": listen_count,
@@ -230,7 +268,9 @@ def _build_payload(data: dict[str, Any], old_proxy: str | None = None) -> dict[s
         host = upstream
         if host.startswith(("https://", "http://", "quic://")):
             host = host.split("://", 1)[1]
-        proxy_uri = f"https://{username}:{password}@{host.rstrip('/')}"
+        # Креденшалы percent-encode'им (RFC 3986): `@ : / ` и пр. в пароле
+        # иначе ломают разбор URI. naive/Chromium userinfo декодирует.
+        proxy_uri = f"https://{quote(username, safe='')}:{quote(password, safe='')}@{host.rstrip('/')}"
 
     cfg: dict[str, Any] = {"listen": listen, "proxy": proxy_uri}
     if data.get("log"):
@@ -266,7 +306,22 @@ def _run(cmd: list[str], timeout: int = 10) -> dict[str, Any]:
 def _service(action: str) -> dict[str, Any]:
     if not INIT_SCRIPT.exists():
         abort(503, description=f"{INIT_SCRIPT} not found")
-    return _run(["/bin/sh", str(INIT_SCRIPT), action])
+    # stop в S99naiveproxy ждёт до 10с, restart = stop+start — таймаут обязан
+    # покрывать худший случай, иначе /bin/sh убивают посреди рестарта
+    return _run(["/bin/sh", str(INIT_SCRIPT), action], timeout=30)
+
+
+def _pid_is_naive(pid: int) -> bool:
+    """Анти-pid-reuse: сверяем имя процесса, если /proc доступен.
+
+    Не читается (нет /proc — macOS/dev-запуск, чужой uid) — считаем нашим:
+    ложный «работает» безопаснее ложного «остановлен».
+    """
+    try:
+        name = Path(f"/proc/{pid}/comm").read_text(encoding="utf-8").strip()
+    except OSError:
+        return True
+    return name in {"naive", "naiveproxy"}
 
 
 def _status() -> dict[str, Any]:
@@ -290,6 +345,9 @@ def _status() -> dict[str, Any]:
             except PermissionError:
                 # Процесс чужой (другой uid), но жив — считаем запущенным
                 running = True
+            if running and not _pid_is_naive(pid):
+                pid = None  # pid переиспользован чужим процессом
+                running = False
             if running:
                 uptime = max(0, int(time.time() - PID_FILE.stat().st_mtime))
     return {
@@ -303,38 +361,88 @@ def _status() -> dict[str, Any]:
     }
 
 
+_CRED_RE = re.compile(r"([a-zA-Z][a-zA-Z0-9+.\-]*://[^:/@\s]+):([^@\s]+)@")
+
+
+def _mask_creds(text: str) -> str:
+    """Маскирует userinfo в URI (`scheme://user:pass@host` → `user:***@`)."""
+    return _CRED_RE.sub(r"\1:***@", text)
+
+
 def _tail_log(lines: int = 100) -> str:
+    """Последние `lines` строк лога — чтением с конца, а не всего файла.
+
+    Между рестартами лог может вырасти далеко за урезающий лимит init-скрипта,
+    а /api/logs дёргается поллингом каждые 3с — readlines() всего файла на
+    роутере был бы заметен по памяти/CPU. Заодно маскируем креды в URI.
+    """
     if not LOG_FILE.exists():
         return ""
     lines = max(1, min(lines, 1000))
     try:
-        with LOG_FILE.open("r", encoding="utf-8", errors="replace") as fh:
-            data = fh.readlines()
+        with LOG_FILE.open("rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            end = fh.tell()
+            chunk = 8192
+            buf = b""
+            while True:
+                start = max(0, end - chunk)
+                fh.seek(start)
+                buf = fh.read(end - start) + buf
+                if buf.count(b"\n") > lines or start == 0:
+                    break
+                end = start
+                chunk = min(chunk * 2, 4 * 1024 * 1024)
+            data = buf.decode("utf-8", errors="replace")
     except OSError as exc:
         return f"<log read error: {exc}>"
-    return "".join(data[-lines:])
+    return _mask_creds("".join(data.splitlines(keepends=True)[-lines:]))
 
 
 # --- Flask app ------------------------------------------------------------
 
 app = Flask(__name__)
+# Конфиги крошечные — гигантский PUT иначе ронял бы память роутера
+app.config["MAX_CONTENT_LENGTH"] = 256 * 1024
+
+
+@app.errorhandler(HTTPException)
+def _api_json_errors(exc: HTTPException):
+    """Ошибки под /api/* — JSON, а не HTML-страница Flask.
+
+    Фронтенд парсит тело ответа и показывает `error` в плашке; сырой HTML
+    там выглядел мусором.
+    """
+    if request.path.startswith("/api/"):
+        msg = exc.description or exc.name
+        return jsonify({"error": msg, "description": msg}), exc.code
+    return exc
 
 
 # --- Host allowlist (анти-DNS-rebinding) -----------------------------------
 
+# Дефолтный allowlist: адрес bind + loopback-алиасы. Прямой доступ из браузера
+# всегда идёт на один из них; чужое имя в Host — маркер DNS-rebinding.
+DEFAULT_ALLOWED_HOSTS = _default_allowed_hosts(PANEL_BIND)
+
+
 @app.before_request
 def _enforce_host_allowlist():
-    """Если NAIVEPANEL_HOSTS задан — отклоняет запросы с чужим Host.
+    """Allowlist Host-заголовков: анти-DNS-rebinding.
 
-    При bind на LAN-адрес страница зловредного сайта может через DNS rebinding
-    резолвиться в IP роутера: браузер считает запросы same-origin и читает API.
-    Такие запросы приходят с Host вида `evil.com:8089` — отклоняем их.
-    Значения — точные строки Host с портом: `192.168.1.1:8089,router.lan:8089`.
+    При DNS-rebinding страница зловредного сайта резолвится в адрес панели, и
+    браузер считает запросы same-origin: он может читать ответы и ставить
+    кастомные заголовки — CSRF-проверка его не остановит. Единственный след
+    атаки — чужое имя в Host. Правила: NAIVEPANEL_HOSTS задан → только эти
+    точные строки (`192.168.1.1:8089,router.lan:8089`); не задан → адрес bind
+    + loopback-алиасы. Reverse proxy со своим именем хоста требует явного
+    NAIVEPANEL_HOSTS (см. README).
     """
-    if not ALLOWED_HOSTS or request.host in ALLOWED_HOSTS:
+    allowed = {h.lower() for h in (ALLOWED_HOSTS or DEFAULT_ALLOWED_HOSTS)}
+    if request.host.lower() in allowed:
         return
     app.logger.warning("rejected Host %r from %s", request.host, request.remote_addr)
-    abort(403, description="host not allowed")
+    abort(403, description="host not allowed (see NAIVEPANEL_HOSTS)")
 
 
 # --- CSRF -------------------------------------------------------------------
@@ -362,6 +470,15 @@ def _csrf_protect():
 
 # --- HTTP Basic auth (опционально) ----------------------------------------
 
+# Поллинг UI дёргает API каждые 3с: без кэша bcrypt-хэширование съедало бы CPU
+# роутера постоянно. Кэшируем только УСПЕШНЫЕ проверки (ключ — sha256 креденшалов);
+# смена admin.pass (mtime/size) сбрасывает кэш немедленно, как и удаление записи.
+_AUTH_CACHE_TTL = 300.0
+_AUTH_CACHE_LIMIT = 64
+_auth_cache: dict[str, float] = {}  # sha256(user\x00pass) → expiry (monotonic)
+_admin_pass_stamp: tuple[int, int] | None = None
+
+
 @app.before_request
 def _require_auth():
     """Если /opt/etc/naive/panel/admin.pass существует — требует HTTP Basic auth
@@ -372,12 +489,32 @@ def _require_auth():
     Без пакета python3-bcrypt auth fail-closed (401 на любой запрос), в лог
     пишется ошибка. Это намеренно: лучше сломанная панель, чем открытая.
     """
+    global _admin_pass_stamp
     if not PANEL_ADMIN_PASS.exists():
         return  # auth выключен — только 127.0.0.1, публично не торчим
-    stored = PANEL_ADMIN_PASS.read_text(encoding="utf-8")
+    try:
+        st = PANEL_ADMIN_PASS.stat()
+        stamp = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        stamp = None
+    if stamp != _admin_pass_stamp:
+        _admin_pass_stamp = stamp
+        _auth_cache.clear()
     auth = request.authorization
-    if auth and _htpasswd_verify(stored, auth.username or "", auth.password or ""):
-        return
+    if auth:
+        key = hashlib.sha256(
+            (auth.username or "").encode() + b"\x00" + (auth.password or "").encode()
+        ).hexdigest()
+        now = time.monotonic()
+        exp = _auth_cache.get(key)
+        if exp is not None and exp > now:
+            return
+        stored = PANEL_ADMIN_PASS.read_text(encoding="utf-8")
+        if _htpasswd_verify(stored, auth.username or "", auth.password or ""):
+            if len(_auth_cache) >= _AUTH_CACHE_LIMIT:
+                _auth_cache.clear()
+            _auth_cache[key] = now + _AUTH_CACHE_TTL
+            return
     app.logger.warning(
         "auth failed: user=%r addr=%s path=%s",
         auth.username if auth else None,
@@ -482,9 +619,13 @@ def api_configs_update(name: str):
     old = _load_json(path)  # 404, если пресета нет
     cfg = _build_payload(data, old_proxy=old.get("proxy"))
     _save_json(path, cfg)
+    restart = None
     if _active_name() == name:
+        # Активный пресет = работающий конфиг: применяем сразу, как activate,
+        # иначе «Сохранено» врало бы — файл обновлён, а naive работает старым.
         _write_active(name, cfg)
-    return jsonify({"name": name, "updated": True})
+        restart = _service("restart") if INIT_SCRIPT.exists() else {"rc": None, "note": "no init script"}
+    return jsonify({"name": name, "updated": True, "restart": restart})
 
 
 @app.route("/api/configs/<name>", methods=["DELETE"])
@@ -530,9 +671,10 @@ def api_panel_restart():
     """
     if not PANEL_INIT.exists():
         abort(503, description=f"{PANEL_INIT} not found")
-    # Новая сессия → ребёнок переживёт смерть Flask-процесса.
+    # Новая сессия → ребёнок переживёт смерть Flask-процесса. Путь передаём
+    # argv ($1), а не интерполяцией в shell-строку.
     subprocess.Popen(
-        ["sh", "-c", f"sleep 1; exec /bin/sh '{PANEL_INIT}' restart"],
+        ["sh", "-c", 'sleep 1; exec /bin/sh "$1" restart', "sh", str(PANEL_INIT)],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         start_new_session=True,
@@ -554,8 +696,7 @@ def api_logs():
 
 if __name__ == "__main__":
     _ensure_dirs()
-    host, _, port = PANEL_BIND.rpartition(":")
-    host = host or "127.0.0.1"
+    host, port = _parse_bind(PANEL_BIND)
     if host in ("0.0.0.0", "::"):
         app.logger.warning(
             "bind %s exposes the panel on ALL interfaces (on a router incl. "
@@ -563,4 +704,6 @@ if __name__ == "__main__":
             "NAIVEPANEL_HOSTS and firewall rules are in place.",
             PANEL_BIND,
         )
-    app.run(host=host, port=int(port or 8089), debug=False)
+    # threaded: поллинг UI каждые 3с не должен стоять за медленным запросом
+    # (bcrypt, рестарт сервиса до 30с, sleep на неудачной аутентификации)
+    app.run(host=host, port=port, debug=False, threaded=True)

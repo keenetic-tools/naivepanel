@@ -111,10 +111,13 @@
       <input id="f_username" autocomplete="off" spellcheck="false">
 
       <label for="f_password">Password (пусто = оставить прежний)</label>
-      <input id="f_password" type="password" autocomplete="new-password" placeholder="••••••••">
+      <div style="display:flex;gap:8px">
+        <input id="f_password" type="password" autocomplete="new-password" placeholder="••••••••" style="flex:1">
+        <button type="button" class="ghost" id="btnPw" onclick="togglePw()">показать</button>
+      </div>
       <div style="font-size:11px;color:var(--mut);margin-top:4px">
         Пароль не возвращается из API: пустое поле при сохранении переиспользует
-        прежний, введённый — заменяет.
+        прежний, введённый — заменяет. Спецсимволы кодируются автоматически.
       </div>
 
       <details>
@@ -182,7 +185,7 @@ async function jdel(url) { const r = await fetch(url, {method:'DELETE', headers:
 async function handle(r) {
   const txt = await r.text();
   let data; try { data = JSON.parse(txt); } catch { data = {raw:txt}; }
-  if (!r.ok) throw new Error(data.description || data.message || (data.raw || ('HTTP '+r.status)));
+  if (!r.ok) throw new Error(data.error || data.description || data.message || (data.raw || ('HTTP '+r.status)));
   return data;
 }
 
@@ -290,6 +293,23 @@ function newPreset() {
   $('f_name').focus();
 }
 
+function togglePw() {
+  const i = $('f_password'), b = $('btnPw');
+  const show = i.type === 'password';
+  i.type = show ? 'text' : 'password';
+  b.textContent = show ? 'скрыть' : 'показать';
+}
+
+// Правдивые сообщения о применении: restart.rc отдаёт PUT активного пресета
+// и activate; rc===null — init-скрипта нет (рестарт пропущен), rc!==0 — сбой.
+function restartFailed(rst) { return !!rst && typeof rst.rc === 'number' && rst.rc !== 0; }
+function applyMsg(base, rst) {
+  if (!rst) return base;                                  // не активный пресет
+  if (typeof rst.rc !== 'number') return base + ' (init-скрипта нет — рестарт пропущен)';
+  if (rst.rc !== 0) return base + ' — рестарт НЕ удался: ' + (rst.stderr || rst.stdout || ('rc=' + rst.rc));
+  return base + ', сервис перезапущен';
+}
+
 async function save(ev) {
   if (ev) ev.preventDefault();
   const btn = $('btnSave');
@@ -297,14 +317,14 @@ async function save(ev) {
   btn.disabled = true; btn.textContent = 'Сохранение…';
   try {
     if (current) {
-      await jput('/api/configs/'+encodeURIComponent(current), payload);
-      flash('Сохранено: '+current, true);
+      const d = await jput('/api/configs/'+encodeURIComponent(current), payload);
+      flash(applyMsg('Сохранено: '+current, d.restart), !restartFailed(d.restart));
     } else {
       await jpost('/api/configs', payload);
       current = payload.name;
       $('f_name').disabled = true;
       setHash(current);
-      flash('Создан: '+current, true);
+      flash('Создан: '+current+' (не активен — нажмите «Сделать активным»)', true);
     }
     dirty = false;
     await refreshAll();
@@ -331,8 +351,8 @@ async function activate(name) {
   if (!n) return;
   if (dirty && !confirm('В форме есть несохранённые правки — активируется последняя СОХРАНЁННАЯ версия пресета. Продолжить?')) return;
   try {
-    await jpost('/api/configs/'+encodeURIComponent(n)+'/activate', null);
-    flash('Активирован: '+n, true);
+    const d = await jpost('/api/configs/'+encodeURIComponent(n)+'/activate', null);
+    flash(applyMsg('Активирован: '+n, d.restart), !restartFailed(d.restart));
     await refreshAll();
   } catch (e) { flash(e.message, false); }
 }
