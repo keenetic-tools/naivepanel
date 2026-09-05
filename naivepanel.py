@@ -39,6 +39,8 @@ PANEL_INIT = Path(os.environ.get("NAIVEPANEL_INIT", "/opt/etc/init.d/S99naivepan
 
 NAME_RE = re.compile(r"^[a-zA-Z0-9_\-.]{1,64}$")
 
+APP_VERSION = "0.3.0"
+
 
 def _ensure_dirs() -> None:
     CONF_D.mkdir(parents=True, exist_ok=True)
@@ -87,6 +89,39 @@ def _active_name() -> str | None:
     except OSError:
         return None
     return name if NAME_RE.match(name) else None
+
+
+def _split_proxy(proxy: str) -> tuple[str, str, str | None]:
+    """Разбирает proxy-URI на (upstream, username, password).
+
+    Зеркально _build_payload: тот собирает строго `https://user:pass@host`,
+    поэтому тут пароль выделяется от последнего `@` (в пароле бывает `@`),
+    username — до первого `:` в кредах. Если URI не https:// или кредов нет —
+    upstream возвращается целиком, password=None (кредов не выделить).
+    """
+    if proxy.startswith("https://"):
+        rest = proxy[len("https://"):]
+        at = rest.rfind("@")
+        if at != -1:
+            creds, host = rest[:at], rest[at + 1:]
+            colon = creds.find(":")
+            if colon != -1:
+                return host, creds[:colon], creds[colon + 1:]
+    return proxy, "", None
+
+
+def _for_edit(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Конфигурация для формы редактирования — БЕЗ пароля.
+
+    upstream и username отдаются уже разобранными, чтобы фронтенду не пришлось
+    самому парсить proxy-URI (и ломаться на `@` в пароле). Пароль через API
+    не возвращается вовсе: пустое поле в форме означает «оставить прежний».
+    """
+    upstream, username, _ = _split_proxy(cfg.get("proxy") or "")
+    out = {k: v for k, v in cfg.items() if k != "proxy"}
+    out["upstream"] = upstream
+    out["username"] = username
+    return out
 
 
 def _summary(cfg: dict[str, Any]) -> dict[str, Any]:
@@ -142,7 +177,7 @@ def _normalize_listen(raw: str) -> str | None:
     return raw
 
 
-def _build_payload(data: dict[str, Any]) -> dict[str, Any]:
+def _build_payload(data: dict[str, Any], old_proxy: str | None = None) -> dict[str, Any]:
     """Собирает JSON-конфиг клиента naive из данных формы.
 
     listen принимает строку (несколько адресов через запятую/перенос) или массив;
@@ -153,11 +188,13 @@ def _build_payload(data: dict[str, Any]) -> dict[str, Any]:
       - `https://user:pass@host[:port]` — полный proxy URL, передаётся как есть
       - `host[:port]` или `https://host[:port]` — креденшалы подставляются из
         полей username/password
+
+    Пароль через API не возвращается (GET отдаёт конфиг без него), поэтому при
+    обновлении пустой password означает «оставить прежний» — он извлекается из
+    old_proxy. То же с пустым username.
     """
     name = (data.get("name") or "").strip()
     upstream = (data.get("upstream") or "").strip()
-    username = (data.get("username") or "").strip()
-    password = data.get("password") or ""
 
     # listen — строка с разделителями (запятая/перенос), либо массив
     listen_raw = data.get("listen") or []
@@ -169,8 +206,8 @@ def _build_payload(data: dict[str, Any]) -> dict[str, Any]:
         parts = []
     listen_uris = [u for u in (_normalize_listen(p) for p in parts) if u]
 
-    if not (name and listen_uris and upstream and username and password):
-        abort(400, description="name, listen, upstream, username, password are required")
+    if not (name and listen_uris and upstream):
+        abort(400, description="name, listen, upstream are required")
 
     # Один адрес → строка (компактнее), несколько → массив
     listen = listen_uris[0] if len(listen_uris) == 1 else listen_uris
@@ -179,6 +216,16 @@ def _build_payload(data: dict[str, Any]) -> dict[str, Any]:
         # Уже полный proxy URL с креденшалами
         proxy_uri = upstream
     else:
+        username = (data.get("username") or "").strip()
+        password = data.get("password") or ""
+        if old_proxy:
+            old_upstream, old_user, old_pass = _split_proxy(old_proxy)
+            if not username and old_upstream == upstream:
+                username = old_user
+            if not password:
+                password = old_pass or ""
+        if not (username and password):
+            abort(400, description="username and password are required")
         # Вытаскиваем хост из возможного `https://` префикса
         host = upstream
         if host.startswith(("https://", "http://", "quic://")):
@@ -246,6 +293,7 @@ def _status() -> dict[str, Any]:
             if running:
                 uptime = max(0, int(time.time() - PID_FILE.stat().st_mtime))
     return {
+        "version": APP_VERSION,
         "active": running,
         "pid": pid,
         "uptime": uptime,
@@ -289,6 +337,29 @@ def _enforce_host_allowlist():
     abort(403, description="host not allowed")
 
 
+# --- CSRF -------------------------------------------------------------------
+# Basic-креды браузер прикладывает к кросс-сайтовым запросам автоматически,
+# поэтому сама по себе auth от CSRF не защищает. POST без тела — «simple
+# request» без preflight, так что зловредная страница могла бы дёргать
+# /api/service/* и activate от имени залогиненного админа. Кастомный заголовок
+# cross-origin JS не поставит без успешного CORS-preflight, а preflight-ответов
+# мы не отдаём — запрос отклоняется ещё на нём.
+
+@app.before_request
+def _csrf_protect():
+    if request.method in ("GET", "HEAD", "OPTIONS"):
+        return
+    if request.headers.get("X-Requested-With") != "naivepanel":
+        app.logger.warning(
+            "csrf: no X-Requested-With, %s %s from %s",
+            request.method, request.path, request.remote_addr,
+        )
+        abort(403, description="X-Requested-With header required")
+    site = request.headers.get("Sec-Fetch-Site")
+    if site is not None and site not in ("same-origin", "none"):
+        abort(403, description="cross-site request rejected")
+
+
 # --- HTTP Basic auth (опционально) ----------------------------------------
 
 @app.before_request
@@ -313,6 +384,7 @@ def _require_auth():
         request.remote_addr,
         request.path,
     )
+    time.sleep(0.5)  # подрезать онлайн-перебор; bcrypt и так медленный
     return Response(
         "auth required",
         401,
@@ -345,9 +417,12 @@ def _htpasswd_verify(stored: str, user: str, password: str) -> bool:
         if not h.startswith(("$2y$", "$2a$", "$2b$")):
             app.logger.warning("admin.pass: unsupported hash for %r (need bcrypt)", u)
             return False
-        if bcrypt.checkpw(password.encode(), h.encode()):
-            return True
-        return False  # пользователь найден, пароль не совпал
+        try:
+            return bcrypt.checkpw(password.encode(), h.encode())
+        except ValueError:
+            # битый хэш в admin.pass не должен превращать каждый запрос в 500
+            app.logger.warning("admin.pass: malformed bcrypt hash for %r", u)
+            return False
     return False  # пользователь не найден
 
 
@@ -377,7 +452,8 @@ def api_configs_list():
 def api_configs_get(name: str):
     if not NAME_RE.match(name):
         abort(400, description="invalid name")
-    return jsonify(_load_json(CONF_D / f"{name}.json"))
+    cfg = _load_json(CONF_D / f"{name}.json")
+    return jsonify(_for_edit(cfg))
 
 
 @app.route("/api/configs", methods=["POST"])
@@ -402,10 +478,9 @@ def api_configs_update(name: str):
     data = request.get_json(silent=True) or {}
     if "name" in data and data["name"] != name:
         abort(400, description="name in body must match URL")
-    cfg = _build_payload(data)
     path = CONF_D / f"{name}.json"
-    if not path.exists():
-        abort(404, description=f"preset {name!r} not found")
+    old = _load_json(path)  # 404, если пресета нет
+    cfg = _build_payload(data, old_proxy=old.get("proxy"))
     _save_json(path, cfg)
     if _active_name() == name:
         _write_active(name, cfg)

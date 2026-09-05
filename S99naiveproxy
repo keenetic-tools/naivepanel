@@ -23,6 +23,15 @@ LOGFILE=/opt/var/log/naiveproxy.log
 log()  { logger -t naiveproxy "$@"; echo "$@"; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# грубая ротация: лог аппендится без ограничений, не даём разрастись на USB
+truncate_log() {
+    [ -f "$LOGFILE" ] || return 0
+    if [ "$(wc -c <"$LOGFILE")" -gt 5242880 ]; then
+        : > "$LOGFILE"
+        log "truncated oversized $LOGFILE (>5M)"
+    fi
+}
+
 running() {
     [ -f "$PIDFILE" ] || return 1
     local pid
@@ -39,12 +48,18 @@ start() {
         log "daemon not found: $DAEMON"
         return 1
     fi
+    if [ -z "$DAEMON_OPTS" ]; then
+        # штатно до первого activate пресета в NaivePanel — не ошибка
+        log "no active config yet — activate a preset in NaivePanel"
+        return 0
+    fi
     if [ ! -r "$DAEMON_OPTS" ]; then
         log "config not readable: $DAEMON_OPTS"
         return 1
     fi
     [ -d /opt/var/log ] || mkdir -p /opt/var/log
     [ -d /opt/var/run ] || mkdir -p /opt/var/run
+    truncate_log
     log "starting $PROG with $DAEMON_OPTS"
     # nohup + & для отвязки от init; перенаправляем stdout/stderr → log-файл
     nohup "$DAEMON" "$DAEMON_OPTS" >>"$LOGFILE" 2>&1 &

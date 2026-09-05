@@ -110,8 +110,12 @@
       <label for="f_username">Username (basic_auth)</label>
       <input id="f_username" autocomplete="off" spellcheck="false">
 
-      <label for="f_password">Password (basic_auth)</label>
-      <input id="f_password" type="password" autocomplete="off">
+      <label for="f_password">Password (пусто = оставить прежний)</label>
+      <input id="f_password" type="password" autocomplete="new-password" placeholder="••••••••">
+      <div style="font-size:11px;color:var(--mut);margin-top:4px">
+        Пароль не возвращается из API: пустое поле при сохранении переиспользует
+        прежний, введённый — заменяет.
+      </div>
 
       <details>
         <summary style="cursor:pointer;color:var(--mut);margin-top:10px">Дополнительно</summary>
@@ -147,6 +151,8 @@ const $ = (id) => document.getElementById(id);
 let current = null; // выбранный пресет (имя) или null
 let dirty = false;  // есть несохранённые правки в редакторе
 
+const CSRF = {'X-Requested-With': 'naivepanel'}; // мутации без него сервер отбивает 403
+
 async function jget(url, tries = 2) {
   // GET идемпотентен: при сетевом сбое (не HTTP-ошибке) — одна повторная
   // попытка через 800мс. Сглаживает transient-гонки сразу после рестарта панели.
@@ -163,15 +169,15 @@ async function jget(url, tries = 2) {
 }
 async function jpost(url, body) {
   const r = await fetch(url, {method:'POST',
-    headers: body ? {'Content-Type':'application/json'} : {},
+    headers: {...CSRF, 'Content-Type':'application/json'},
     body: body ? JSON.stringify(body) : null});
   return handle(r);
 }
 async function jput(url, body) {
-  const r = await fetch(url, {method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+  const r = await fetch(url, {method:'PUT', headers:{...CSRF, 'Content-Type':'application/json'}, body:JSON.stringify(body)});
   return handle(r);
 }
-async function jdel(url) { const r = await fetch(url, {method:'DELETE'}); return handle(r); }
+async function jdel(url) { const r = await fetch(url, {method:'DELETE', headers:CSRF}); return handle(r); }
 
 async function handle(r) {
   const txt = await r.text();
@@ -197,12 +203,24 @@ function maybeDiscard() {
 async function refreshAll() {
   try {
     const [st, ps] = await Promise.all([jget('/api/status'), jget('/api/configs')]);
-    $('status').innerHTML = st.active
-      ? '<span class="on">● работает</span> · пресет: <b>'+escapeHtml(st.current||'?')+'</b>'
-      : '<span class="off">● остановлен</span>' + (st.current ? ' · пресет: '+escapeHtml(st.current) : '');
+    renderStatus(st);
     renderPresets(ps);
     loadLog();
   } catch (e) { flash(e.message, false); }
+}
+
+function renderStatus(st) {
+  const ver = st.version ? ' · v'+escapeHtml(st.version) : '';
+  $('status').innerHTML = (st.active
+    ? '<span class="on">● работает</span> · пресет: <b>'+escapeHtml(st.current||'?')+'</b>'
+    : '<span class="off">● остановлен</span>' + (st.current ? ' · пресет: '+escapeHtml(st.current) : ''))
+    + ver;
+}
+
+// Лёгкий поллинг: лог и статус сами показывают, что naive упал, без кликов.
+// Пресеты не трогаем — перерисовка списка каждые 3с мешает наведению/клику.
+async function pollStatus() {
+  try { renderStatus(await jget('/api/status')); } catch (e) { /* transient */ }
 }
 
 let lastPresets = []; // кэш для перерисовки при смене selected без лишнего запроса
@@ -237,16 +255,16 @@ async function selectPreset(name) {
   try {
     const cfg = await jget('/api/configs/'+encodeURIComponent(name));
     const listen = Array.isArray(cfg.listen) ? cfg.listen.join('\n') : (cfg.listen || '');
-    const proxy  = Array.isArray(cfg.proxy) ? cfg.proxy[0] : (cfg.proxy || '');
     $('editorTitle').textContent = 'Редактор — '+name;
     $('editor').style.display = 'block';
     $('f_name').value = name;
     $('f_name').disabled = true;
     $('f_listen').value = listen.replace(/^socks:\/\//gm, '');
-    const m = proxy.match(/^https?:\/\/([^:@/]+):([^@]+)@(.+)$/);
-    $('f_upstream').value = m ? m[3] : proxy;
-    $('f_username').value = m ? m[1] : '';
-    $('f_password').value = m ? m[2] : '';
+    // upstream/username приходят с сервера уже разобранными (без пароля),
+    // так что регэксп-парсинг proxy-URI на клиенте не нужен
+    $('f_upstream').value = cfg.upstream || '';
+    $('f_username').value = cfg.username || '';
+    $('f_password').value = '';
     $('f_log').value = cfg.log || '';
     $('f_host_resolver_rules').value = cfg['host-resolver-rules'] || '';
     $('f_extra_headers').value = cfg['extra-headers'] || '';
@@ -311,6 +329,7 @@ function formPayload() {
 async function activate(name) {
   const n = name || current;
   if (!n) return;
+  if (dirty && !confirm('В форме есть несохранённые правки — активируется последняя СОХРАНЁННАЯ версия пресета. Продолжить?')) return;
   try {
     await jpost('/api/configs/'+encodeURIComponent(n)+'/activate', null);
     flash('Активирован: '+n, true);
@@ -339,7 +358,7 @@ async function svc(action) {
 async function panelRestart() {
   if (!confirm('Перезапустить саму панель? Страница перезагрузится, когда сервер поднимется.')) return;
   try {
-    const r = await fetch('/api/panel/restart', {method:'POST'});
+    const r = await fetch('/api/panel/restart', {method:'POST', headers:CSRF});
     if (!(r.ok || r.status === 202)) { flash(await r.text(), false); return; }
   } catch (e) {
     flash('Не удалось отправить команду: '+e.message, false); return;
@@ -389,9 +408,9 @@ $('log').addEventListener('scroll', () => {
   logStuck = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 20;
 });
 
-// Автообновление лога: раз в 3с, только на видимой вкладке.
-setInterval(() => { if (!document.hidden) loadLog(); }, 3000);
-document.addEventListener('visibilitychange', () => { if (!document.hidden) loadLog(); });
+// Автообновление лога и статуса: раз в 3с, только на видимой вкладке.
+setInterval(() => { if (!document.hidden) { loadLog(); pollStatus(); } }, 3000);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) { loadLog(); pollStatus(); } });
 
 refreshAll();
 const hashMatch = location.hash.match(/^#preset=(.+)$/);

@@ -16,7 +16,7 @@
 set -eu
 
 REPO_DIR=$(cd "$(dirname "$0")" && pwd)
-REF=v0.2.0
+REF=v0.3.0
 BASE_IMAGE="${BASE_IMAGE:-debian:bookworm-slim}"
 AUTH_FLAG=""
 MODE_FLAGS="--yes"
@@ -98,6 +98,19 @@ echo "==> post-install state"
 /opt/etc/init.d/S99naivepanel status || true
 echo "smoke http_code=\$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8089/api/status)"
 ls -l /opt/etc/rc.d/
+
+echo "==> API checks (CSRF + write-only password)"
+H='-H X-Requested-With:naivepanel'
+code=\$(curl -s -o /tmp/create.json -w '%{http_code}' \$H -H 'Content-Type: application/json' \
+  -d '{"name":"home","listen":"127.0.0.1:1080","upstream":"proxy.example.com","username":"user","password":"p@ss:word"}' \
+  http://127.0.0.1:8089/api/configs)
+echo "create=\$code (expect 201)"
+if curl -s http://127.0.0.1:8089/api/configs/home | grep -q '"password"'; then
+  echo "FAIL: password leaked via GET"; exit 1
+fi
+echo "get raw: \$(curl -s http://127.0.0.1:8089/api/configs/home)"
+echo "csrf_no_header=\$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8089/api/service/stop) (expect 403)"
+echo "csrf_with_header=\$(curl -s \$H -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8089/api/service/stop) (expect 200)"
 echo "==> E2E DONE"
 EOF
 

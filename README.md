@@ -59,7 +59,7 @@ Entware с `opkg`). Скачивает файлы, закреплённые за
 контрольные суммы (`SHA256SUMS`), ставит init-скрипты и запускает панель:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/v0.2.0/install.sh | sh -s -- --with-auth
+curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/v0.3.0/install.sh | sh -s -- --with-auth
 ```
 
 Запуск через пайп безопасен: подтверждение установки и ввод пароля читаются
@@ -73,7 +73,7 @@ curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/v0.2.0/in
 | `--with-auth` | интерактивно создаёт `/opt/etc/naive/panel/admin.pass` (HTTP Basic) |
 | `--bind HOST:PORT` | пишет `NAIVEPANEL_BIND` в `/opt/etc/init.d/rc.conf` |
 | `--hosts LIST` | пишет `NAIVEPANEL_HOSTS` (allowlist Host-заголовков) |
-| `--ref TAG` | устанавливает конкретный тег (по умолчанию `v0.2.0`) |
+| `--ref TAG` | устанавливает конкретный тег (по умолчанию `v0.3.0`) |
 | `--no-naive-init` | не ставить `S99naiveproxy` (если свой init-скрипт уже есть) |
 | `--yes` | неинтерактивный режим (без подтверждения) |
 | `--uninstall` | остановить сервисы и удалить файлы |
@@ -97,7 +97,7 @@ curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/v0.2.0/in
 Пример с LAN-доступом:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/v0.2.0/install.sh \
+curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/v0.3.0/install.sh \
   | sh -s -- --with-auth --bind 192.168.1.1:8089 --hosts '192.168.1.1:8089,router.local:8089'
 ```
 
@@ -261,6 +261,13 @@ NaivePanel собирает минимальный JSON, совместимый 
 - Активация пресета валидирует имя: `^[a-zA-Z0-9_\-.]{1,64}$` (нет path-traversal).
 - Bind на `0.0.0.0` — warning в лог: на роутере это ещё и WAN/VPN/guest-сегменты.
 - 401 (auth failed) и 403 (host rejected) пишутся в лог панели.
+- Мутирующие запросы (POST/PUT/DELETE) требуют заголовок `X-Requested-With`
+  (ставит UI) — защита от CSRF: Basic-креды браузер прикладывает к кросс-сайтовым
+  запросам автоматически, поэтому одной auth тут недостаточно. Неудачная auth
+  замедляется на 0.5с (анти-перебор).
+- Пароли upstream через API не возвращаются: `GET /api/configs/<name>` отдаёт
+  upstream/username разобранными, но без пароля; пустое поле пароля в форме
+  при сохранении означает «оставить прежний».
 - Пароль панели и `admin.pass` НЕ коммитить в git.
 
 ## Что НЕ реализовано (по спеке wiki)
