@@ -3,7 +3,7 @@
 # Init-скрипт для клиента NaiveProxy на Entware (Keenetic).
 #
 # Ожидает:
-#   /opt/etc/naiveproxy/config.json   — активная конфигурация (создаётся NaivePanel)
+#   /opt/etc/naive/proxy/config.json  — активная конфигурация (создаётся NaivePanel)
 #   /opt/bin/naive                    — бинарник из пакета naive-proxy в Entware
 #   /opt/var/log/naiveproxy.log       — лог
 #   /opt/var/run/naiveproxy.pid       — pid
@@ -13,11 +13,11 @@
 ENABLED=yes
 PROG=naive
 DAEMON=/opt/bin/$PROG
-DAEMON_OPTS=/opt/etc/naiveproxy/config.json
+DAEMON_OPTS=/opt/etc/naive/proxy/config.json
 PIDFILE=/opt/var/run/naiveproxy.pid
 LOGFILE=/opt/var/log/naiveproxy.log
 
-[ -f /opt/etc/naiveproxy/config.json ] || DAEMON_OPTS=
+[ -f /opt/etc/naive/proxy/config.json ] || DAEMON_OPTS=
 
 # --- helpers ---------------------------------------------------------------
 log()  { logger -t naiveproxy "$@"; echo "$@"; }

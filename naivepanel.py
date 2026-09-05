@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """NaivePanel — локальная веб-панель управления клиентом NaiveProxy на Keenetic/Entware.
 
-Хранит пресеты конфигураций в /opt/etc/naiveproxy/conf.d/<name>.json,
-при activate копирует один из них в /opt/etc/naiveproxy/config.json
+Хранит пресеты конфигураций в /opt/etc/naive/proxy/conf.d/<name>.json,
+при activate копирует один из них в /opt/etc/naive/proxy/config.json
 (chmod 0600) и перезапускает init-скрипт S99naiveproxy.
 
 Bind по умолчанию 127.0.0.1:8089 — публикация через внешний reverse proxy
@@ -23,14 +23,14 @@ from flask import Flask, Response, abort, jsonify, make_response, render_templat
 
 # --- Конфигурация путей (на Keenetic/Entware) -----------------------------
 
-NAIVEPROXY_DIR = Path(os.environ.get("NAIVEPROXY_DIR", "/opt/etc/naiveproxy"))
+NAIVEPROXY_DIR = Path(os.environ.get("NAIVEPROXY_DIR", "/opt/etc/naive/proxy"))
 CONF_D = NAIVEPROXY_DIR / "conf.d"
 ACTIVE_CONFIG = NAIVEPROXY_DIR / "config.json"
 ACTIVE_POINTER = NAIVEPROXY_DIR / ".active"  # имя текущего активного пресета
 INIT_SCRIPT = Path(os.environ.get("NAIVEPROXY_INIT", "/opt/etc/init.d/S99naiveproxy"))
 LOG_FILE = Path(os.environ.get("NAIVEPROXY_LOG", "/opt/var/log/naiveproxy.log"))
 PID_FILE = Path(os.environ.get("NAIVEPROXY_PID", "/opt/var/run/naiveproxy.pid"))
-PANEL_ADMIN_PASS = Path(os.environ.get("NAIVEPANEL_PASS", "/opt/etc/naivepanel/admin.pass"))
+PANEL_ADMIN_PASS = Path(os.environ.get("NAIVEPANEL_PASS", "/opt/etc/naive/panel/admin.pass"))
 PANEL_BIND = os.environ.get("NAIVEPANEL_BIND", "127.0.0.1:8089")
 # Allowlist Host-заголовков (через запятую, с портом). Пусто — проверка выкл.
 ALLOWED_HOSTS = {h.strip() for h in os.environ.get("NAIVEPANEL_HOSTS", "").split(",") if h.strip()}
@@ -293,7 +293,7 @@ def _enforce_host_allowlist():
 
 @app.before_request
 def _require_auth():
-    """Если /opt/etc/naivepanel/admin.pass существует — требует HTTP Basic auth
+    """Если /opt/etc/naive/panel/admin.pass существует — требует HTTP Basic auth
     на каждый запрос. Формат файла — стандартный htpasswd: `user:bcrypt-hash`
     на строку. Создание: `htpasswd -B -c admin.pass user` (или python3-bcrypt —
     в Entware htpasswd отсутствует, см. README).

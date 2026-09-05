@@ -12,8 +12,8 @@ HTML page — no CDN, no build step. MIT-licensed.
 ## Что это
 
 - **Flask-приложение** (~390 строк, одна HTML-страница, без CDN / без build step).
-- Хранит **N пресетов** конфигурации клиента в `/opt/etc/naiveproxy/conf.d/<name>.json`.
-- По activate копирует пресет в `/opt/etc/naiveproxy/config.json` (`chmod 0600`)
+- Хранит **N пресетов** конфигурации клиента в `/opt/etc/naive/proxy/conf.d/<name>.json`.
+- По activate копирует пресет в `/opt/etc/naive/proxy/config.json` (`chmod 0600`)
   и перезапускает `/opt/etc/init.d/S99naiveproxy`.
 - Bind по умолчанию `127.0.0.1:8089`. Доступ из LAN — через внешний reverse proxy
   или напрямую (см. «Доступ из LAN без reverse proxy»).
@@ -59,7 +59,7 @@ Entware с `opkg`). Скачивает файлы, закреплённые за
 контрольные суммы (`SHA256SUMS`), ставит init-скрипты и запускает панель:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/v0.1.1/install.sh | sh -s -- --with-auth
+curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/v0.2.0/install.sh | sh -s -- --with-auth
 ```
 
 Запуск через пайп безопасен: подтверждение установки и ввод пароля читаются
@@ -70,10 +70,10 @@ curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/v0.1.1/in
 
 | Флаг | Что делает |
 |------|------------|
-| `--with-auth` | интерактивно создаёт `/opt/etc/naivepanel/admin.pass` (HTTP Basic) |
+| `--with-auth` | интерактивно создаёт `/opt/etc/naive/panel/admin.pass` (HTTP Basic) |
 | `--bind HOST:PORT` | пишет `NAIVEPANEL_BIND` в `/opt/etc/init.d/rc.conf` |
 | `--hosts LIST` | пишет `NAIVEPANEL_HOSTS` (allowlist Host-заголовков) |
-| `--ref TAG` | устанавливает конкретный тег (по умолчанию `v0.1.1`) |
+| `--ref TAG` | устанавливает конкретный тег (по умолчанию `v0.2.0`) |
 | `--no-naive-init` | не ставить `S99naiveproxy` (если свой init-скрипт уже есть) |
 | `--yes` | неинтерактивный режим (без подтверждения) |
 | `--uninstall` | остановить сервисы и удалить файлы |
@@ -81,6 +81,12 @@ curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/v0.1.1/in
 
 Установщик идемпотентен: повторный запуск = обновление. Файлы панели
 обновляются, а `admin.pass` и пресеты в `conf.d/` остаются нетронутыми.
+
+Каталоги продукта (начиная с v0.2.0): `/opt/etc/naive/panel` — код панели и
+`admin.pass`, `/opt/etc/naive/proxy` — пресеты (`conf.d/`), активный
+`config.json` и `.active`. Установка поверх схемы < v0.2.0 мигрирует
+автоматически: `/opt/naivepanel`, `/opt/etc/naivepanel`,
+`/opt/etc/naiveproxy` переносятся в новое дерево, данные сохраняются.
 
 Зависимости ставятся через `opkg`, а не pip: `python3` (если его ещё нет в
 `/opt`), `python3-flask`, при `--with-auth` — `python3-bcrypt`. На фидах без
@@ -91,7 +97,7 @@ curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/v0.1.1/in
 Пример с LAN-доступом:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/v0.1.1/install.sh \
+curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/v0.2.0/install.sh \
   | sh -s -- --with-auth --bind 192.168.1.1:8089 --hosts '192.168.1.1:8089,router.local:8089'
 ```
 
@@ -133,13 +139,12 @@ curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/v0.1.1/in
 ```bash
 # 1. Копируем файлы (через sshfs, scp или WebUI Keenetic)
 ssh root@router
-mkdir -p /opt/naivepanel
-mkdir -p /opt/etc/naiveproxy/conf.d
-mkdir -p /opt/etc/naivepanel
+mkdir -p /opt/etc/naive/panel/templates
+mkdir -p /opt/etc/naive/proxy/conf.d
 
 # Положить naivepanel.py + templates/index.html (нужен для render_template)
-scp naivepanel.py root@router:/opt/naivepanel/
-scp -r templates  root@router:/opt/naivepanel/
+scp naivepanel.py root@router:/opt/etc/naive/panel/
+scp -r templates  root@router:/opt/etc/naive/panel/
 scp S99naivepanel   root@router:/opt/etc/init.d/
 scp S99naiveproxy   root@router:/opt/etc/init.d/    # если у тебя ещё нет
 ssh root@router "chmod +x /opt/etc/init.d/S99naiveproxy /opt/etc/init.d/S99naivepanel"
@@ -151,8 +156,8 @@ opkg update && opkg install python3-bcrypt
 #    htpasswd в Entware отсутствует — генерируем bcrypt-хэш через python3
 #    (пароль вводится скрыто). Формат строки: admin:$2b$…
 python3 -c 'import bcrypt,getpass; print("admin:"+bcrypt.hashpw(getpass.getpass().encode(),bcrypt.gensalt()).decode())' \
-  > /opt/etc/naivepanel/admin.pass
-chmod 0600 /opt/etc/naivepanel/admin.pass
+  > /opt/etc/naive/panel/admin.pass
+chmod 0600 /opt/etc/naive/panel/admin.pass
 
 # 3. Запуск
 /opt/etc/init.d/S99naivepanel start
@@ -191,8 +196,8 @@ naivepanel.local.lan {
 opkg update && opkg install python3-bcrypt
 #    htpasswd в Entware отсутствует — генерируем bcrypt-хэш через python3
 python3 -c 'import bcrypt,getpass; print("admin:"+bcrypt.hashpw(getpass.getpass().encode(),bcrypt.gensalt()).decode())' \
-  > /opt/etc/naivepanel/admin.pass
-chmod 0600 /opt/etc/naivepanel/admin.pass
+  > /opt/etc/naive/panel/admin.pass
+chmod 0600 /opt/etc/naive/panel/admin.pass
 
 # 2. Bind на LAN-адрес (НЕ 0.0.0.0 — иначе торчим и в WAN/VPN/guest-сегменты)
 #    и allowlist Host-заголовков (анти-DNS-rebinding), в /opt/etc/init.d/rc.conf:
@@ -247,7 +252,7 @@ NaivePanel собирает минимальный JSON, совместимый 
 - Bind по умолчанию только `127.0.0.1`; LAN-bind — по чеклисту
   «Доступ из LAN без reverse proxy».
 - `config.json`, `.active`, `*.json` в `conf.d/` — `chmod 0600`.
-- Если есть `/opt/etc/naivepanel/admin.pass` — **каждый** запрос требует HTTP Basic
+- Если есть `/opt/etc/naive/panel/admin.pass` — **каждый** запрос требует HTTP Basic
   auth (bcrypt, формат htpasswd `user:$2y$…`). Без пакета `python3-bcrypt` в
   Entware auth fail-closed (401 на любой запрос + ошибка в лог).
 - Если задан `NAIVEPANEL_HOSTS` (список через запятую, точные строки Host с

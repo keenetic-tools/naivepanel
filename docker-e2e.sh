@@ -16,7 +16,7 @@
 set -eu
 
 REPO_DIR=$(cd "$(dirname "$0")" && pwd)
-REF=v0.1.1
+REF=v0.2.0
 BASE_IMAGE="${BASE_IMAGE:-debian:bookworm-slim}"
 AUTH_FLAG=""
 MODE_FLAGS="--yes"

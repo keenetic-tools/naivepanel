@@ -3,18 +3,19 @@
 # firmware with Entware). Runs ON the router.
 #
 # Bootstrap (pin to a release tag, not `main`):
-#   curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/v0.1.1/install.sh | sh -s -- --with-auth
+#   curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/v0.2.0/install.sh | sh -s -- --with-auth
 #
 # Safe to pipe into `sh`: the confirmation and password prompts read the
 # terminal (/dev/tty), never the piped stdin. Add --yes to skip confirmation.
 #
-# Idempotent upgrade: just run it again. Config (admin.pass, conf.d/*) is kept.
+# Idempotent upgrade: just run it again. Config (admin.pass, conf.d/*) is kept;
+# a pre-0.2.0 layout is migrated automatically.
 #
 # Flags:
-#   --with-auth          create /opt/etc/naivepanel/admin.pass (interactive)
+#   --with-auth          create /opt/etc/naive/panel/admin.pass (interactive)
 #   --bind HOST:PORT     write NAIVEPANEL_BIND to /opt/etc/init.d/rc.conf
 #   --hosts LIST         write NAIVEPANEL_HOSTS to /opt/etc/init.d/rc.conf
-#   --ref TAG            git tag/ref to install (default: v0.1.1)
+#   --ref TAG            git tag/ref to install (default: v0.2.0)
 #   --no-naive-init      do not install S99naiveproxy init script
 #   --yes                non-interactive (no confirmation prompt)
 #   --uninstall          stop services and remove installed files
@@ -23,7 +24,7 @@
 set -u
 
 REPO="keenetic-tools/naivepanel"
-REF="v0.1.1"
+REF="v0.2.0"
 BIND=""
 HOSTS=""
 WITH_AUTH=0
@@ -32,10 +33,10 @@ YES=0
 UNINSTALL=0
 PURGE=0
 
-PANEL_DIR=/opt/naivepanel
-PANEL_ETC=/opt/etc/naivepanel
+NAIVE_ROOT=/opt/etc/naive
+PANEL_DIR=/opt/etc/naive/panel
+NAIVEPROXY_DIR=/opt/etc/naive/proxy
 INIT_DIR=/opt/etc/init.d
-NAIVEPROXY_DIR=/opt/etc/naiveproxy
 RC_CONF=/opt/etc/init.d/rc.conf
 
 info() { echo "==> $*"; }
@@ -56,10 +57,10 @@ usage() {
     cat <<'EOF'
 Usage: install.sh [flags]
 
-  --with-auth          create /opt/etc/naivepanel/admin.pass (interactive)
+  --with-auth          create /opt/etc/naive/panel/admin.pass (interactive)
   --bind HOST:PORT     write NAIVEPANEL_BIND to /opt/etc/init.d/rc.conf
   --hosts LIST         write NAIVEPANEL_HOSTS to /opt/etc/init.d/rc.conf
-  --ref TAG            git tag/ref to install (default: v0.1.1)
+  --ref TAG            git tag/ref to install (default: v0.2.0)
   --no-naive-init      do not install S99naiveproxy init script
   --yes                non-interactive (no confirmation prompt)
   --uninstall          stop services and remove installed files
@@ -100,16 +101,15 @@ if [ "$UNINSTALL" = 1 ]; then
         rm -f "/opt/etc/rc.d/$init"
         [ "$PURGE" = 1 ] && rm -f "$INIT_DIR/$init"
     done
-    rm -f "$PANEL_DIR/naivepanel.py"
-    rm -rf "$PANEL_DIR/templates"
-    rmdir "$PANEL_DIR" 2>/dev/null || true
     if [ "$PURGE" = 1 ]; then
-        rm -f "$PANEL_ETC/admin.pass"
-        rm -rf "$NAIVEPROXY_DIR/conf.d"
-        rmdir "$PANEL_ETC" 2>/dev/null || true
+        rm -f "$PANEL_DIR/admin.pass"
+        rm -rf "$NAIVEPROXY_DIR" /opt/etc/naiveproxy /opt/etc/naivepanel /opt/naivepanel
         sed -i '/^[[:space:]]*NAIVEPANEL_BIND=/d;/^[[:space:]]*NAIVEPANEL_HOSTS=/d' "$RC_CONF" 2>/dev/null || true
-        info "purged configs (admin.pass, conf.d, rc.conf vars)"
+        info "purged configs (admin.pass, proxy configs, rc.conf vars)"
     fi
+    rm -f "$PANEL_DIR/naivepanel.py" /opt/naivepanel/naivepanel.py
+    rm -rf "$PANEL_DIR/templates" /opt/naivepanel/templates
+    rmdir "$PANEL_DIR" /opt/naivepanel /opt/etc/naivepanel "$NAIVE_ROOT" 2>/dev/null || true
     info "uninstall complete"
     exit 0
 fi
@@ -131,6 +131,42 @@ if [ "$YES" != 1 ]; then
         die "no terminal to confirm the install — re-run with --yes"
     fi
     case "$ans" in y|Y|yes|YES) ;; *) echo "aborted" >&2; exit 1 ;; esac
+fi
+
+# --- migrate pre-0.2.0 layout -----------------------------------------------
+
+OLD_PANEL_DIR=/opt/naivepanel
+OLD_PANEL_ETC=/opt/etc/naivepanel
+OLD_PROXY_DIR=/opt/etc/naiveproxy
+
+if [ -d "$OLD_PANEL_DIR" ] || [ -d "$OLD_PANEL_ETC" ] || [ -d "$OLD_PROXY_DIR" ]; then
+    info "migrating pre-0.2.0 layout → $NAIVE_ROOT"
+    # services hold absolute paths — stop before moving anything
+    "$INIT_DIR/S99naivepanel" stop >/dev/null 2>&1 || true
+    "$INIT_DIR/S99naiveproxy" stop >/dev/null 2>&1 || true
+    mkdir -p "$NAIVE_ROOT"
+    if [ -d "$OLD_PROXY_DIR" ]; then
+        if [ -d "$NAIVEPROXY_DIR" ]; then
+            warn "both $OLD_PROXY_DIR and $NAIVEPROXY_DIR exist — keeping the new one"
+        else
+            mv "$OLD_PROXY_DIR" "$NAIVEPROXY_DIR" || die "mv $OLD_PROXY_DIR"
+        fi
+    fi
+    mkdir -p "$PANEL_DIR"
+    if [ -f "$OLD_PANEL_ETC/admin.pass" ]; then
+        if [ -f "$PANEL_DIR/admin.pass" ]; then
+            warn "admin.pass exists in both places — keeping $PANEL_DIR/admin.pass"
+        else
+            mv "$OLD_PANEL_ETC/admin.pass" "$PANEL_DIR/admin.pass" || die "mv admin.pass"
+        fi
+        rmdir "$OLD_PANEL_ETC" 2>/dev/null || true
+    fi
+    # the old app dir holds only distributive files — the fresh copy now lives
+    # in $PANEL_DIR; drop the stale one so there is no second copy to edit
+    rm -f "$OLD_PANEL_DIR/naivepanel.py"
+    rm -rf "$OLD_PANEL_DIR/templates"
+    rmdir "$OLD_PANEL_DIR" 2>/dev/null \
+        || warn "kept $OLD_PANEL_DIR (contains unexpected files)"
 fi
 
 # --- python + deps ---------------------------------------------------------
@@ -225,7 +261,7 @@ putfile() {  # $1=src $2=dst $3=mode
     chmod "$3" "$2"
 }
 
-mkdir -p "$PANEL_DIR/templates" "$PANEL_ETC" "$NAIVEPROXY_DIR/conf.d"
+mkdir -p "$PANEL_DIR/templates" "$NAIVEPROXY_DIR/conf.d"
 
 putfile "$STAGE/naivepanel.py" "$PANEL_DIR/naivepanel.py" 0644
 putfile "$STAGE/templates/index.html" "$PANEL_DIR/templates/index.html" 0644
@@ -255,15 +291,17 @@ if [ "$WITH_AUTH" = 1 ]; then
     if [ ! -t 0 ] && ! { [ -c /dev/tty ] && : 2>/dev/null </dev/tty; }; then
         die "--with-auth needs an interactive terminal for the password prompt"
     fi
-    info "setting up panel password (stored in $PANEL_ETC/admin.pass)"
+    info "setting up panel password (stored in $PANEL_DIR/admin.pass)"
     "$PYTHON" -c 'import bcrypt,getpass,sys; sys.stdout.write("admin:"+bcrypt.hashpw(getpass.getpass("password: ").encode(), bcrypt.gensalt()).decode()+"\n")' \
-        >"$PANEL_ETC/admin.pass" || die "bcrypt hash generation failed"
-    chmod 0600 "$PANEL_ETC/admin.pass"
+        >"$PANEL_DIR/admin.pass" || die "bcrypt hash generation failed"
+    chmod 0600 "$PANEL_DIR/admin.pass"
 fi
 
 # --- start + smoke ---------------------------------------------------------
 
 "$INIT_DIR/S99naivepanel" start || true
+# при апгрейде/миграции поднимаем и proxy, если активная конфигурация уже есть
+[ -f "$NAIVEPROXY_DIR/config.json" ] && "$INIT_DIR/S99naiveproxy" start >/dev/null 2>&1 || true
 
 BIND_ADDR="${BIND:-127.0.0.1:8089}"
 # init script sets default 127.0.0.1:8089; if rc.conf overrides it, read it back

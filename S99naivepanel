@@ -3,7 +3,7 @@
 # Init-скрипт для NaivePanel (Flask UI) на Entware (Keenetic).
 #
 # Ожидает:
-#   /opt/naivepanel/naivepanel.py — основной скрипт
+#   /opt/etc/naive/panel/naivepanel.py — основной скрипт
 #   /opt/bin/python3 или /opt/bin/python — интерпретатор (из пакета python3 в Entware)
 #   /opt/var/run/naivepanel.pid — pid
 #   /opt/var/log/naivepanel.log — stdout/stderr
@@ -13,25 +13,25 @@
 # Конфигурация через переменные окружения (можно задать в /opt/etc/init.d/rc.conf):
 #   NAIVEPANEL_BIND=127.0.0.1:8089
 #   NAIVEPANEL_HOSTS=192.168.1.1:8089,...            # allowlist Host (анти-rebinding); пусто = выкл
-#   NAIVEPROXY_DIR=/opt/etc/naiveproxy
+#   NAIVEPROXY_DIR=/opt/etc/naive/proxy
 #   NAIVEPROXY_INIT=/opt/etc/init.d/S99naiveproxy
 #   NAIVEPROXY_LOG=/opt/var/log/naiveproxy.log
-#   NAIVEPANEL_PASS=/opt/etc/naivepanel/admin.pass   # если файла нет — auth отключена
+#   NAIVEPANEL_PASS=/opt/etc/naive/panel/admin.pass  # если файла нет — auth отключена
 
 ENABLED=yes
 PROG=naivepanel
-APP=/opt/naivepanel/naivepanel.py
+APP=/opt/etc/naive/panel/naivepanel.py
 PIDFILE=/opt/var/run/naivepanel.pid
 LOGFILE=/opt/var/log/naivepanel.log
 
 # Defaults (можно переопределить в /opt/etc/init.d/rc.conf перед вызовом)
 : ${NAIVEPANEL_BIND:=127.0.0.1:8089}
 : ${NAIVEPANEL_HOSTS:=}
-: ${NAIVEPROXY_DIR:=/opt/etc/naiveproxy}
+: ${NAIVEPROXY_DIR:=/opt/etc/naive/proxy}
 : ${NAIVEPROXY_INIT:=/opt/etc/init.d/S99naiveproxy}
 : ${NAIVEPROXY_LOG:=/opt/var/log/naiveproxy.log}
 : ${NAIVEPROXY_PID:=/opt/var/run/naiveproxy.pid}
-: ${NAIVEPANEL_PASS:=/opt/etc/naivepanel/admin.pass}
+: ${NAIVEPANEL_PASS:=/opt/etc/naive/panel/admin.pass}
 export NAIVEPANEL_BIND NAIVEPANEL_HOSTS NAIVEPROXY_DIR NAIVEPROXY_INIT NAIVEPROXY_LOG NAIVEPROXY_PID NAIVEPANEL_PASS
 
 # python в Entware живёт в /opt/bin; fallback — системный
