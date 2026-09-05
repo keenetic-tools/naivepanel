@@ -59,8 +59,12 @@ Entware с `opkg`). Скачивает файлы, закреплённые за
 контрольные суммы (`SHA256SUMS`), ставит init-скрипты и запускает панель:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/v0.1.0/install.sh | sh -s -- --with-auth
+curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/v0.1.1/install.sh | sh -s -- --with-auth
 ```
+
+Запуск через пайп безопасен: подтверждение установки и ввод пароля читаются
+с терминала (`/dev/tty`), а не из stdin скрипта. Для полностью неинтерактивного
+режима добавьте `--yes`.
 
 Флаги:
 
@@ -69,7 +73,7 @@ curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/v0.1.0/in
 | `--with-auth` | интерактивно создаёт `/opt/etc/naivepanel/admin.pass` (HTTP Basic) |
 | `--bind HOST:PORT` | пишет `NAIVEPANEL_BIND` в `/opt/etc/init.d/rc.conf` |
 | `--hosts LIST` | пишет `NAIVEPANEL_HOSTS` (allowlist Host-заголовков) |
-| `--ref TAG` | устанавливает конкретный тег (по умолчанию `v0.1.0`) |
+| `--ref TAG` | устанавливает конкретный тег (по умолчанию `v0.1.1`) |
 | `--no-naive-init` | не ставить `S99naiveproxy` (если свой init-скрипт уже есть) |
 | `--yes` | неинтерактивный режим (без подтверждения) |
 | `--uninstall` | остановить сервисы и удалить файлы |
@@ -78,14 +82,16 @@ curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/v0.1.0/in
 Установщик идемпотентен: повторный запуск = обновление. Файлы панели
 обновляются, а `admin.pass` и пресеты в `conf.d/` остаются нетронутыми.
 
-Зависимости ставятся через `opkg`, а не pip: `python3` (если < 3.10),
-`python3-flask`, при `--with-auth` — `python3-bcrypt`. Отсутствие бинарника
-`naive` не блокирует установку — только предупреждение.
+Зависимости ставятся через `opkg`, а не pip: `python3` (если его ещё нет в
+`/opt`), `python3-flask`, при `--with-auth` — `python3-bcrypt`. На фидах без
+`python3-flask` (например `aarch64-k3.10`) установщик ставит `python3-pip`
+и flask через `pip3`. Отсутствие бинарника `naive` не блокирует установку —
+только предупреждение.
 
 Пример с LAN-доступом:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/v0.1.0/install.sh \
+curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/v0.1.1/install.sh \
   | sh -s -- --with-auth --bind 192.168.1.1:8089 --hosts '192.168.1.1:8089,router.local:8089'
 ```
 
