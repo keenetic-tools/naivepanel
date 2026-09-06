@@ -3,7 +3,7 @@
 # firmware with Entware). Runs ON the router.
 #
 # Bootstrap (pin to a release tag, not `main`):
-#   curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/v0.4.0/install.sh | sh -s -- --with-auth
+#   curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/v0.4.1/install.sh | sh -s -- --with-auth
 #
 # Safe to pipe into `sh`: the confirmation and password prompts read the
 # terminal (/dev/tty), never the piped stdin. Add --yes to skip confirmation.
@@ -13,9 +13,9 @@
 #
 # Flags:
 #   --with-auth          create /opt/etc/naive/panel/admin.pass (interactive)
-#   --bind HOST:PORT     write NAIVEPANEL_BIND to /opt/etc/init.d/rc.conf
-#   --hosts LIST         write NAIVEPANEL_HOSTS to /opt/etc/init.d/rc.conf
-#   --ref TAG            git tag/ref to install (default: v0.3.0)
+#   --bind HOST:PORT     write NAIVEPANEL_BIND to /opt/etc/naive/panel/panel.conf
+#   --hosts LIST         write NAIVEPANEL_HOSTS to /opt/etc/naive/panel/panel.conf
+#   --ref TAG            git tag/ref to install (default: v0.4.1)
 #   --no-naive-init      do not install S99naiveproxy init script
 #   --yes                non-interactive (no confirmation prompt)
 #   --uninstall          stop services and remove installed files
@@ -24,7 +24,7 @@
 set -u
 
 REPO="keenetic-tools/naivepanel"
-REF="v0.4.0"
+REF="v0.4.1"
 BIND=""
 HOSTS=""
 WITH_AUTH=0
@@ -37,6 +37,8 @@ NAIVE_ROOT=/opt/etc/naive
 PANEL_DIR=/opt/etc/naive/panel
 NAIVEPROXY_DIR=/opt/etc/naive/proxy
 INIT_DIR=/opt/etc/init.d
+PANEL_CONF=/opt/etc/naive/panel/panel.conf
+# legacy (pre-0.4.1): настройки писались сюда, но не читались init-скриптом
 RC_CONF=/opt/etc/init.d/rc.conf
 
 info() { echo "==> $*"; }
@@ -58,21 +60,15 @@ usage() {
 Usage: install.sh [flags]
 
   --with-auth          create /opt/etc/naive/panel/admin.pass (interactive)
-  --bind HOST:PORT     write NAIVEPANEL_BIND to /opt/etc/init.d/rc.conf
-  --hosts LIST         write NAIVEPANEL_HOSTS to /opt/etc/init.d/rc.conf
-  --ref TAG            git tag/ref to install (default: v0.3.0)
+  --bind HOST:PORT     write NAIVEPANEL_BIND to /opt/etc/naive/panel/panel.conf
+  --hosts LIST         write NAIVEPANEL_HOSTS to /opt/etc/naive/panel/panel.conf
+  --ref TAG            git tag/ref to install (default: v0.4.1)
   --no-naive-init      do not install S99naiveproxy init script
   --yes                non-interactive (no confirmation prompt)
   --uninstall          stop services and remove installed files
   --purge              with --uninstall: also remove configs and admin.pass
 EOF
     exit 0
-}
-
-rc_conf_set() {  # $1=VAR $2=value
-    [ -f "$RC_CONF" ] || : >"$RC_CONF"
-    sed -i "/^[[:space:]]*$1=/d" "$RC_CONF"
-    echo "$1=\"$2\"" >>"$RC_CONF"
 }
 
 gen_admin_pass() {  # -> stdout: `admin:<bcrypt-hash>`; пароль спрашивается дважды
@@ -90,6 +86,14 @@ for _ in range(3):
     sys.exit(0)
 sys.exit(1)
 PY
+}
+
+# panel.conf: единственное место настроек панели — его читает сам
+# naivepanel.py, поэтому файл переживает любые обновления init-скрипта.
+conf_upsert() {  # $1=KEY $2=value — обновить ключ, остальное не трогать
+    [ -f "$PANEL_CONF" ] || : >"$PANEL_CONF"
+    sed -i "/^[[:space:]]*$1=/d" "$PANEL_CONF"
+    echo "$1=\"$2\"" >>"$PANEL_CONF"
 }
 
 # --- arg parsing -----------------------------------------------------------
@@ -110,7 +114,7 @@ while [ $# -gt 0 ]; do
     shift
 done
 
-# --- validate values (они попадают в rc.conf, который sourced'ится шеллом) ---
+# --- validate values (попадают в panel.conf и в Host-allowlist) -------------
 
 if [ -n "$BIND" ]; then
     echo "$BIND" | grep -Eq '^\[?[A-Za-z0-9.:-]+\]?:[0-9]+$' \
@@ -130,10 +134,10 @@ if [ "$UNINSTALL" = 1 ]; then
         [ "$PURGE" = 1 ] && rm -f "$INIT_DIR/$init"
     done
     if [ "$PURGE" = 1 ]; then
-        rm -f "$PANEL_DIR/admin.pass"
+        rm -f "$PANEL_DIR/admin.pass" "$PANEL_CONF"
         rm -rf "$NAIVEPROXY_DIR" /opt/etc/naiveproxy /opt/etc/naivepanel /opt/naivepanel
         sed -i '/^[[:space:]]*NAIVEPANEL_BIND=/d;/^[[:space:]]*NAIVEPANEL_HOSTS=/d' "$RC_CONF" 2>/dev/null || true
-        info "purged configs (admin.pass, proxy configs, rc.conf vars)"
+        info "purged configs (admin.pass, panel.conf, proxy configs, legacy rc.conf vars)"
     fi
     rm -f "$PANEL_DIR/naivepanel.py" /opt/naivepanel/naivepanel.py
     rm -rf "$PANEL_DIR/templates" /opt/naivepanel/templates
@@ -166,9 +170,11 @@ fi
 OLD_PANEL_DIR=/opt/naivepanel
 OLD_PANEL_ETC=/opt/etc/naivepanel
 OLD_PROXY_DIR=/opt/etc/naiveproxy
+MIGRATED=0
 
 if [ -d "$OLD_PANEL_DIR" ] || [ -d "$OLD_PANEL_ETC" ] || [ -d "$OLD_PROXY_DIR" ]; then
     info "migrating pre-0.2.0 layout → $NAIVE_ROOT"
+    MIGRATED=1
     # services hold absolute paths — stop before moving anything
     "$INIT_DIR/S99naivepanel" stop >/dev/null 2>&1 || true
     "$INIT_DIR/S99naiveproxy" stop >/dev/null 2>&1 || true
@@ -297,6 +303,11 @@ putfile "$STAGE/S99naivepanel" "$INIT_DIR/S99naivepanel" 0755
 
 if [ "$NO_NAIVE_INIT" = 1 ]; then
     warn "skipping S99naiveproxy (--no-naive-init)"
+elif [ "$MIGRATED" = 1 ]; then
+    # старый скрипт жёстко прописан на pre-0.2.0 пути — оставлять его нельзя,
+    # иначе proxy не запустится (config.json теперь в новом дереве)
+    putfile "$STAGE/S99naiveproxy" "$INIT_DIR/S99naiveproxy" 0755
+    info "S99naiveproxy updated (old copy pointed at pre-0.2.0 paths)"
 elif [ -f "$INIT_DIR/S99naiveproxy" ]; then
     info "S99naiveproxy already present — keeping it"
 else
@@ -310,8 +321,57 @@ ln -sf "$INIT_DIR/S99naivepanel" /opt/etc/rc.d/S99naivepanel
 
 # --- config ----------------------------------------------------------------
 
-[ -n "$BIND" ]  && rc_conf_set NAIVEPANEL_BIND "$BIND"
-[ -n "$HOSTS" ] && rc_conf_set NAIVEPANEL_HOSTS "$HOSTS"
+# panel.conf создаём один раз, существующий НИКОГДА не перезаписываем
+# целиком: пользовательские правки должны переживать обновления.
+if [ ! -f "$PANEL_CONF" ]; then
+    cat >"$PANEL_CONF" <<'EOF'
+# NaivePanel settings - this file is read by naivepanel.py at startup.
+# Format: KEY="VALUE" (quotes optional). Comments only on their own line.
+# Explicit environment variables override values from this file.
+# After editing run: /opt/etc/init.d/S99naivepanel restart
+
+# Where the panel listens (LAN address, NOT 0.0.0.0 - it would also expose
+# WAN/VPN/guest segments on a router):
+#NAIVEPANEL_BIND="127.0.0.1:8089"
+
+# Host-header allowlist (anti DNS-rebinding). Required when binding to a LAN
+# address or behind a reverse proxy with its own hostname. Default (unset):
+# bind address + loopback aliases.
+#NAIVEPANEL_HOSTS="192.168.1.1:8089,router.local:8089"
+
+# Point at the bcrypt htpasswd file (its presence enables HTTP Basic auth):
+#NAIVEPANEL_PASS="/opt/etc/naive/panel/admin.pass"
+
+# Advanced: relocate the proxy assets the panel manages
+#NAIVEPROXY_DIR="/opt/etc/naive/proxy"
+#NAIVEPROXY_INIT="/opt/etc/init.d/S99naiveproxy"
+#NAIVEPROXY_LOG="/opt/var/log/naiveproxy.log"
+#NAIVEPROXY_PID="/opt/var/run/naiveproxy.pid"
+EOF
+    chmod 0644 "$PANEL_CONF"
+    info "created $PANEL_CONF (settings template — uncomment what you need)"
+fi
+
+# legacy: перенести NAIVEPANEL_BIND/HOSTS из rc.conf (v0.4.0 и раньше писали
+# их туда, но init-скрипт этот файл никогда не читал — настройки не работали)
+if [ -f "$RC_CONF" ] && grep -qE '^[[:space:]]*NAIVEPANEL_(BIND|HOSTS)=' "$RC_CONF"; then
+    mig=0
+    for k in NAIVEPANEL_BIND NAIVEPANEL_HOSTS; do
+        v=$(sed -n "s/^[[:space:]]*$k=//p" "$RC_CONF" 2>/dev/null | head -n 1 | tr -d '"')
+        if [ -n "$v" ] && ! grep -qE "^[[:space:]]*$k=" "$PANEL_CONF"; then
+            conf_upsert "$k" "$v"
+            mig=1
+        fi
+    done
+    if [ "$mig" = 1 ]; then
+        sed -i '/^[[:space:]]*NAIVEPANEL_BIND=/d;/^[[:space:]]*NAIVEPANEL_HOSTS=/d' "$RC_CONF"
+        info "migrated NAIVEPANEL_BIND/HOSTS: rc.conf → $PANEL_CONF"
+    fi
+fi
+
+# явные флаги — последний word: обновляют ключи даже в существующем файле
+[ -n "$BIND" ]  && conf_upsert NAIVEPANEL_BIND "$BIND"
+[ -n "$HOSTS" ] && conf_upsert NAIVEPANEL_HOSTS "$HOSTS"
 
 if [ "$WITH_AUTH" = 1 ]; then
     # python getpass falls back to stdin when no tty is available — under a
@@ -336,10 +396,10 @@ fi
 [ -f "$NAIVEPROXY_DIR/config.json" ] && "$INIT_DIR/S99naiveproxy" start >/dev/null 2>&1 || true
 
 BIND_ADDR="${BIND:-127.0.0.1:8089}"
-# init script sets default 127.0.0.1:8089; if rc.conf overrides it, read it back
-if [ -f "$RC_CONF" ]; then
-    . "$RC_CONF" 2>/dev/null
-    [ -n "${NAIVEPANEL_BIND:-}" ] && BIND_ADDR="$NAIVEPANEL_BIND"
+# panel.conf — источник правды о bind (флаг --bind уже учтён выше)
+if [ -f "$PANEL_CONF" ]; then
+    v=$(sed -n 's/^[[:space:]]*NAIVEPANEL_BIND=//p' "$PANEL_CONF" 2>/dev/null | head -n 1 | tr -d '"')
+    [ -n "$v" ] && BIND_ADDR="$v"
 fi
 
 sleep 1
@@ -362,7 +422,8 @@ fi
 info "done. Panel: http://$BIND_ADDR"
 echo ""
 echo "Reminders:"
+echo "  - settings: /opt/etc/naive/panel/panel.conf (bind, hosts, paths) — survives upgrades"
 echo "  - auth: add a password with --with-auth if the panel is reachable from LAN"
-echo "  - LAN bind: use --bind 192.168.1.1:8089 --hosts '192.168.1.1:8089,router.local:8089'"
+echo "  - LAN bind: set NAIVEPANEL_BIND=192.168.1.1:8089 and NAIVEPANEL_HOSTS in panel.conf"
 echo "  - reverse proxy: add its hostname via --hosts (other Host headers get 403)"
 echo "  - firewall: only expose the port to trusted devices"

@@ -2,6 +2,11 @@
 # /opt/etc/init.d/S99naivepanel
 # Init-скрипт для NaivePanel (Flask UI) на Entware (Keenetic).
 #
+# НАСТРОЕК ЗДЕСЬ НЕТ: установщик перезаписывает этот файл при каждом
+# обновлении. Все настройки панели — в /opt/etc/naive/panel/panel.conf,
+# который читает сам naivepanel.py (ключи и примеры — в README и в самом
+# файле-шаблоне). Окружение (env) перекрывает panel.conf.
+#
 # Ожидает:
 #   /opt/etc/naive/panel/naivepanel.py — основной скрипт
 #   /opt/bin/python3 или /opt/bin/python — интерпретатор (из пакета python3 в Entware)
@@ -9,30 +14,13 @@
 #   /opt/var/log/naivepanel.log — stdout/stderr
 #
 # Команды: start | stop | restart | status
-#
-# Конфигурация через переменные окружения (можно задать в /opt/etc/init.d/rc.conf):
-#   NAIVEPANEL_BIND=127.0.0.1:8089
-#   NAIVEPANEL_HOSTS=192.168.1.1:8089,...            # allowlist Host (анти-rebinding); пусто = выкл
-#   NAIVEPROXY_DIR=/opt/etc/naive/proxy
-#   NAIVEPROXY_INIT=/opt/etc/init.d/S99naiveproxy
-#   NAIVEPROXY_LOG=/opt/var/log/naiveproxy.log
-#   NAIVEPANEL_PASS=/opt/etc/naive/panel/admin.pass  # если файла нет — auth отключена
 
 ENABLED=yes
 PROG=naivepanel
 APP=/opt/etc/naive/panel/naivepanel.py
 PIDFILE=/opt/var/run/naivepanel.pid
 LOGFILE=/opt/var/log/naivepanel.log
-
-# Defaults (можно переопределить в /opt/etc/init.d/rc.conf перед вызовом)
-: ${NAIVEPANEL_BIND:=127.0.0.1:8089}
-: ${NAIVEPANEL_HOSTS:=}
-: ${NAIVEPROXY_DIR:=/opt/etc/naive/proxy}
-: ${NAIVEPROXY_INIT:=/opt/etc/init.d/S99naiveproxy}
-: ${NAIVEPROXY_LOG:=/opt/var/log/naiveproxy.log}
-: ${NAIVEPROXY_PID:=/opt/var/run/naiveproxy.pid}
-: ${NAIVEPANEL_PASS:=/opt/etc/naive/panel/admin.pass}
-export NAIVEPANEL_BIND NAIVEPANEL_HOSTS NAIVEPROXY_DIR NAIVEPROXY_INIT NAIVEPROXY_LOG NAIVEPROXY_PID NAIVEPANEL_PASS
+CONF=/opt/etc/naive/panel/panel.conf
 
 # python в Entware живёт в /opt/bin; fallback — системный
 PYTHON=/opt/bin/python3
@@ -64,7 +52,10 @@ start() {
     [ -d /opt/var/log ] || mkdir -p /opt/var/log
     [ -d /opt/var/run ] || mkdir -p /opt/var/run
     truncate_log
-    echo "starting $PROG on $NAIVEPANEL_BIND"
+    # bind показываем из panel.conf чисто для лога — сам файл шеллом не
+    # исполняется (сломанная строка в конфиге не должна уронить сервис)
+    bind=$(sed -n 's/^[[:space:]]*NAIVEPANEL_BIND=//p' "$CONF" 2>/dev/null | head -n 1 | tr -d '"')
+    echo "starting $PROG on ${bind:-127.0.0.1:8089}"
     nohup "$PYTHON" "$APP" >>"$LOGFILE" 2>&1 &
     echo $! > "$PIDFILE"
     sleep 1

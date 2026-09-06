@@ -54,6 +54,73 @@ def _create(client, **overrides):
     return client.post("/api/configs", json=payload, headers=CSRF), payload
 
 
+# --- panel.conf: постоянные настройки ----------------------------------------
+
+@pytest.fixture()
+def conf_env(env, monkeypatch):
+    """panel.conf-тесты применяют файл через os.environ.setdefault —
+    сохраняем/восстанавливаем окружение целиком, чтобы не протекло."""
+    saved = dict(os.environ)
+    conf = env / "panel.conf"
+    monkeypatch.setenv("NAIVEPANEL_CONF", str(conf))
+    yield conf
+    os.environ.clear()
+    os.environ.update(saved)
+
+
+def _reload():
+    import naivepanel
+    importlib.reload(naivepanel)
+    return naivepanel
+
+
+def test_conf_file_applies_bind_and_hosts(conf_env):
+    conf_env.write_text(
+        'NAIVEPANEL_BIND="192.168.1.1:8099"\n'
+        'NAIVEPANEL_HOSTS="np.lan:8099,192.168.1.1:8099"\n'
+    )
+    m = _reload()
+    assert m.PANEL_BIND == "192.168.1.1:8099"
+    assert "np.lan:8099" in m.ALLOWED_HOSTS
+    c = m.app.test_client()
+    assert c.get("/api/status", headers={"Host": "np.lan:8099"}).status_code == 200
+    assert c.get("/api/status", headers={"Host": "evil.com"}).status_code == 403
+
+
+def test_conf_env_overrides_file(conf_env, monkeypatch):
+    conf_env.write_text('NAIVEPANEL_BIND="10.0.0.1:9999"\n')
+    monkeypatch.setenv("NAIVEPANEL_BIND", "127.0.0.1:8091")
+    m = _reload()
+    assert m.PANEL_BIND == "127.0.0.1:8091"  # env > panel.conf
+
+
+def test_conf_ignores_comments_unknown_keys_and_typos(conf_env):
+    conf_env.write_text(
+        "# комментарий\n"
+        "\n"
+        "FOO=bar\n"
+        "NIVEPANEL_BIND=x\n"  # опечатка не должна применять значение
+        "NAIVEPANEL_HOSTS=\"a.lan:1\"\n"
+    )
+    m = _reload()
+    assert "a.lan:1" in m.ALLOWED_HOSTS
+    assert m.PANEL_BIND == "127.0.0.1:8089"  # дефолт — NIVEPANEL_* проигнорирован
+    assert "FOO" in m._CONF_SKIPPED
+    assert "NIVEPANEL_BIND" in m._CONF_SKIPPED
+
+
+def test_conf_quotes_stripped(conf_env):
+    conf_env.write_text("NAIVEPANEL_BIND='127.0.0.1:8095'\n")
+    m = _reload()
+    assert m.PANEL_BIND == "127.0.0.1:8095"
+
+
+def test_conf_missing_file_uses_defaults(env, monkeypatch):
+    monkeypatch.setenv("NAIVEPANEL_CONF", str(env / "absent.conf"))
+    m = _reload()
+    assert m.PANEL_BIND == "127.0.0.1:8089"
+
+
 def _stub_init(env, marker_name="init-calls.txt"):
     """Исполняемый init-стаб: пишет аргумент (start|stop|restart) в marker."""
     marker = env / marker_name

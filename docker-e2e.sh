@@ -16,7 +16,7 @@
 set -eu
 
 REPO_DIR=$(cd "$(dirname "$0")" && pwd)
-REF=v0.4.0
+REF=v0.4.1
 BASE_IMAGE="${BASE_IMAGE:-debian:bookworm-slim}"
 AUTH_FLAG=""
 MODE_FLAGS="--yes"
@@ -98,6 +98,8 @@ echo "==> post-install state"
 /opt/etc/init.d/S99naivepanel status || true
 echo "smoke http_code=\$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8089/api/status)"
 ls -l /opt/etc/rc.d/
+test -f /opt/etc/naive/panel/panel.conf && echo "panel.conf: present"
+grep -c '^#' /opt/etc/naive/panel/panel.conf >/dev/null && echo "panel.conf: template comments intact"
 
 echo "==> API checks (CSRF + write-only password)"
 H='-H X-Requested-With:naivepanel'
@@ -111,6 +113,18 @@ fi
 echo "get raw: \$(curl -s http://127.0.0.1:8089/api/configs/home)"
 echo "csrf_no_header=\$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8089/api/service/stop) (expect 403)"
 echo "csrf_with_header=\$(curl -s \$H -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8089/api/service/stop) (expect 200)"
+
+echo "==> upgrade: rc.conf migration + --bind upsert"
+mkdir -p /opt/etc/init.d
+printf 'OTHER_VAR="keep"\nNAIVEPANEL_BIND="10.9.9.9:1234"\n' > /opt/etc/init.d/rc.conf
+curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/$REF/install.sh | sh -s -- --yes --bind 192.168.1.1:8089
+if grep -q '^NAIVEPANEL_BIND="192.168.1.1:8089"' /opt/etc/naive/panel/panel.conf \
+   && ! grep -q 'NAIVEPANEL' /opt/etc/init.d/rc.conf \
+   && grep -q '^OTHER_VAR=' /opt/etc/init.d/rc.conf; then
+  echo "panel.conf migration: OK (flag wins, rc.conf cleaned, other keys kept)"
+else
+  echo "FAIL: panel.conf migration"; cat /opt/etc/naive/panel/panel.conf /opt/etc/init.d/rc.conf; exit 1
+fi
 echo "==> E2E DONE"
 EOF
 

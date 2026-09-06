@@ -59,7 +59,7 @@ Entware с `opkg`). Скачивает файлы, закреплённые за
 контрольные суммы (`SHA256SUMS`), ставит init-скрипты и запускает панель:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/v0.4.0/install.sh | sh -s -- --with-auth
+curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/v0.4.1/install.sh | sh -s -- --with-auth
 ```
 
 Запуск через пайп безопасен: подтверждение установки и ввод пароля читаются
@@ -71,9 +71,9 @@ curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/v0.4.0/in
 | Флаг | Что делает |
 |------|------------|
 | `--with-auth` | интерактивно создаёт `/opt/etc/naive/panel/admin.pass` (HTTP Basic) |
-| `--bind HOST:PORT` | пишет `NAIVEPANEL_BIND` в `/opt/etc/init.d/rc.conf` |
-| `--hosts LIST` | пишет `NAIVEPANEL_HOSTS` (allowlist Host-заголовков) |
-| `--ref TAG` | устанавливает конкретный тег (по умолчанию `v0.4.0`) |
+| `--bind HOST:PORT` | пишет `NAIVEPANEL_BIND` в `/opt/etc/naive/panel/panel.conf` |
+| `--hosts LIST` | пишет `NAIVEPANEL_HOSTS` в `panel.conf` |
+| `--ref TAG` | устанавливает конкретный тег (по умолчанию `v0.4.1`) |
 | `--no-naive-init` | не ставить `S99naiveproxy` (если свой init-скрипт уже есть) |
 | `--yes` | неинтерактивный режим (без подтверждения) |
 | `--uninstall` | остановить сервисы и удалить файлы |
@@ -97,9 +97,38 @@ curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/v0.4.0/in
 Пример с LAN-доступом:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/v0.4.0/install.sh \
+curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/v0.4.1/install.sh \
   | sh -s -- --with-auth --bind 192.168.1.1:8089 --hosts '192.168.1.1:8089,router.local:8089'
 ```
+
+### Настройки панели (panel.conf)
+
+Все настройки панели живут в **`/opt/etc/naive/panel/panel.conf`** — этот файл
+читает сам `naivepanel.py`, поэтому настройки переживают любые обновления
+(установщик перезаписывает init-скрипт при каждом апгрейде, так что вписывать
+настройки туда нельзя). Файл создаётся установщиком один раз как шаблон;
+**существующий файл никогда не перезаписывается** — правки руками сохраняются.
+
+```ini
+# KEY="VALUE"; комментарии — только с начала строки
+NAIVEPANEL_BIND="192.168.1.1:8089"
+NAIVEPANEL_HOSTS="192.168.1.1:8089,router.local:8089"
+#NAIVEPANEL_PASS="/opt/etc/naive/panel/admin.pass"
+#NAIVEPROXY_DIR="/opt/etc/naive/proxy"
+#NAIVEPROXY_INIT="/opt/etc/init.d/S99naiveproxy"
+#NAIVEPROXY_LOG="/opt/var/log/naiveproxy.log"
+#NAIVEPROXY_PID="/opt/var/run/naiveproxy.pid"
+```
+
+Приоритет: **env > panel.conf > встроенный дефолт** — переменные окружения
+удобны для dev-запуска, файл — для роутера. Ключи вне списка из шаблона
+игнорируются (опечатка не применится молча — в лог уйдёт warning). После
+правок: `/opt/etc/init.d/S99naivepanel restart`.
+
+Флаги `--bind`/`--hosts` обновляют соответствующие ключи внутри существующего
+файла. Историческая схема с `/opt/etc/init.d/rc.conf` не работала (файл никто
+не читал) — установщик v0.4.1 переносит найденные там `NAIVEPANEL_BIND/HOSTS`
+в `panel.conf`.
 
 ### Установка бинарника naive
 
@@ -187,9 +216,9 @@ naivepanel.local.lan {
 Панель за reverse proxy видит чужой `Host` (`naivepanel.local.lan`) — добавь
 его в allowlist, иначе 403 (см. «Безопасность»):
 
-```bash
-# в /opt/etc/init.d/rc.conf
-NAIVEPANEL_HOSTS=naivepanel.local.lan
+```ini
+# в /opt/etc/naive/panel/panel.conf
+NAIVEPANEL_HOSTS="naivepanel.local.lan"
 ```
 
 Или просто SSH-туннель: `ssh -L 8089:127.0.0.1:8089 root@router`.
@@ -208,11 +237,11 @@ python3 -c 'import bcrypt,getpass; print("admin:"+bcrypt.hashpw(getpass.getpass(
 chmod 0600 /opt/etc/naive/panel/admin.pass
 
 # 2. Bind на LAN-адрес (НЕ 0.0.0.0 — иначе торчим и в WAN/VPN/guest-сегменты)
-#    и allowlist Host-заголовков (анти-DNS-rebinding), в /opt/etc/init.d/rc.conf.
+#    и allowlist Host-заголовков (анти-DNS-rebinding) — в /opt/etc/naive/panel/panel.conf.
 #    Без NAIVEPANEL_HOSTS разрешены только адрес bind и loopback-алиасы —
 #    доступ по имени роутера (router.lan и т.п.) потребует явного allowlist.
-NAIVEPANEL_BIND=192.168.1.1:8089
-NAIVEPANEL_HOSTS=192.168.1.1:8089,router.local:8089
+NAIVEPANEL_BIND="192.168.1.1:8089"
+NAIVEPANEL_HOSTS="192.168.1.1:8089,router.local:8089"
 
 # 3. Файрвол Keenetic: порт 8089 только с твоих устройств; guest-сегмент — закрыт.
 ```

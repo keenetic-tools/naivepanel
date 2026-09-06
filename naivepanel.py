@@ -7,6 +7,7 @@
 
 Bind по умолчанию 127.0.0.1:8089 — публикация через внешний reverse proxy
 или напрямую в LAN (admin.pass + NAIVEPANEL_HOSTS + firewall, см. README).
+Постоянные настройки — /opt/etc/naive/panel/panel.conf (env перекрывает его).
 """
 
 from __future__ import annotations
@@ -23,6 +24,53 @@ from urllib.parse import quote, unquote
 
 from flask import Flask, Response, abort, jsonify, make_response, render_template, request
 from werkzeug.exceptions import HTTPException
+
+# --- panel.conf: постоянные настройки панели (переживают апгрейды) --------
+# Установщик перезаписывает init-скрипт при каждом обновлении, поэтому
+# настройки живут в отдельном файле, который читает сам naivepanel.py.
+# Формат: KEY="VALUE" (кавычки срезаются), комментарии — только с начала
+# строки. Приоритет: env > panel.conf > встроенный дефолт.
+# После правок: /opt/etc/init.d/S99naivepanel restart
+
+PANEL_CONF = Path(os.environ.get("NAIVEPANEL_CONF", "/opt/etc/naive/panel/panel.conf"))
+
+# Ключи, которые panel.conf имеет право задавать. Остальное игнорируем:
+# файл разбирается до создания Flask-приложения, и опечатка не должна
+# притащить в окружение произвольную переменную.
+CONF_KEYS = frozenset({
+    "NAIVEPANEL_BIND", "NAIVEPANEL_HOSTS", "NAIVEPANEL_PASS",
+    "NAIVEPROXY_DIR", "NAIVEPROXY_INIT", "NAIVEPROXY_LOG", "NAIVEPROXY_PID",
+    "NAIVEPANEL_INIT",
+})
+
+_CONF_SKIPPED: list[str] = []
+
+
+def _parse_conf(path: Path) -> dict[str, str]:
+    out: dict[str, str] = {}
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return out  # файла нет — работаем на env/дефолтах
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key, value = key.strip(), value.strip().strip('"').strip("'")
+        if key in CONF_KEYS:
+            out[key] = value
+        else:
+            _CONF_SKIPPED.append(key)
+    return out
+
+
+def _apply_conf_file() -> None:
+    for key, value in _parse_conf(PANEL_CONF).items():
+        os.environ.setdefault(key, value)
+
+
+_apply_conf_file()
 
 # --- Конфигурация путей (на Keenetic/Entware) -----------------------------
 
@@ -42,7 +90,7 @@ PANEL_INIT = Path(os.environ.get("NAIVEPANEL_INIT", "/opt/etc/init.d/S99naivepan
 
 NAME_RE = re.compile(r"^[a-zA-Z0-9_\-.]{1,64}$")
 
-APP_VERSION = "0.4.0"
+APP_VERSION = "0.4.1"
 
 
 def _ensure_dirs() -> None:
@@ -404,6 +452,10 @@ def _tail_log(lines: int = 100) -> str:
 app = Flask(__name__)
 # Конфиги крошечные — гигантский PUT иначе ронял бы память роутера
 app.config["MAX_CONTENT_LENGTH"] = 256 * 1024
+
+# Опечатки в panel.conf не должны молча теряться (NIVEPANEL_BIND и т.п.)
+for _k in sorted(set(_CONF_SKIPPED)):
+    app.logger.warning("panel.conf: ignoring unknown key %r", _k)
 
 
 @app.errorhandler(HTTPException)
