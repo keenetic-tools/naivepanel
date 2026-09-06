@@ -170,11 +170,9 @@ fi
 OLD_PANEL_DIR=/opt/naivepanel
 OLD_PANEL_ETC=/opt/etc/naivepanel
 OLD_PROXY_DIR=/opt/etc/naiveproxy
-MIGRATED=0
 
 if [ -d "$OLD_PANEL_DIR" ] || [ -d "$OLD_PANEL_ETC" ] || [ -d "$OLD_PROXY_DIR" ]; then
     info "migrating pre-0.2.0 layout → $NAIVE_ROOT"
-    MIGRATED=1
     # services hold absolute paths — stop before moving anything
     "$INIT_DIR/S99naivepanel" stop >/dev/null 2>&1 || true
     "$INIT_DIR/S99naiveproxy" stop >/dev/null 2>&1 || true
@@ -303,14 +301,15 @@ putfile "$STAGE/S99naivepanel" "$INIT_DIR/S99naivepanel" 0755
 
 if [ "$NO_NAIVE_INIT" = 1 ]; then
     warn "skipping S99naiveproxy (--no-naive-init)"
-elif [ "$MIGRATED" = 1 ]; then
-    # старый скрипт жёстко прописан на pre-0.2.0 пути — оставлять его нельзя,
-    # иначе proxy не запустится (config.json теперь в новом дереве)
-    putfile "$STAGE/S99naiveproxy" "$INIT_DIR/S99naiveproxy" 0755
-    info "S99naiveproxy updated (old copy pointed at pre-0.2.0 paths)"
-elif [ -f "$INIT_DIR/S99naiveproxy" ]; then
+elif [ -f "$INIT_DIR/S99naiveproxy" ] \
+     && ! grep -q '/opt/etc/naiveproxy' "$INIT_DIR/S99naiveproxy"; then
     info "S99naiveproxy already present — keeping it"
 else
+    # скрипт, ссылающийся на pre-0.2.0 пути, не может запустить proxy после
+    # переезда конфигов — заменяем независимо от того, мигрировали мы только
+    # что или это случилось при прошлом апгрейде
+    [ -f "$INIT_DIR/S99naiveproxy" ] \
+        && info "S99naiveproxy updated (existing copy points at pre-0.2.0 paths)"
     putfile "$STAGE/S99naiveproxy" "$INIT_DIR/S99naiveproxy" 0755
 fi
 

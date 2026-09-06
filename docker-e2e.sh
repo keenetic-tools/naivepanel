@@ -114,8 +114,10 @@ echo "get raw: \$(curl -s http://127.0.0.1:8089/api/configs/home)"
 echo "csrf_no_header=\$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8089/api/service/stop) (expect 403)"
 echo "csrf_with_header=\$(curl -s \$H -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8089/api/service/stop) (expect 200)"
 
-echo "==> upgrade: rc.conf migration + --bind upsert"
+echo "==> upgrade: rc.conf migration + --bind upsert + stale S99naiveproxy"
 mkdir -p /opt/etc/init.d
+# имитируем протухший S99naiveproxy (как после апгрейда v0.4.0 с pre-0.2.0):
+printf '#!/bin/sh\nDAEMON_OPTS=/opt/etc/naiveproxy/config.json\n[ -f /opt/etc/naiveproxy/config.json ] || DAEMON_OPTS=\n' > /opt/etc/init.d/S99naiveproxy
 printf 'OTHER_VAR="keep"\nNAIVEPANEL_BIND="10.9.9.9:1234"\n' > /opt/etc/init.d/rc.conf
 curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/$REF/install.sh | sh -s -- --yes --bind 192.168.1.1:8089
 if grep -q '^NAIVEPANEL_BIND="192.168.1.1:8089"' /opt/etc/naive/panel/panel.conf \
@@ -124,6 +126,12 @@ if grep -q '^NAIVEPANEL_BIND="192.168.1.1:8089"' /opt/etc/naive/panel/panel.conf
   echo "panel.conf migration: OK (flag wins, rc.conf cleaned, other keys kept)"
 else
   echo "FAIL: panel.conf migration"; cat /opt/etc/naive/panel/panel.conf /opt/etc/init.d/rc.conf; exit 1
+fi
+if grep -q '/opt/etc/naive/proxy/config.json' /opt/etc/init.d/S99naiveproxy \
+   && ! grep -q '/opt/etc/naiveproxy' /opt/etc/init.d/S99naiveproxy; then
+  echo "stale S99naiveproxy replaced: OK"
+else
+  echo "FAIL: stale S99naiveproxy not replaced"; head -5 /opt/etc/init.d/S99naiveproxy; exit 1
 fi
 echo "==> E2E DONE"
 EOF
