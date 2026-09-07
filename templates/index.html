@@ -3,84 +3,141 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="theme-color" content="#0f1115">
+<meta name="theme-color" media="(prefers-color-scheme: dark)" content="#0f1115">
+<meta name="theme-color" media="(prefers-color-scheme: light)" content="#f4f5f7">
 <title>NaivePanel</title>
 <style>
-  :root { --bg:#0f1115; --fg:#e6e6e6; --mut:#9aa; --acc:#5dd2a4; --err:#ff7070; --card:#181b22; }
-  html { color-scheme: dark; }
+  /* Тёмная тема — базовая (как было), светлая — ниже в двух местах:
+     :root[data-theme="light"] (ручной выбор) и media-запрос (системная).
+     Оба блока должны оставаться синхронными. */
+  :root { color-scheme:dark;
+    --bg:#0f1115; --fg:#e6e6e6; --mut:#9aa; --acc:#5dd2a4; --err:#ff7070; --warn:#e0b657;
+    --btn-fg:#0f1115; --card:#181b22; --border:#2a2f38; --border-sel:#57606e;
+    --sel-bg:rgba(255,255,255,.04); --hov:rgba(255,255,255,.07);
+    --acc-tint:rgba(93,210,164,.07); --badge-bg:rgba(93,210,164,.18); --mut-tint:rgba(154,170,170,.18);
+    --input-bg:#0f1115; --log-bg:#000; --log-fg:#bfe; }
+  :root[data-theme="light"] { color-scheme:light;
+    --bg:#f4f5f7; --fg:#1c2128; --mut:#69707a; --acc:#0e8a5f; --err:#c43e3e; --warn:#8a6a1d;
+    --btn-fg:#ffffff; --card:#ffffff; --border:#d6dae0; --border-sel:#9aa3ad;
+    --sel-bg:rgba(0,0,0,.04); --hov:rgba(0,0,0,.06);
+    --acc-tint:rgba(14,138,95,.08); --badge-bg:rgba(14,138,95,.14); --mut-tint:rgba(105,112,122,.14);
+    --input-bg:#ffffff; --log-bg:#fbfcfd; --log-fg:#24292f; }
+  @media (prefers-color-scheme: light) {
+    :root:not([data-theme="dark"]) { color-scheme:light;
+      --bg:#f4f5f7; --fg:#1c2128; --mut:#69707a; --acc:#0e8a5f; --err:#c43e3e; --warn:#8a6a1d;
+      --btn-fg:#ffffff; --card:#ffffff; --border:#d6dae0; --border-sel:#9aa3ad;
+      --sel-bg:rgba(0,0,0,.04); --hov:rgba(0,0,0,.06);
+      --acc-tint:rgba(14,138,95,.08); --badge-bg:rgba(14,138,95,.14); --mut-tint:rgba(105,112,122,.14);
+      --input-bg:#ffffff; --log-bg:#fbfcfd; --log-fg:#24292f; }
+  }
   * { box-sizing:border-box; }
   body { margin:0; font:14px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;
          background:var(--bg); color:var(--fg); }
-  header { padding:14px 18px; border-bottom:1px solid #2a2f38; display:flex; gap:16px; align-items:center; }
+  header { padding:14px 18px; border-bottom:1px solid var(--border); display:flex; gap:12px; align-items:center; }
   header h1 { font-size:16px; margin:0; }
   #status { color:var(--mut); margin-left:auto; }
   .on { color:var(--acc); } .off { color:var(--err); }
   main { display:grid; grid-template-columns: 280px 1fr; gap:16px; padding:16px; }
   @media (max-width:800px) { main { grid-template-columns: 1fr; } }
-  .card { background:var(--card); border:1px solid #2a2f38; border-radius:8px; padding:14px; }
+  .card { background:var(--card); border:1px solid var(--border); border-radius:8px; padding:14px; }
   .card h2 { margin:0 0 10px; font-size:13px; text-transform:uppercase; letter-spacing:.08em; color:var(--mut); }
+  .svcinfo { display:grid; gap:3px; margin-bottom:12px; font-size:13px; }
+  .svcinfo .kv { display:flex; justify-content:space-between; gap:10px; min-width:0; }
+  .svcinfo .kv span { color:var(--mut); }
+  .svcinfo .kv b { font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   ul.presets { list-style:none; padding:0; margin:0; }
-  ul.presets li { border:1px solid #2a2f38; border-radius:6px; margin-bottom:6px;
-                  display:flex; flex-wrap:wrap; align-items:center; }
+  #search { margin-bottom:8px; }
+  ul.presets li { border:1px solid var(--border); border-radius:6px; margin-bottom:6px;
+                  display:flex; flex-wrap:wrap; align-items:center; transition:border-color .12s ease; }
   ul.presets li:hover { border-color:var(--acc); }
-  ul.presets li.selected { border-color:#57606e; background:rgba(255,255,255,.04); }
+  ul.presets li.selected { border-color:var(--border-sel); background:var(--sel-bg); }
   /* active (запущенный) важнее selected — его зелёная рамка переопределяет */
-  ul.presets li.active { border-color:var(--acc); background:rgba(93,210,164,.07); }
+  ul.presets li.active { border-color:var(--acc); background:var(--acc-tint); }
   ul.presets .sel { flex:1 1 auto; min-width:0; display:flex; align-items:center; gap:6px 8px;
                     padding:8px 4px 8px 10px; background:none; border:none; color:inherit;
                     font:inherit; text-align:left; cursor:pointer; border-radius:6px; }
-  ul.presets .sel:hover { background:rgba(255,255,255,.05); }
+  ul.presets .sel:hover { background:var(--hov); }
   ul.presets .name { font-weight:600; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   ul.presets .proxy { flex-basis:100%; color:var(--mut); font-size:12px; padding:0 10px 8px;
                       overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   ul.presets .badge { font-size:11px; padding:2px 6px; border-radius:10px;
-                      background:rgba(93,210,164,.18); color:var(--acc); white-space:nowrap; }
-  ul.presets .badge.listen { background:rgba(154,170,170,.18); color:var(--mut); }
+                      background:var(--badge-bg); color:var(--acc); white-space:nowrap; }
+  ul.presets .badge.listen { background:var(--mut-tint); color:var(--mut); }
   ul.presets .acts { margin-left:auto; display:flex; gap:4px; padding-right:6px; }
   ul.presets .act { font-size:12px; color:var(--acc); background:none; border:none; cursor:pointer;
                     padding:4px 6px; border-radius:4px; }
   ul.presets .del { background:none; border:none; color:var(--err); cursor:pointer;
                     padding:4px 6px; border-radius:4px; }
-  ul.presets .act:hover, ul.presets .del:hover { background:rgba(255,255,255,.08); }
-  button { background:var(--acc); color:#0f1115; border:none; border-radius:6px; padding:7px 12px; cursor:pointer; font-weight:600; }
+  ul.presets .act:hover, ul.presets .del:hover { background:var(--hov); }
+  button { background:var(--acc); color:var(--btn-fg); border:none; border-radius:6px; padding:7px 12px;
+           cursor:pointer; font-weight:600; transition:filter .12s ease; }
   button:hover:not(:disabled) { filter:brightness(1.15); }
-  button.ghost { background:transparent; color:var(--fg); border:1px solid #2a2f38; }
-  button.ghost:hover:not(:disabled) { border-color:var(--acc); }
-  button.danger { background:var(--err); color:#0f1115; }
+  button:active:not(:disabled) { transform:scale(.97); }
+  button.ghost, a.btn { background:transparent; color:var(--fg); border:1px solid var(--border); }
+  button.ghost:hover:not(:disabled) { border-color:var(--acc); filter:none; }
+  button.danger { background:var(--err); color:var(--btn-fg); }
   button.wide { width:100%; }
   button:disabled { opacity:.5; cursor:not-allowed; }
-  button:focus-visible, input:focus-visible, textarea:focus-visible, summary:focus-visible {
+  .iconbtn { padding:4px 9px; }
+  a.btn { display:inline-block; padding:7px 12px; border-radius:6px; text-decoration:none;
+          font:inherit; font-weight:600; }
+  a.btn:hover { border-color:var(--acc); }
+  button:focus-visible, input:focus-visible, textarea:focus-visible, summary:focus-visible, a:focus-visible {
     outline:2px solid var(--acc); outline-offset:1px; }
   label { display:block; font-size:12px; color:var(--mut); margin-top:10px; }
-  input,textarea { width:100%; padding:8px 10px; background:#0f1115; color:var(--fg);
-                   border:1px solid #2a2f38; border-radius:6px; font:13px/1.4 ui-monospace,Menlo,monospace; }
+  input,textarea { width:100%; padding:8px 10px; background:var(--input-bg); color:var(--fg);
+                   border:1px solid var(--border); border-radius:6px; font:13px/1.4 ui-monospace,Menlo,monospace; }
   textarea { min-height:120px; resize:vertical; }
   .row { display:flex; gap:8px; flex-wrap:wrap; margin-top:12px; }
   .actions { display:flex; gap:8px; flex-wrap:wrap; margin-top:14px; }
-  pre.log { background:#000; color:#bfe; padding:10px; border-radius:6px;
+  pre.log { background:var(--log-bg); color:var(--log-fg); padding:10px; border-radius:6px;
             max-height:260px; overflow:auto; font:12px/1.5 ui-monospace,Menlo,monospace; white-space:pre-wrap; }
-  .msg { padding:8px 10px; border-radius:6px; margin-top:10px; font-size:13px; display:none; }
-  .msg.ok { background:rgba(93,210,164,.12); color:var(--acc); display:block; }
-  .msg.err { background:rgba(255,112,112,.12); color:var(--err); display:block; }
+  pre.log .lvl-err { color:var(--err); }
+  pre.log .lvl-warn { color:var(--warn); }
+  #toasts { position:fixed; right:14px; bottom:14px; display:flex; flex-direction:column; gap:8px;
+            z-index:10; max-width:min(420px, calc(100vw - 28px)); }
+  .toast { padding:9px 12px; border-radius:6px; font-size:13px; cursor:pointer; white-space:pre-line;
+           background:var(--card); border:1px solid var(--border); box-shadow:0 4px 14px rgba(0,0,0,.25); }
+  .toast.ok { border-color:var(--acc); color:var(--acc); }
+  .toast.err { border-color:var(--err); color:var(--err); }
+  /* Визуально скрытый aria-live: текст flash() анонсируется скринридером,
+     а пользователь видит toast (двойной вывод был бы шумным). */
+  .sr-only { position:absolute; width:1px; height:1px; margin:-1px; overflow:hidden;
+             clip:rect(0 0 0 0); white-space:nowrap; }
 </style>
+<script>
+  // Тема применяется до первой отрисовки — без вспышки неправильных цветов.
+  try {
+    const t = localStorage.getItem('naivepanel-theme');
+    if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t;
+  } catch (e) { /* private mode и т.п. — просто останемся на системной теме */ }
+</script>
 </head>
 <body>
 <header>
   <h1>NaivePanel</h1>
+  <button class="ghost iconbtn" id="themeToggle" onclick="toggleTheme()" title="Переключить тему (светлая/тёмная)">☀</button>
   <span id="status" aria-live="polite">…</span>
 </header>
 <main>
   <section class="card">
     <h2>Сервис</h2>
+    <div class="svcinfo" id="svcinfo"></div>
     <div class="actions">
       <button onclick="svc('start')">Запуск</button>
       <button class="ghost" onclick="svc('stop')">Стоп</button>
       <button class="ghost" onclick="svc('restart')">Рестарт</button>
     </div>
     <h2 style="margin-top:18px">Пресеты</h2>
+    <input id="search" placeholder="Поиск пресета — /" aria-label="Поиск пресета"
+           autocomplete="off" spellcheck="false">
     <ul class="presets" id="presets"></ul>
     <div class="actions" style="margin-top:10px">
       <button class="ghost" onclick="newPreset()">+ Новый</button>
+      <a class="btn" href="/api/configs/export" title="Скачать все пресеты одним JSON. ВНИМАНИЕ: файл содержит пароли upstream!">Экспорт</a>
+      <button class="ghost" onclick="document.getElementById('importFile').click()"
+              title="Загрузить пресеты из ранее экспортированного JSON">Импорт</button>
+      <input type="file" id="importFile" accept=".json,application/json" style="display:none" aria-hidden="true" tabindex="-1">
     </div>
     <h2 style="margin-top:18px">Панель</h2>
     <div class="actions" style="margin-top:10px">
@@ -105,7 +162,11 @@
       </div>
 
       <label for="f_upstream">Upstream URL (https://host или полный proxy URL)</label>
-      <input id="f_upstream" placeholder="https://proxy.example.com" autocomplete="off" spellcheck="false">
+      <div style="display:flex;gap:8px">
+        <input id="f_upstream" placeholder="https://proxy.example.com" autocomplete="off" spellcheck="false" style="flex:1">
+        <button type="button" class="ghost" id="btnProbe" onclick="probeUpstream()"
+                title="TCP-доступность upstream с роутера (без TLS и кредов, таймаут 3с)">пинг</button>
+      </div>
 
       <label for="f_username">Username (basic_auth)</label>
       <input id="f_username" autocomplete="off" spellcheck="false">
@@ -136,18 +197,19 @@
       </details>
 
       <div class="row">
-        <button type="submit" id="btnSave">Сохранить</button>
+        <button type="submit" id="btnSave" title="Ctrl+S">Сохранить</button>
         <button type="button" class="ghost" onclick="activate()">Сделать активным</button>
         <button type="button" class="danger" onclick="del()">Удалить</button>
       </div>
     </form>
-    <div id="msg" class="msg" aria-live="polite"></div>
+    <div id="msg" class="sr-only" aria-live="polite"></div>
 
     <h2 style="margin-top:18px">Лог</h2>
     <pre class="log" id="log">…</pre>
     <div class="actions"><button class="ghost" onclick="loadLog()">Обновить лог</button></div>
   </section>
 </main>
+<div id="toasts"></div>
 
 <script>
 const $ = (id) => document.getElementById(id);
@@ -189,11 +251,36 @@ async function handle(r) {
   return data;
 }
 
-function flash(msg, ok) {
-  const m = $('msg'); m.textContent = msg;
-  // Пустое сообщение — прячем плашку (иначе висит пустой цветной баннер).
-  m.className = msg ? 'msg ' + (ok ? 'ok' : 'err') : 'msg';
+// Сообщение видно toast'ом (клик — закрыть), а #msg — visually-hidden
+// aria-live для скринридера. Ошибки держим дольше: их успевают прочитать.
+function flash(msg, ok, ms) {
+  $('msg').textContent = msg;
+  if (!msg) return;
+  const box = $('toasts');
+  const t = document.createElement('div');
+  t.className = 'toast ' + (ok ? 'ok' : 'err');
+  t.textContent = msg;
+  t.onclick = () => t.remove();
+  box.appendChild(t);
+  while (box.children.length > 4) box.firstChild.remove();
+  setTimeout(() => t.remove(), ms || (ok ? 5000 : 9000));
 }
+
+// --- Тема: без data-theme — по системной (prefers-color-scheme), клик
+// фиксирует выбор в localStorage. -------------------------------------
+const THEME_KEY = 'naivepanel-theme';
+function effTheme() {
+  const t = document.documentElement.dataset.theme;
+  if (t) return t;
+  return matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+}
+function toggleTheme() {
+  const next = effTheme() === 'light' ? 'dark' : 'light';
+  document.documentElement.dataset.theme = next;
+  try { localStorage.setItem(THEME_KEY, next); } catch (e) { /* private mode */ }
+  $('themeToggle').textContent = next === 'light' ? '☾' : '☀';
+}
+$('themeToggle').textContent = effTheme() === 'light' ? '☾' : '☀';
 
 function setHash(name) {
   history.replaceState(null, '', name ? '#preset='+encodeURIComponent(name) : location.pathname);
@@ -212,12 +299,31 @@ async function refreshAll() {
   } catch (e) { flash(e.message, false); }
 }
 
+function fmtUptime(s) {
+  if (s == null) return '—';
+  const d = Math.floor(s/86400), h = Math.floor(s%86400/3600), m = Math.floor(s%3600/60);
+  if (d) return d+'д '+h+'ч';
+  if (h) return h+'ч '+m+'м';
+  if (m) return m+'м '+(s%60)+'с';
+  return s+'с';
+}
+
 function renderStatus(st) {
   const ver = st.version ? ' · v'+escapeHtml(st.version) : '';
   $('status').innerHTML = (st.active
     ? '<span class="on">● работает</span> · пресет: <b>'+escapeHtml(st.current||'?')+'</b>'
     : '<span class="off">● остановлен</span>' + (st.current ? ' · пресет: '+escapeHtml(st.current) : ''))
     + ver;
+  const rows = [
+    ['состояние', st.active ? '<span class="on">● работает</span>' : '<span class="off">● остановлен</span>'],
+    ['пресет', st.current ? escapeHtml(st.current) : '—'],
+    ['uptime', st.active ? fmtUptime(st.uptime) : '—'],
+    ['pid', st.active && st.pid != null ? String(st.pid) : '—'],
+    ['панель', 'v'+escapeHtml(st.version || '?')],
+  ];
+  $('svcinfo').innerHTML = rows.map(([k, v]) =>
+    '<div class="kv"><span>'+k+'</span><b>'+v+'</b></div>').join('');
+  $('svcinfo').title = 'обновлено ' + new Date().toLocaleTimeString();
 }
 
 // Лёгкий поллинг: лог и статус сами показывают, что naive упал, без кликов.
@@ -226,13 +332,20 @@ async function pollStatus() {
   try { renderStatus(await jget('/api/status')); } catch (e) { /* transient */ }
 }
 
-let lastPresets = []; // кэш для перерисовки при смене selected без лишнего запроса
+let lastPresets = []; // кэш для перерисовки при смене selected/поиска без запроса
 
 function renderPresets(presets) {
   lastPresets = presets;
+  const q = ($('search').value || '').trim().toLowerCase();
+  const shown = q ? presets.filter(p =>
+    (p.name + ' ' + (p.proxy || '')).toLowerCase().includes(q)) : presets;
   const ul = $('presets'); ul.innerHTML = '';
-  if (!presets.length) { ul.innerHTML = '<li style="color:var(--mut);border:none;padding:8px 10px">нет пресетов</li>'; return; }
-  for (const p of presets) {
+  if (!shown.length) {
+    ul.innerHTML = '<li style="color:var(--mut);border:none;padding:8px 10px">'
+      + (presets.length ? 'ничего не найдено' : 'нет пресетов') + '</li>';
+    return;
+  }
+  for (const p of shown) {
     const li = document.createElement('li');
     li.className = (p.active ? 'active' : '') + (p.name === current ? ' selected' : '');
     li.innerHTML = '<button class="sel" '+(p.name === current ? 'aria-current="true" ' : '')
@@ -242,8 +355,9 @@ function renderPresets(presets) {
       + (p.listen_count > 1 ? '<span class="badge listen" title="слушает '+p.listen_count+' адреса(ов)">×'+p.listen_count+'</span>' : '')
       + '</button>'
       + '<span class="acts">'
-      + (!p.active ? '<button class="act" aria-label="Активировать '+escapeHtml(p.name)+'" onclick="event.stopPropagation();activate(decodeURIComponent(\''+encodeURIComponent(p.name)+'\'))">→</button>' : '')
-      + '<button class="del" aria-label="Удалить '+escapeHtml(p.name)+'" onclick="event.stopPropagation();del(decodeURIComponent(\''+encodeURIComponent(p.name)+'\'))">✕</button>'
+      + (!p.active ? '<button class="act" aria-label="Активировать '+escapeHtml(p.name)+'" title="Активировать" onclick="event.stopPropagation();activate(decodeURIComponent(\''+encodeURIComponent(p.name)+'\'))">→</button>' : '')
+      + '<button class="act" aria-label="Дублировать '+escapeHtml(p.name)+'" title="Дублировать (пароль переносится)" onclick="event.stopPropagation();dupPreset(decodeURIComponent(\''+encodeURIComponent(p.name)+'\'))">⧉</button>'
+      + '<button class="del" aria-label="Удалить '+escapeHtml(p.name)+'" title="Удалить" onclick="event.stopPropagation();del(decodeURIComponent(\''+encodeURIComponent(p.name)+'\'))">✕</button>'
       + '</span>'
       + '<span class="proxy">'+escapeHtml(p.proxy.replace(/:\/\/[^@]+@/,'://***@'))+'</span>';
     ul.appendChild(li);
@@ -275,7 +389,7 @@ async function selectPreset(name) {
     dirty = false;
     setHash(name);
     renderPresets(lastPresets); // подсветить выбранный
-    flash('', true);
+    $('msg').textContent = '';
   } catch (e) { flash(e.message, false); }
 }
 
@@ -293,11 +407,41 @@ function newPreset() {
   $('f_name').focus();
 }
 
+function closeEditor() {
+  if (!maybeDiscard()) return;
+  current = null;
+  $('editor').style.display = 'none';
+  setHash(null);
+  renderPresets(lastPresets);
+}
+
+async function dupPreset(name) {
+  try {
+    const d = await jpost('/api/configs/'+encodeURIComponent(name)+'/duplicate', null);
+    flash('Скопирован: '+d.name+' (пароль перенесён)', true);
+    await refreshAll();
+    selectPreset(d.name);
+  } catch (e) { flash(e.message, false); }
+}
+
 function togglePw() {
   const i = $('f_password'), b = $('btnPw');
   const show = i.type === 'password';
   i.type = show ? 'text' : 'password';
   b.textContent = show ? 'скрыть' : 'показать';
+}
+
+// TCP-пинг upstream с роутера: отличает «прокси лежит» от «сеть недоступна».
+async function probeUpstream() {
+  const b = $('btnProbe');
+  b.disabled = true; b.textContent = '…';
+  try {
+    const d = await jpost('/api/probe', {upstream: $('f_upstream').value.trim()});
+    flash(d.ms != null
+      ? 'upstream доступен: '+d.ms+'мс ('+escapeHtml(d.host)+':'+d.port+')'
+      : 'upstream НЕ доступен: '+(d.error || '?'), d.ms != null);
+  } catch (e) { flash(e.message, false); }
+  finally { b.disabled = false; b.textContent = 'пинг'; }
 }
 
 // Правдивые сообщения о применении: restart.rc отдаёт PUT активного пресета
@@ -402,8 +546,17 @@ async function panelRestart() {
 let lastLog = null;   // кэш — не трогаем DOM, если контент не изменился
 let logStuck = true;  // «прилип» к низу лога — автоскролл только когда true
 
+// naive/Chromium пишет уровни в формате [pid:ERROR:…]; подсветим их.
+const LOG_ERR = /\b(ERROR|FATAL|PANIC)\b/, LOG_WARN = /\b(WARNING|WARN)\b/;
+function renderLog(content) {
+  // сервер уже замаскировал креды; здесь — экранирование и подсветка уровней
+  $('log').innerHTML = content.split('\n').map(l => {
+    const cls = LOG_ERR.test(l) ? ' class="lvl-err"' : (LOG_WARN.test(l) ? ' class="lvl-warn"' : '');
+    return '<span'+cls+'>'+escapeHtml(l)+'</span>';
+  }).join('\n');
+}
+
 async function loadLog() {
-  const pre = $('log');
   let content;
   try {
     const r = await jget('/api/logs?lines=100');
@@ -413,13 +566,42 @@ async function loadLog() {
   }
   if (content !== lastLog) {
     lastLog = content;
-    pre.textContent = content;
+    renderLog(content);
   }
-  if (logStuck) pre.scrollTop = pre.scrollHeight;
+  if (logStuck) $('log').scrollTop = $('log').scrollHeight;
 }
 
+// Импорт: файл экспорта содержит proxy-URI с паролями — креды переносятся.
+$('importFile').addEventListener('change', async () => {
+  const f = $('importFile').files[0];
+  $('importFile').value = ''; // повторный выбор того же файла тоже срабатывает
+  if (!f) return;
+  try {
+    const d = await jpost('/api/configs/import', JSON.parse(await f.text()));
+    const parts = ['импортировано: ' + (d.imported.join(', ') || '—')];
+    for (const s of d.skipped) parts.push('пропущен ' + s.name + ' — ' + s.reason);
+    flash(parts.join('\n'), d.imported.length > 0, 12000);
+    if (d.imported.length) await refreshAll();
+  } catch (e) { flash('Импорт не удался: ' + e.message, false); }
+});
+
+$('search').addEventListener('input', () => renderPresets(lastPresets));
 $('editor').addEventListener('input', () => { dirty = true; });
 window.addEventListener('beforeunload', (e) => { if (dirty) { e.preventDefault(); e.returnValue = ''; } });
+
+// Горячие клавиши: Ctrl/Cmd+S — сохранить, «/» — поиск, Esc — закрыть редактор.
+document.addEventListener('keydown', (e) => {
+  if ((e.ctrlKey || e.metaKey) && (e.key === 's' || e.key === 'S')) {
+    if ($('editor').style.display !== 'none') { e.preventDefault(); save(null); }
+    return;
+  }
+  if (e.key === '/' && !e.ctrlKey && !e.metaKey && !/^(INPUT|TEXTAREA)$/.test(e.target.tagName)) {
+    e.preventDefault(); $('search').focus();
+    return;
+  }
+  // SUMMARY не трогаем: Esc там закрывает <details> нативно
+  if (e.key === 'Escape' && current && e.target.tagName !== 'SUMMARY') closeEditor();
+});
 
 // Следим за «прилипанием»: пользователь у самого низа → автоскролл включён,
 // проскроллил вверх читать → выключен, пока не вернётся вниз.

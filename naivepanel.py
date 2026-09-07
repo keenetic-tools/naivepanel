@@ -16,6 +16,7 @@ import hashlib
 import json
 import os
 import re
+import socket
 import subprocess
 import time
 from pathlib import Path
@@ -89,8 +90,11 @@ ALLOWED_HOSTS = {h.strip() for h in os.environ.get("NAIVEPANEL_HOSTS", "").split
 PANEL_INIT = Path(os.environ.get("NAIVEPANEL_INIT", "/opt/etc/init.d/S99naivepanel"))
 
 NAME_RE = re.compile(r"^[a-zA-Z0-9_\-.]{1,64}$")
+# Имена, занятые статическими маршрутами /api/configs/export|import:
+# такой пресет нельзя было бы получить через GET (роутинг отдаёт файл)
+RESERVED_NAMES = frozenset({"export", "import"})
 
-APP_VERSION = "0.4.1"
+APP_VERSION = "0.5.0"
 
 
 def _ensure_dirs() -> None:
@@ -335,6 +339,64 @@ def _build_payload(data: dict[str, Any], old_proxy: str | None = None) -> dict[s
     return cfg
 
 
+def _validate_cfg(cfg: dict[str, Any], name: str) -> None:
+    """Схема хранимого формата перед activate/PUT/импортом (400 при ошибке).
+
+    Бинарник naive с битым конфигом падает в рантайме — activate такого
+    пресета уронил бы РАБОТАЮЩИЙ прокси (config.json уже перезаписан, а
+    рестарт не удался). Ловим очевидные проблемы заранее: отсутствующие
+    listen/proxy, пустые адреса, URI без схемы, диапазон insecure-concurrency
+    (HTML-форма ограничивает 1..4, но API — нет).
+    """
+    errors: list[str] = []
+    listen = cfg.get("listen")
+    if isinstance(listen, list):
+        if not listen or any(not isinstance(l, str) or not l.strip() for l in listen):
+            errors.append("listen: нужны непустые строки")
+    elif not (isinstance(listen, str) and listen.strip()):
+        errors.append("listen обязателен (строка или массив строк)")
+    proxy = cfg.get("proxy")
+    if not (isinstance(proxy, str) and proxy.strip()):
+        errors.append("proxy обязателен")
+    elif not re.match(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://", proxy):
+        errors.append("proxy должен быть URI со схемой (https://…)")
+    ic = cfg.get("insecure-concurrency")
+    if ic is not None and (not isinstance(ic, int) or isinstance(ic, bool) or not 1 <= ic <= 4):
+        errors.append("insecure-concurrency: целое 1..4")
+    for key in ("log", "extra-headers", "host-resolver-rules"):
+        if cfg.get(key) is not None and not isinstance(cfg[key], str):
+            errors.append(f"{key}: строка")
+    if errors:
+        abort(400, description=f"{name}: " + "; ".join(errors))
+
+
+def _upstream_endpoint(upstream: str) -> tuple[str, int] | None:
+    """Upstream (host, host:port или полный/неполный URI) → (host, port).
+
+    Для TCP-проверки доступности нужны только адрес и порт: срезаем схему и
+    креденшалы. Порт не указан → 443 (стандартный для https-upstream).
+    Голый IPv6 без квадратных скобок не поддерживаем — в поле upstream
+    такой формат не встречается.
+    """
+    host = (upstream or "").strip()
+    if "://" in host:
+        host = host.split("://", 1)[1]
+    at = host.rfind("@")  # креды в userinfo
+    if at != -1:
+        host = host[at + 1:]
+    host = host.split("/", 1)[0]
+    if not host:
+        return None
+    if host.startswith("[") and "]" in host:  # IPv6: [::1] или [::1]:443
+        inner = host[1:host.index("]")]
+        rest = host[host.index("]") + 1:].lstrip(":")
+        return inner, (int(rest) if rest.isdigit() else 443)
+    head, sep, tail = host.rpartition(":")
+    if sep:
+        return (head, int(tail)) if head and tail.isdigit() else None
+    return tail, 443  # rpartition без sep: head пуст, исходная строка в tail
+
+
 # --- Service control ------------------------------------------------------
 
 def _run(cmd: list[str], timeout: int = 10) -> dict[str, Any]:
@@ -469,6 +531,36 @@ def _api_json_errors(exc: HTTPException):
         msg = exc.description or exc.name
         return jsonify({"error": msg, "description": msg}), exc.code
     return exc
+
+
+# --- Security headers --------------------------------------------------------
+
+# CSP сознательно допускает 'unsafe-inline' для script/style: UI — один файл
+# с inline-обработчиками onclick и без сборки (это принцип проекта). Ценность
+# политики не в блокировке inline-XSS (первичная защита — экранирование в
+# escapeHtml() и JSON-only API), а в запрете подгрузки ВНЕШНИХ скриптов и
+# стилей: инъекция <script src=…>/<link href=…> с чужого хоста не сработает.
+# connect-src 'self' не даёт внедрённому коду эксфильтрировать данные fetch'ем
+# на сторонний домен.
+_CSP = (
+    "default-src 'none'; "
+    "script-src 'unsafe-inline'; "
+    "style-src 'unsafe-inline'; "
+    "connect-src 'self'; "
+    "img-src 'self' data:; "
+    "base-uri 'none'; "
+    "form-action 'self'; "
+    "frame-ancestors 'none'"
+)
+
+
+@app.after_request
+def _security_headers(resp: Response) -> Response:
+    resp.headers.setdefault("Content-Security-Policy", _CSP)
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("X-Frame-Options", "DENY")
+    resp.headers.setdefault("Referrer-Policy", "no-referrer")
+    return resp
 
 
 # --- Host allowlist (анти-DNS-rebinding) -----------------------------------
@@ -651,6 +743,8 @@ def api_configs_create():
     name = (data.get("name") or "").strip()
     if not NAME_RE.match(name):
         abort(400, description="invalid name")
+    if name in RESERVED_NAMES:
+        abort(400, description=f"name {name!r} is reserved")
     cfg = _build_payload(data)
     path = CONF_D / f"{name}.json"
     if path.exists():
@@ -670,6 +764,7 @@ def api_configs_update(name: str):
     path = CONF_D / f"{name}.json"
     old = _load_json(path)  # 404, если пресета нет
     cfg = _build_payload(data, old_proxy=old.get("proxy"))
+    _validate_cfg(cfg, name)
     _save_json(path, cfg)
     restart = None
     if _active_name() == name:
@@ -701,9 +796,125 @@ def api_configs_activate(name: str):
     if not src.exists():
         abort(404, description=f"preset {name!r} not found")
     cfg = _load_json(src)
+    _validate_cfg(cfg, name)  # битый конфиг не должен ронять рабочий прокси
     _write_active(name, cfg)
     restart = _service("restart") if INIT_SCRIPT.exists() else {"rc": None, "note": "no init script"}
     return jsonify({"name": name, "active": True, "restart": restart})
+
+
+@app.route("/api/configs/<name>/duplicate", methods=["POST"])
+def api_configs_duplicate(name: str):
+    """Копия пресета целиком, server-side — включая пароль.
+
+    Через UI (GET → форма → POST) пароль не переносится: GET его не отдаёт,
+    а create требует креды для host-only upstream. Копирование файла на
+    сервере сохраняет работоспособный конфиг без повторного ввода секрета.
+    """
+    if not NAME_RE.match(name):
+        abort(400, description="invalid name")
+    src = CONF_D / f"{name}.json"
+    if not src.exists():
+        abort(404, description=f"preset {name!r} not found")
+    cfg = _load_json(src)
+    # имя копии: name-copy, при занятости name-copy2, name-copy3… NAME_RE
+    # допускает 64 символа — урезаем базу, чтобы суффикс всегда влез
+    base = f"{name}-copy"[:58]
+    candidate, n = base, 2
+    while (CONF_D / f"{candidate}.json").exists():
+        if n > 99:
+            abort(409, description=f"too many copies of {name!r}")
+        candidate = f"{base}{n}"
+        n += 1
+    _save_json(CONF_D / f"{candidate}.json", cfg)
+    return jsonify({"name": candidate, "copied_from": name}), 201
+
+
+@app.route("/api/configs/export")
+def api_configs_export():
+    """Все пресеты одним JSON-файлом — бэкап / миграция на другой роутер.
+
+    ВАЖНО: содержит proxy-URI с паролями — иначе восстановление теряло бы
+    креды и не было бы бэкапом. Это единственный GET, отдающий секреты:
+    осознанное действие пользователя (Content-Disposition: attachment —
+    файл уходит в Downloads, а не в кеш браузера).
+    """
+    _ensure_dirs()
+    presets: dict[str, Any] = {}
+    for p in sorted(CONF_D.glob("*.json")):
+        try:
+            presets[p.stem] = _load_json(p)
+        except Exception as exc:  # битый файл не должен ронять весь экспорт
+            app.logger.warning("export: skipping %s: %s", p.name, exc)
+    resp = jsonify({
+        "format": 1,
+        "version": APP_VERSION,
+        "exported": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "presets": presets,
+    })
+    resp.headers["Content-Disposition"] = 'attachment; filename="naivepanel-presets.json"'
+    return resp
+
+
+@app.route("/api/configs/import", methods=["POST"])
+def api_configs_import():
+    """Импорт пресетов из файла export-формата (поле presets: {name: cfg}).
+
+    Существующие имена НЕ перезаписываются (причина — в ответе), каждый
+    пресет проходит _validate_cfg — файл мог быть отредактирован руками.
+    Лимит тела 256 КБ (MAX_CONTENT_LENGTH) покрывает ~сотни пресетов.
+    """
+    data = request.get_json(silent=True) or {}
+    incoming = data.get("presets")
+    if not isinstance(incoming, dict):
+        abort(400, description="expected {presets: {name: config}}")
+    imported: list[str] = []
+    skipped: list[dict[str, str]] = []
+    for name, cfg in sorted(incoming.items()):
+        if not NAME_RE.match(name or ""):
+            skipped.append({"name": name, "reason": "invalid name"})
+            continue
+        if name in RESERVED_NAMES:
+            skipped.append({"name": name, "reason": "reserved name"})
+            continue
+        if not isinstance(cfg, dict):
+            skipped.append({"name": name, "reason": "expected object"})
+            continue
+        try:
+            _validate_cfg(cfg, name)
+        except HTTPException as exc:
+            skipped.append({"name": name, "reason": str(exc.description)})
+            continue
+        if (CONF_D / f"{name}.json").exists():
+            skipped.append({"name": name, "reason": "already exists"})
+            continue
+        _save_json(CONF_D / f"{name}.json", cfg)
+        imported.append(name)
+    if imported:
+        app.logger.info("import: created %s", ", ".join(imported))
+    return jsonify({"imported": imported, "skipped": skipped})
+
+
+@app.route("/api/probe", methods=["POST"])
+def api_probe():
+    """TCP-доступность upstream: коннект с роутера, таймаут 3с.
+
+    Отличает «прокси лежит» от «сеть/файрвол»: панель ходит с того же хоста,
+    что и naive. Только TCP-коннект — без TLS-хендшейка и без отправки
+    кредов; недоступность — это нормальный ответ 200 с полем error.
+    """
+    data = request.get_json(silent=True) or {}
+    ep = _upstream_endpoint(data.get("upstream") or "")
+    if not ep:
+        abort(400, description="upstream required (host[:port] or URI)")
+    host, port = ep
+    t0 = time.monotonic()
+    try:
+        with socket.create_connection(ep, timeout=3.0):
+            pass
+        return jsonify({"host": host, "port": port,
+                        "ms": round((time.monotonic() - t0) * 1000)})
+    except OSError as exc:  # refused/timeout/DNS — не ошибка панели
+        return jsonify({"host": host, "port": port, "error": str(exc)})
 
 
 @app.route("/api/service/<action>", methods=["POST"])

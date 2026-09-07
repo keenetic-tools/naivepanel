@@ -427,3 +427,184 @@ def test_api_errors_are_json(client):
     r = client.get("/no-such-page")
     assert r.status_code == 404
     assert not r.is_json
+
+
+# --- Security headers -----------------------------------------------------------
+
+def test_security_headers_on_pages_and_api(client):
+    for path in ("/", "/api/status"):
+        r = client.get(path)
+        csp = r.headers.get("Content-Security-Policy", "")
+        assert "default-src 'none'" in csp
+        assert "connect-src 'self'" in csp
+        assert r.headers.get("X-Content-Type-Options") == "nosniff"
+        assert r.headers.get("X-Frame-Options") == "DENY"
+        assert r.headers.get("Referrer-Policy") == "no-referrer"
+
+
+def test_csp_blocks_external_scripts_but_allows_inline(client):
+    # UI — один файл с inline-скриптами без сборки: CSP обязан их пропускать
+    csp = client.get("/").headers["Content-Security-Policy"]
+    assert "script-src 'unsafe-inline'" in csp
+    assert "style-src 'unsafe-inline'" in csp
+    # никаких внешних origin'ов: у всех директив только 'self'/'none'/кёвоты
+    for src in csp.split(";"):
+        if "src" in src or "uri" in src:
+            assert "://" not in src
+
+
+# --- duplicate ------------------------------------------------------------------
+
+def test_duplicate_copies_config_with_password(client, app):
+    _create(client)
+    r = client.post("/api/configs/home/duplicate", headers=CSRF)
+    assert r.status_code == 201
+    assert r.get_json()["name"] == "home-copy"
+    src = json.loads((app.CONF_D / "home.json").read_text())
+    copy = json.loads((app.CONF_D / "home-copy.json").read_text())
+    assert copy == src  # включая proxy-URI с паролем
+    assert copy["proxy"] == "https://user:p%40ss%3Aword@proxy.example.com"
+
+
+def test_duplicate_counter_and_missing(client):
+    _create(client)
+    for _ in range(2):
+        r = client.post("/api/configs/home/duplicate", headers=CSRF)
+        assert r.status_code == 201
+    assert r.get_json()["name"] == "home-copy2"
+    assert client.post("/api/configs/nope/duplicate", headers=CSRF).status_code == 404
+    # CSRF обязателен и для duplicate
+    assert client.post("/api/configs/home/duplicate").status_code == 403
+
+
+# --- валидация перед активацией --------------------------------------------------
+
+def test_activate_rejects_broken_preset(client, app):
+    # пресет, отредактированный руками до битого состояния
+    app._ensure_dirs()
+    (app.CONF_D / "broken.json").write_text('{"listen": "", "proxy": "https://h"}')
+    r = client.post("/api/configs/broken/activate", headers=CSRF)
+    assert r.status_code == 400
+    assert "listen" in r.get_json()["error"]
+    # активный конфиг не тронут: activate отклонён ДО перезаписи config.json
+    assert not app.ACTIVE_CONFIG.exists()
+
+
+def test_activate_rejects_proxy_without_scheme(client, app):
+    app._ensure_dirs()
+    (app.CONF_D / "noscheme.json").write_text(
+        '{"listen": "socks://127.0.0.1:1080", "proxy": "justhost"}')
+    r = client.post("/api/configs/noscheme/activate", headers=CSRF)
+    assert r.status_code == 400
+    assert "proxy" in r.get_json()["error"]
+
+
+def test_validate_cfg_ranges_and_types(app):
+    good = {"listen": "socks://127.0.0.1:1080", "proxy": "https://h"}
+    app._validate_cfg(good, "ok")  # не бросает
+    app._validate_cfg({**good, "insecure-concurrency": 4}, "ok")
+    for bad in [{"insecure-concurrency": 5}, {"insecure-concurrency": True},
+                {"log": 42}, {"extra-headers": []}]:
+        with pytest.raises(Exception):
+            app._validate_cfg({**good, **bad}, "bad")
+
+
+# --- export / import --------------------------------------------------------------
+
+def test_export_contains_all_presets_with_creds(client):
+    _create(client)
+    _create(client, name="work", upstream="other.example.com")
+    r = client.get("/api/configs/export")
+    assert r.status_code == 200
+    assert "attachment" in r.headers["Content-Disposition"]
+    data = r.get_json()
+    assert set(data["presets"]) == {"home", "work"}
+    # осознанное исключение из write-only: бэкап без паролей не был бы бэкапом
+    assert data["presets"]["home"]["proxy"] == "https://user:p%40ss%3Aword@proxy.example.com"
+
+
+def test_import_roundtrip_and_skip_existing(client, env):
+    _create(client)
+    export = client.get("/api/configs/export").get_json()
+    export["presets"]["home"]["listen"] = "socks://127.0.0.1:1999"  # «другой роутер»
+    r = client.post("/api/configs/import", headers=CSRF, json=export)
+    assert r.status_code == 200
+    d = r.get_json()
+    assert d["imported"] == []  # home уже есть — не перезаписываем
+    assert d["skipped"][0]["reason"] == "already exists"
+
+
+def test_import_creates_presets_and_file_rights(client, app):
+    body = {"format": 1, "presets": {
+        "imported-one": {"listen": "socks://127.0.0.1:1080",
+                         "proxy": "https://u:p@h.example"},
+    }}
+    r = client.post("/api/configs/import", headers=CSRF, json=body)
+    d = r.get_json()
+    assert d["imported"] == ["imported-one"] and d["skipped"] == []
+    p = app.CONF_D / "imported-one.json"
+    assert p.stat().st_mode & 0o777 == 0o600  # секреты → права как у пресетов
+
+
+def test_import_rejects_invalid_entries(client):
+    body = {"presets": {
+        "bad name!": {"listen": "socks://127.0.0.1:1080", "proxy": "https://h"},
+        "broken": {"listen": "", "proxy": ""},
+        "good": {"listen": "127.0.0.1:1080", "proxy": "https://h"},
+    }}
+    d = client.post("/api/configs/import", headers=CSRF, json=body).get_json()
+    assert d["imported"] == ["good"]
+    reasons = {s["name"]: s["reason"] for s in d["skipped"]}
+    assert "invalid name" in reasons["bad name!"]
+    assert "listen" in reasons["broken"]
+    assert client.post("/api/configs/import", headers=CSRF, json={}).status_code == 400
+
+
+def test_reserved_names_rejected(client):
+    # /api/configs/export и /api/configs/import — статические маршруты:
+    # пресет с таким именем нельзя получить через GET
+    for name in ("export", "import"):
+        r, _ = _create(client, name=name)
+        assert r.status_code == 400
+        assert "reserved" in r.get_json()["error"]
+    body = {"presets": {"export": {"listen": "127.0.0.1:1080", "proxy": "https://h"}}}
+    d = client.post("/api/configs/import", headers=CSRF, json=body).get_json()
+    assert d["skipped"][0]["reason"] == "reserved name"
+
+
+# --- upstream probe ----------------------------------------------------------------
+
+def test_upstream_endpoint_variants(app):
+    f = app._upstream_endpoint
+    assert f("proxy.example.com") == ("proxy.example.com", 443)
+    assert f("https://proxy.example.com") == ("proxy.example.com", 443)
+    assert f("https://user:p%40ss@h.example:8443/x") == ("h.example", 8443)
+    assert f("[::1]:8443") == ("::1", 8443)
+    assert f("https://[::1]/") == ("::1", 443)
+    assert f("host:port") is None
+    assert f("  ") is None
+
+
+def test_probe_measures_real_tcp(client):
+    # живой слушающий сокет на ephemeral-порту — без моков
+    import socket as s
+    srv = s.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    port = srv.getsockname()[1]
+    try:
+        r = client.post("/api/probe", headers=CSRF,
+                        json={"upstream": f"127.0.0.1:{port}"})
+        assert r.status_code == 200
+        d = r.get_json()
+        assert d["port"] == port and isinstance(d["ms"], int) and d["ms"] >= 0
+    finally:
+        srv.close()
+    # порт закрыт — это нормальный результат проверки, а не ошибка панели
+    r = client.post("/api/probe", headers=CSRF, json={"upstream": "127.0.0.1:1"})
+    d = r.get_json()
+    assert r.status_code == 200 and "error" in d
+
+
+def test_probe_requires_upstream(client):
+    assert client.post("/api/probe", headers=CSRF, json={}).status_code == 400

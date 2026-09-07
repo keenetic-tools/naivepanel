@@ -18,17 +18,32 @@ HTML page — no CDN, no build step. MIT-licensed.
 - Bind по умолчанию `127.0.0.1:8089`. Доступ из LAN — через внешний reverse proxy
   или напрямую (см. «Доступ из LAN без reverse proxy»).
 
+## Возможности UI (v0.5.0)
+
+- Карточка статуса: состояние, активный пресет, uptime, PID, версия панели.
+- Поиск по пресетам (клавиша `/`), дублирование пресета в один клик (⧉ —
+  пароль переносится, руками вводить не нужно).
+- Экспорт/импорт всех пресетов JSON-файлом (бэкап/миграция между роутерами).
+- Кнопка «пинг» в редакторе: TCP-доступность upstream с роутера (3с, без TLS).
+- Светлая/тёмная тема: автоматически по системной, клик по ☀/☾ фиксирует выбор.
+- Toast-уведомления, подсветка ERROR/WARNING в логе, горячие клавиши
+  (Ctrl+S — сохранить, Esc — закрыть редактор).
+
 ## API
 
 | Метод | Путь | Что делает |
 |-------|------|------------|
-| `GET` | `/api/status` | `{active, current, init_present, init_script, pid, uptime}` |
+| `GET` | `/api/status` | `{active, current, init_present, init_script, pid, uptime, version}` |
 | `GET` | `/api/configs` | список пресетов `{name, active, listen, proxy, username}` |
 | `GET` | `/api/configs/<name>` | полный JSON-конфиг пресета |
 | `POST` | `/api/configs` | создать пресет |
 | `PUT` | `/api/configs/<name>` | обновить (если активный — propagate в `config.json` **и restart**; ответ содержит `restart:{rc,...}`) |
 | `DELETE` | `/api/configs/<name>` | удалить (если не активный) |
-| `POST` | `/api/configs/<name>/activate` | сделать активным + restart |
+| `POST` | `/api/configs/<name>/activate` | сделать активным + restart (конфиг **валидируется** — битый не роняет рабочий прокси) |
+| `POST` | `/api/configs/<name>/duplicate` | копия пресета server-side, **включая пароль** |
+| `GET` | `/api/configs/export` | все пресеты одним JSON-файлом (attachment; содержит пароли!) |
+| `POST` | `/api/configs/import` | импорт из файла export-формата; существующие не перезаписываются, битые отклоняются |
+| `POST` | `/api/probe` | TCP-доступность upstream с роутера (`{upstream}` → `{ms}` или `{error}`) |
 | `POST` | `/api/service/{start,stop,restart}` | управление через S99naiveproxy |
 | `POST` | `/api/panel/restart` | перезапуск самой панели (после обновления файлов) |
 | `GET` | `/api/logs?lines=100` | tail лог-файла |
@@ -303,6 +318,13 @@ NaivePanel собирает минимальный JSON, совместимый 
   маркер DNS-rebinding. Поэтому reverse proxy со своим именем требует явного
   `NAIVEPANEL_HOSTS`.
 - Активация пресета валидирует имя: `^[a-zA-Z0-9_\-.]{1,64}$` (нет path-traversal).
+- **Схема конфига валидируется** перед activate/PUT/импортом: непустые
+  `listen`/`proxy`, URI со схемой, диапазон `insecure-concurrency` 1..4 — битый
+  (например, руками отредактированный) пресет не перезапишет рабочий `config.json`.
+- **Security-заголовки** на каждом ответе: `Content-Security-Policy`
+  (`default-src 'none'`, внешние скрипты/стили запрещены, `connect-src 'self'`
+  против эксфильтрации), `X-Content-Type-Options: nosniff`,
+  `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`.
 - Bind на `0.0.0.0` — warning в лог: на роутере это ещё и WAN/VPN/guest-сегменты.
 - 401 (auth failed) и 403 (host rejected) пишутся в лог панели.
 - Мутирующие запросы (POST/PUT/DELETE) требуют заголовок `X-Requested-With`
@@ -313,6 +335,11 @@ NaivePanel собирает минимальный JSON, совместимый 
   upstream/username разобранными, но без пароля; пустое поле пароля в форме
   при сохранении означает «оставить прежний». Креденшалы в proxy-URI
   percent-encode'ятся (`@ : /` и т.п. в пароле не ломают URI).
+- **Исключение — export**: `GET /api/configs/export` сознательно содержит
+  proxy-URI с паролями — бэкап без кредов не был бы бэкапом. Файл уходит как
+  `Content-Disposition: attachment` по явному клику «Экспорт»; импорт
+  (`/api/configs/import`) существующие пресеты не перезаписывает и валидирует
+  каждый. Не хранить экспорт-файл в общедоступных местах.
 - `/api/logs` маскирует креды в URI (`scheme://user:pass@host` →
   `scheme://user:***@host`) и читает лог с конца файла, а не целиком.
 - PUT активного пресета применяет изменения сразу (перезаписывает
@@ -326,8 +353,7 @@ NaivePanel собирает минимальный JSON, совместимый 
 - ❌ multi-user
 - ❌ HTTPS termination (только через внешний reverse proxy)
 - ❌ auto-update панели
-- ❌ мониторинг (latency / graphs / uptime)
-- ❌ импорт/экспорт пресетов
+- ❌ графики мониторинга (uptime-строка и проверка доступности upstream — есть)
 - ❌ управление upstream-серверами
 
 ## Структура
@@ -371,6 +397,12 @@ curl -s http://127.0.0.1:8089/api/status
    появился тот же JSON с `chmod 0600`.
 3. PUT (изменить listen port) → проверить, что `config.json` обновился.
 4. Создать второй пресет `work`, активировать его, удалить `home`.
+5. ⧉ на пресете → появилась копия `work-copy` с тем же паролем (проверить
+   `conf.d/work-copy.json`); «пинг» в редакторе → toast с мс или ошибкой.
+6. «Экспорт» → скачался JSON со всеми пресетами; удалить один пресет,
+   «Импорт» → пресет вернулся, существующие не перезаписаны.
+7. `/` → фокус в поиске, фильтрация списка; Ctrl+S — сохранить; Esc — закрыть
+   редактор; ☀/☾ — тема переключается и переживает перезагрузку.
 
 ## Лицензия
 
