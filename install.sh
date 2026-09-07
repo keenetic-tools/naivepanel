@@ -3,7 +3,7 @@
 # firmware with Entware). Runs ON the router.
 #
 # Bootstrap (pin to a release tag, not `main`):
-#   curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/v0.4.1/install.sh | sh -s -- --with-auth
+#   curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/v0.5.0/install.sh | sh -s -- --with-auth
 #
 # Safe to pipe into `sh`: the confirmation and password prompts read the
 # terminal (/dev/tty), never the piped stdin. Add --yes to skip confirmation.
@@ -15,7 +15,7 @@
 #   --with-auth          create /opt/etc/naive/panel/admin.pass (interactive)
 #   --bind HOST:PORT     write NAIVEPANEL_BIND to /opt/etc/naive/panel/panel.conf
 #   --hosts LIST         write NAIVEPANEL_HOSTS to /opt/etc/naive/panel/panel.conf
-#   --ref TAG            git tag/ref to install (default: v0.4.1)
+#   --ref TAG            git tag/ref to install (default: v0.5.0)
 #   --no-naive-init      do not install S99naiveproxy init script
 #   --yes                non-interactive (no confirmation prompt)
 #   --uninstall          stop services and remove installed files
@@ -24,7 +24,7 @@
 set -u
 
 REPO="keenetic-tools/naivepanel"
-REF="v0.4.1"
+REF="v0.5.0"
 BIND=""
 HOSTS=""
 WITH_AUTH=0
@@ -62,7 +62,7 @@ Usage: install.sh [flags]
   --with-auth          create /opt/etc/naive/panel/admin.pass (interactive)
   --bind HOST:PORT     write NAIVEPANEL_BIND to /opt/etc/naive/panel/panel.conf
   --hosts LIST         write NAIVEPANEL_HOSTS to /opt/etc/naive/panel/panel.conf
-  --ref TAG            git tag/ref to install (default: v0.4.1)
+  --ref TAG            git tag/ref to install (default: v0.5.0)
   --no-naive-init      do not install S99naiveproxy init script
   --yes                non-interactive (no confirmation prompt)
   --uninstall          stop services and remove installed files
