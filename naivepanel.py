@@ -94,7 +94,7 @@ NAME_RE = re.compile(r"^[a-zA-Z0-9_\-.]{1,64}$")
 # такой пресет нельзя было бы получить через GET (роутинг отдаёт файл)
 RESERVED_NAMES = frozenset({"export", "import"})
 
-APP_VERSION = "0.5.0"
+APP_VERSION = "0.5.1"
 
 
 def _ensure_dirs() -> None:

@@ -15,89 +15,153 @@
     --btn-fg:#0f1115; --card:#181b22; --border:#2a2f38; --border-sel:#57606e;
     --sel-bg:rgba(255,255,255,.04); --hov:rgba(255,255,255,.07);
     --acc-tint:rgba(93,210,164,.07); --badge-bg:rgba(93,210,164,.18); --mut-tint:rgba(154,170,170,.18);
-    --input-bg:#0f1115; --log-bg:#000; --log-fg:#bfe; }
+    --input-bg:#0f1115; --log-bg:#000; --log-fg:#bfe;
+    --bg-glow:rgba(93,210,164,.045); --bg-glow2:rgba(97,140,255,.035);
+    --hdr-bg:rgba(15,17,21,.96); --hdr-blur:rgba(15,17,21,.78);
+    --dot-halo:rgba(93,210,164,.16);
+    /* elevation: тени в тёмной теме едва заметны — держат форму карточек */
+    --shadow-1:0 1px 2px rgba(0,0,0,.25);
+    --shadow-2:0 2px 6px rgba(0,0,0,.35), 0 10px 28px rgba(0,0,0,.30); }
   :root[data-theme="light"] { color-scheme:light;
     --bg:#f4f5f7; --fg:#1c2128; --mut:#69707a; --acc:#0e8a5f; --err:#c43e3e; --warn:#8a6a1d;
     --btn-fg:#ffffff; --card:#ffffff; --border:#d6dae0; --border-sel:#9aa3ad;
     --sel-bg:rgba(0,0,0,.04); --hov:rgba(0,0,0,.06);
     --acc-tint:rgba(14,138,95,.08); --badge-bg:rgba(14,138,95,.14); --mut-tint:rgba(105,112,122,.14);
-    --input-bg:#ffffff; --log-bg:#fbfcfd; --log-fg:#24292f; }
+    --input-bg:#ffffff; --log-bg:#fbfcfd; --log-fg:#24292f;
+    --bg-glow:rgba(14,138,95,.05); --bg-glow2:rgba(58,106,255,.05);
+    --hdr-bg:#ffffff; --hdr-blur:rgba(255,255,255,.72);
+    --dot-halo:rgba(14,138,95,.15);
+    --shadow-1:0 1px 2px rgba(24,33,40,.06);
+    --shadow-2:0 2px 6px rgba(24,33,40,.07), 0 10px 28px rgba(24,33,40,.10); }
   @media (prefers-color-scheme: light) {
     :root:not([data-theme="dark"]) { color-scheme:light;
       --bg:#f4f5f7; --fg:#1c2128; --mut:#69707a; --acc:#0e8a5f; --err:#c43e3e; --warn:#8a6a1d;
       --btn-fg:#ffffff; --card:#ffffff; --border:#d6dae0; --border-sel:#9aa3ad;
       --sel-bg:rgba(0,0,0,.04); --hov:rgba(0,0,0,.06);
       --acc-tint:rgba(14,138,95,.08); --badge-bg:rgba(14,138,95,.14); --mut-tint:rgba(105,112,122,.14);
-      --input-bg:#ffffff; --log-bg:#fbfcfd; --log-fg:#24292f; }
+      --input-bg:#ffffff; --log-bg:#fbfcfd; --log-fg:#24292f;
+      --bg-glow:rgba(14,138,95,.05); --bg-glow2:rgba(58,106,255,.05);
+      --hdr-bg:#ffffff; --hdr-blur:rgba(255,255,255,.72);
+      --dot-halo:rgba(14,138,95,.15);
+      --shadow-1:0 1px 2px rgba(24,33,40,.06);
+      --shadow-2:0 2px 6px rgba(24,33,40,.07), 0 10px 28px rgba(24,33,40,.10); }
   }
   * { box-sizing:border-box; }
-  body { margin:0; font:14px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;
+  body { margin:0; font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;
          background:var(--bg); color:var(--fg); }
-  header { padding:14px 18px; border-bottom:1px solid var(--border); display:flex; gap:12px; align-items:center; }
-  header h1 { font-size:16px; margin:0; }
-  #status { color:var(--mut); margin-left:auto; }
+  /* Тонкий статичный градиент: один раз рисуется композитором, не анимируется */
+  body::before { content:""; position:fixed; inset:0; z-index:-1; pointer-events:none;
+    background:
+      radial-gradient(1100px 480px at 18% -12%, var(--bg-glow), transparent 70%),
+      radial-gradient(900px 420px at 108% 8%, var(--bg-glow2), transparent 65%); }
+  header { position:sticky; top:0; z-index:5; padding:14px 20px; display:flex; gap:12px; align-items:center;
+           border-bottom:1px solid var(--border); background:var(--hdr-bg); }
+  @supports (backdrop-filter:blur(8px)) or (-webkit-backdrop-filter:blur(8px)) {
+    header { background:var(--hdr-blur); backdrop-filter:blur(8px); -webkit-backdrop-filter:blur(8px); }
+  }
+  header h1 { font-size:16px; margin:0; letter-spacing:-.01em; display:flex; align-items:center; gap:10px; }
+  .logo { width:24px; height:24px; border-radius:7px; flex:none;
+          background:linear-gradient(135deg, var(--acc), #4a8cf7);
+          display:inline-flex; align-items:center; justify-content:center;
+          color:#fff; font-weight:800; font-size:13px; box-shadow:var(--shadow-1); }
+  #status { color:var(--mut); margin-left:auto; font-variant-numeric:tabular-nums; }
   .on { color:var(--acc); } .off { color:var(--err); }
-  main { display:grid; grid-template-columns: 280px 1fr; gap:16px; padding:16px; }
-  @media (max-width:800px) { main { grid-template-columns: 1fr; } }
-  .card { background:var(--card); border:1px solid var(--border); border-radius:8px; padding:14px; }
-  .card h2 { margin:0 0 10px; font-size:13px; text-transform:uppercase; letter-spacing:.08em; color:var(--mut); }
-  .svcinfo { display:grid; gap:3px; margin-bottom:12px; font-size:13px; }
-  .svcinfo .kv { display:flex; justify-content:space-between; gap:10px; min-width:0; }
+  /* Живая точка статуса: пульс только на transform/opacity, один элемент.
+     prefers-reduced-motion — без анимации (доступность). */
+  .dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:5px;
+         vertical-align:1px; box-shadow:0 0 0 3px var(--dot-halo); }
+  .dot.on { background:var(--acc); color:var(--acc); }
+  .dot.off { background:var(--err); }
+  @media (prefers-reduced-motion: no-preference) {
+    .dot.on { animation:pulse 2.4s ease-in-out infinite; }
+  }
+  @keyframes pulse {
+    0%, 100% { transform:scale(1); opacity:1; }
+    50% { transform:scale(1.35); opacity:.55; }
+  }
+  main { display:grid; grid-template-columns: 288px 1fr; gap:20px; padding:20px max(20px, calc((100% - 1180px)/2)); }
+  @media (max-width:800px) { main { grid-template-columns: 1fr; padding:14px; } }
+  .card { background:var(--card); border:1px solid var(--border); border-radius:12px;
+          padding:16px; box-shadow:var(--shadow-1); }
+  .card h2 { margin:0 0 12px; font-size:12px; font-weight:600; text-transform:uppercase;
+             letter-spacing:.09em; color:var(--mut); display:flex; align-items:center; gap:8px; }
+  .card h2::after { content:""; flex:1; height:1px; background:var(--border); opacity:.6; }
+  h2.sect { margin-top:24px; padding-top:18px; border-top:1px solid var(--border); }
+  h2.sect::after { display:none; }
+  .svcinfo { display:grid; gap:4px; margin-bottom:14px; font-size:13px; }
+  .svcinfo .kv { display:flex; justify-content:space-between; gap:10px; min-width:0;
+                 padding:3px 8px; margin:0 -8px; border-radius:6px; }
+  .svcinfo .kv:nth-child(odd) { background:var(--sel-bg); }
   .svcinfo .kv span { color:var(--mut); }
-  .svcinfo .kv b { font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .svcinfo .kv b { font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+                   font-variant-numeric:tabular-nums; }
   ul.presets { list-style:none; padding:0; margin:0; }
-  #search { margin-bottom:8px; }
-  ul.presets li { border:1px solid var(--border); border-radius:6px; margin-bottom:6px;
-                  display:flex; flex-wrap:wrap; align-items:center; transition:border-color .12s ease; }
-  ul.presets li:hover { border-color:var(--acc); }
+  #search { margin-bottom:10px; }
+  ul.presets li { border:1px solid var(--border); border-radius:10px; margin-bottom:8px;
+                  display:flex; flex-wrap:wrap; align-items:center; background:var(--input-bg);
+                  transition:border-color .14s ease, transform .14s ease, box-shadow .14s ease; }
+  ul.presets li:hover { border-color:var(--acc); transform:translateY(-1px); box-shadow:var(--shadow-1); }
   ul.presets li.selected { border-color:var(--border-sel); background:var(--sel-bg); }
   /* active (запущенный) важнее selected — его зелёная рамка переопределяет */
   ul.presets li.active { border-color:var(--acc); background:var(--acc-tint); }
   ul.presets .sel { flex:1 1 auto; min-width:0; display:flex; align-items:center; gap:6px 8px;
-                    padding:8px 4px 8px 10px; background:none; border:none; color:inherit;
-                    font:inherit; text-align:left; cursor:pointer; border-radius:6px; }
+                    padding:9px 4px 9px 12px; background:none; border:none; color:inherit;
+                    font:inherit; text-align:left; cursor:pointer; border-radius:9px; }
   ul.presets .sel:hover { background:var(--hov); }
   ul.presets .name { font-weight:600; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  ul.presets .proxy { flex-basis:100%; color:var(--mut); font-size:12px; padding:0 10px 8px;
+  ul.presets .proxy { flex-basis:100%; color:var(--mut); font-size:12px; padding:0 12px 9px;
                       overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  ul.presets .badge { font-size:11px; padding:2px 6px; border-radius:10px;
+  ul.presets .badge { font-size:11px; font-weight:600; padding:2px 7px; border-radius:999px;
                       background:var(--badge-bg); color:var(--acc); white-space:nowrap; }
   ul.presets .badge.listen { background:var(--mut-tint); color:var(--mut); }
-  ul.presets .acts { margin-left:auto; display:flex; gap:4px; padding-right:6px; }
+  ul.presets .acts { margin-left:auto; display:flex; gap:4px; padding-right:8px; }
   ul.presets .act { font-size:12px; color:var(--acc); background:none; border:none; cursor:pointer;
-                    padding:4px 6px; border-radius:4px; }
+                    padding:4px 6px; border-radius:6px; }
   ul.presets .del { background:none; border:none; color:var(--err); cursor:pointer;
-                    padding:4px 6px; border-radius:4px; }
+                    padding:4px 6px; border-radius:6px; }
   ul.presets .act:hover, ul.presets .del:hover { background:var(--hov); }
-  button { background:var(--acc); color:var(--btn-fg); border:none; border-radius:6px; padding:7px 12px;
-           cursor:pointer; font-weight:600; transition:filter .12s ease; }
-  button:hover:not(:disabled) { filter:brightness(1.15); }
-  button:active:not(:disabled) { transform:scale(.97); }
-  button.ghost, a.btn { background:transparent; color:var(--fg); border:1px solid var(--border); }
-  button.ghost:hover:not(:disabled) { border-color:var(--acc); filter:none; }
+  /* Пустое состояние списка — мягкая заглушка вместо голого текста */
+  .empty { text-align:center; color:var(--mut); font-size:13px; padding:26px 12px;
+           border:1px dashed var(--border); border-radius:10px; }
+  .empty .ico { display:block; font-size:22px; opacity:.55; margin-bottom:6px; }
+  .empty .hint { display:block; font-size:12px; opacity:.75; margin-top:4px; }
+  button { background:var(--acc); color:var(--btn-fg); border:none; border-radius:8px; padding:7px 13px;
+           cursor:pointer; font-weight:600; box-shadow:var(--shadow-1);
+           transition:filter .12s ease, transform .08s ease, box-shadow .14s ease; }
+  button:hover:not(:disabled) { filter:brightness(1.1); box-shadow:var(--shadow-2); }
+  button:active:not(:disabled) { transform:scale(.97); box-shadow:var(--shadow-1); }
+  button.ghost, a.btn { background:transparent; color:var(--fg); border:1px solid var(--border); box-shadow:none; }
+  button.ghost:hover:not(:disabled) { border-color:var(--acc); filter:none; background:var(--hov); box-shadow:none; }
   button.danger { background:var(--err); color:var(--btn-fg); }
   button.wide { width:100%; }
   button:disabled { opacity:.5; cursor:not-allowed; }
-  .iconbtn { padding:4px 9px; }
-  a.btn { display:inline-block; padding:7px 12px; border-radius:6px; text-decoration:none;
+  .iconbtn { padding:4px 9px; border-radius:8px; }
+  a.btn { display:inline-block; padding:7px 13px; border-radius:8px; text-decoration:none;
           font:inherit; font-weight:600; }
-  a.btn:hover { border-color:var(--acc); }
+  a.btn:hover { border-color:var(--acc); background:var(--hov); }
   button:focus-visible, input:focus-visible, textarea:focus-visible, summary:focus-visible, a:focus-visible {
     outline:2px solid var(--acc); outline-offset:1px; }
-  label { display:block; font-size:12px; color:var(--mut); margin-top:10px; }
-  input,textarea { width:100%; padding:8px 10px; background:var(--input-bg); color:var(--fg);
-                   border:1px solid var(--border); border-radius:6px; font:13px/1.4 ui-monospace,Menlo,monospace; }
+  label { display:block; font-size:12px; color:var(--mut); margin-top:12px; }
+  input,textarea { width:100%; padding:8px 11px; background:var(--input-bg); color:var(--fg);
+                   border:1px solid var(--border); border-radius:8px; font:13px/1.5 ui-monospace,Menlo,monospace;
+                   transition:border-color .14s ease, box-shadow .14s ease; }
+  input:hover, textarea:hover { border-color:var(--border-sel); }
+  input:focus, textarea:focus { border-color:var(--acc); box-shadow:0 0 0 3px var(--dot-halo); outline:none; }
   textarea { min-height:120px; resize:vertical; }
-  .row { display:flex; gap:8px; flex-wrap:wrap; margin-top:12px; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; margin-top:14px; }
   .actions { display:flex; gap:8px; flex-wrap:wrap; margin-top:14px; }
-  pre.log { background:var(--log-bg); color:var(--log-fg); padding:10px; border-radius:6px;
-            max-height:260px; overflow:auto; font:12px/1.5 ui-monospace,Menlo,monospace; white-space:pre-wrap; }
+  pre.log { background:var(--log-bg); color:var(--log-fg); padding:12px; border:1px solid var(--border);
+            border-radius:10px; box-shadow:inset 0 1px 4px rgba(0,0,0,.12);
+            max-height:260px; overflow:auto; font:12px/1.55 ui-monospace,Menlo,monospace;
+            white-space:pre-wrap; font-variant-numeric:tabular-nums; }
   pre.log .lvl-err { color:var(--err); }
   pre.log .lvl-warn { color:var(--warn); }
-  #toasts { position:fixed; right:14px; bottom:14px; display:flex; flex-direction:column; gap:8px;
-            z-index:10; max-width:min(420px, calc(100vw - 28px)); }
-  .toast { padding:9px 12px; border-radius:6px; font-size:13px; cursor:pointer; white-space:pre-line;
-           background:var(--card); border:1px solid var(--border); box-shadow:0 4px 14px rgba(0,0,0,.25); }
+  #toasts { position:fixed; right:16px; bottom:16px; display:flex; flex-direction:column; gap:8px;
+            z-index:10; max-width:min(420px, calc(100vw - 32px)); }
+  .toast { padding:10px 13px; border-radius:10px; font-size:13px; cursor:pointer; white-space:pre-line;
+           background:var(--card); border:1px solid var(--border); box-shadow:var(--shadow-2);
+           animation:toast-in .18s ease; }
+  @keyframes toast-in { from { opacity:0; transform:translateY(6px); } to { opacity:1; transform:none; } }
   .toast.ok { border-color:var(--acc); color:var(--acc); }
   .toast.err { border-color:var(--err); color:var(--err); }
   /* Визуально скрытый aria-live: текст flash() анонсируется скринридером,
@@ -115,7 +179,7 @@
 </head>
 <body>
 <header>
-  <h1>NaivePanel</h1>
+  <h1><span class="logo" aria-hidden="true">N</span>NaivePanel</h1>
   <button class="ghost iconbtn" id="themeToggle" onclick="toggleTheme()" title="Переключить тему (светлая/тёмная)">☀</button>
   <span id="status" aria-live="polite">…</span>
 </header>
@@ -128,7 +192,7 @@
       <button class="ghost" onclick="svc('stop')">Стоп</button>
       <button class="ghost" onclick="svc('restart')">Рестарт</button>
     </div>
-    <h2 style="margin-top:18px">Пресеты</h2>
+    <h2 class="sect">Пресеты</h2>
     <input id="search" placeholder="Поиск пресета — /" aria-label="Поиск пресета"
            autocomplete="off" spellcheck="false">
     <ul class="presets" id="presets"></ul>
@@ -139,7 +203,7 @@
               title="Загрузить пресеты из ранее экспортированного JSON">Импорт</button>
       <input type="file" id="importFile" accept=".json,application/json" style="display:none" aria-hidden="true" tabindex="-1">
     </div>
-    <h2 style="margin-top:18px">Панель</h2>
+    <h2 class="sect">Панель</h2>
     <div class="actions" style="margin-top:10px">
       <button class="ghost wide" onclick="panelRestart()" title="Перезапуск веб-панели (после обновления файлов)">Перезапуск</button>
     </div>
@@ -204,7 +268,7 @@
     </form>
     <div id="msg" class="sr-only" aria-live="polite"></div>
 
-    <h2 style="margin-top:18px">Лог</h2>
+    <h2 class="sect">Лог</h2>
     <pre class="log" id="log">…</pre>
     <div class="actions"><button class="ghost" onclick="loadLog()">Обновить лог</button></div>
   </section>
@@ -310,12 +374,13 @@ function fmtUptime(s) {
 
 function renderStatus(st) {
   const ver = st.version ? ' · v'+escapeHtml(st.version) : '';
+  const dotOn = '<span class="dot on" aria-hidden="true"></span>', dotOff = '<span class="dot off" aria-hidden="true"></span>';
   $('status').innerHTML = (st.active
-    ? '<span class="on">● работает</span> · пресет: <b>'+escapeHtml(st.current||'?')+'</b>'
-    : '<span class="off">● остановлен</span>' + (st.current ? ' · пресет: '+escapeHtml(st.current) : ''))
+    ? '<span class="on">'+dotOn+' работает</span> · пресет: <b>'+escapeHtml(st.current||'?')+'</b>'
+    : '<span class="off">'+dotOff+' остановлен</span>' + (st.current ? ' · пресет: '+escapeHtml(st.current) : ''))
     + ver;
   const rows = [
-    ['состояние', st.active ? '<span class="on">● работает</span>' : '<span class="off">● остановлен</span>'],
+    ['состояние', st.active ? '<span class="on">'+dotOn+' работает</span>' : '<span class="off">'+dotOff+' остановлен</span>'],
     ['пресет', st.current ? escapeHtml(st.current) : '—'],
     ['uptime', st.active ? fmtUptime(st.uptime) : '—'],
     ['pid', st.active && st.pid != null ? String(st.pid) : '—'],
@@ -341,8 +406,14 @@ function renderPresets(presets) {
     (p.name + ' ' + (p.proxy || '')).toLowerCase().includes(q)) : presets;
   const ul = $('presets'); ul.innerHTML = '';
   if (!shown.length) {
-    ul.innerHTML = '<li style="color:var(--mut);border:none;padding:8px 10px">'
-      + (presets.length ? 'ничего не найдено' : 'нет пресетов') + '</li>';
+    const search = presets.length;
+    ul.innerHTML = '<li class="empty" aria-live="polite">'
+      + (search
+        ? '<span class="ico" aria-hidden="true">⌕</span>ничего не найдено'
+          + '<span class="hint">попробуйте другое слово или очистите поиск</span>'
+        : '<span class="ico" aria-hidden="true">✳</span>пресетов пока нет'
+          + '<span class="hint">нажмите «+ Новый», чтобы создать первый</span>')
+      + '</li>';
     return;
   }
   for (const p of shown) {
