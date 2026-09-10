@@ -114,6 +114,25 @@ echo "get raw: \$(curl -s http://127.0.0.1:8089/api/configs/home)"
 echo "csrf_no_header=\$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8089/api/service/stop) (expect 403)"
 echo "csrf_with_header=\$(curl -s \$H -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8089/api/service/stop) (expect 200)"
 
+echo "==> API hardening checks (list no-store + masking, scheme allowlist, server)"
+# список не должен светить пароль upstream и обязан быть no-store
+list_hdr=\$(curl -s -D - -o /tmp/list.json http://127.0.0.1:8089/api/configs)
+echo "\$list_hdr" | grep -qi '^Cache-Control: no-store' \
+  && echo "list no-store: OK" \
+  || { echo "FAIL: list missing no-store"; echo "\$list_hdr"; exit 1; }
+if grep -q 'p%40ss%3Aword\|p@ss:word' /tmp/list.json; then
+  echo "FAIL: list leaks upstream password"; cat /tmp/list.json; exit 1
+fi
+echo "list: \$(cat /tmp/list.json)"
+# схема proxy вне allowlist (https/http/quic) отклоняется на create
+bad=\$(curl -s -o /tmp/bad.json -w '%{http_code}' \$H -H 'Content-Type: application/json' \
+  -d '{"name":"bad","listen":"127.0.0.1:1080","upstream":"file://x@y"}' \
+  http://127.0.0.1:8089/api/configs)
+echo "scheme reject=\$bad (expect 400)"
+[ "\$bad" = "400" ] || { echo "FAIL: file:// scheme accepted"; cat /tmp/bad.json; exit 1; }
+# сервер: waitress, если установился, иначе Werkzeug — оба допустимы
+echo "server: \$(curl -sI http://127.0.0.1:8089/api/status | tr -d '\r' | sed -n 's/^[Ss]erver: //p')"
+
 echo "==> upgrade: rc.conf migration + --bind upsert + stale S99naiveproxy"
 mkdir -p /opt/etc/init.d
 # имитируем протухший S99naiveproxy (как после апгрейда v0.4.0 с pre-0.2.0):

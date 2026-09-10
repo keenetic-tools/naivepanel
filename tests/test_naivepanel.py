@@ -7,8 +7,10 @@ import base64
 import importlib
 import json
 import os
+import re
 import sys
 import time
+import types
 from pathlib import Path
 
 import pytest
@@ -173,6 +175,20 @@ def test_get_splits_fields_and_omits_password(client, app):
     assert stored["proxy"] == "https://user:p%40ss%3Aword@proxy.example.com"
 
 
+def test_list_masks_credentials_and_is_no_store(client):
+    r, _ = _create(client)  # пароль p@ss:word (percent-encoded на диске)
+    assert r.status_code == 201
+    r = client.get("/api/configs")
+    assert r.status_code == 200
+    body = r.get_data(as_text=True)
+    assert "p%40ss%3Aword" not in body   # ни percent-encoded, ни raw пароль
+    assert "p@ss:word" not in body
+    assert r.headers.get("Cache-Control") == "no-store"
+    item = r.get_json()[0]
+    assert item["proxy"] == "https://user:***@proxy.example.com"
+    assert item["username"] == "user"
+
+
 def test_put_reuses_password_when_omitted(client, app):
     _create(client)
     r = client.put("/api/configs/home", headers=CSRF, json={
@@ -222,13 +238,48 @@ def test_auth_accepts_correct_password(client, env):
     assert r.status_code == 200
 
 
-def test_wrong_password_is_slowed_and_rejected(client, env):
+def test_wrong_password_is_rejected(client, env):
     bcrypt = pytest.importorskip("bcrypt")
     h = bcrypt.hashpw(b"s3cret", bcrypt.gensalt()).decode()
     (env / "admin.pass").write_text(f"admin:{h}\n")
     token = base64.b64encode(b"admin:wrong").decode()
     r = client.get("/api/status", headers={"Authorization": f"Basic {token}"})
     assert r.status_code == 401
+
+
+def test_auth_throttles_after_repeated_failures(client, env, app):
+    bcrypt = pytest.importorskip("bcrypt")
+    h = bcrypt.hashpw(b"s3cret", bcrypt.gensalt()).decode()
+    (env / "admin.pass").write_text(f"admin:{h}\n")
+    bad = base64.b64encode(b"admin:wrong").decode()
+    for _ in range(app._AUTH_FAIL_LIMIT):
+        assert client.get("/api/status", headers={"Authorization": f"Basic {bad}"}).status_code == 401
+    assert client.get("/api/status", headers={"Authorization": f"Basic {bad}"}).status_code == 429
+
+
+def test_auth_missing_header_does_not_throttle(client, env, app):
+    # анонимные пробы (без Authorization) не считаются: за reverse-proxy
+    # с общим remote_addr иначе блокировались бы все админы
+    (env / "admin.pass").write_text("admin:$2b$12$shortbrokenhash\n")
+    for _ in range(app._AUTH_FAIL_LIMIT + 3):
+        assert client.get("/api/status").status_code == 401
+
+
+def test_auth_success_clears_failure_counter(client, env, app):
+    bcrypt = pytest.importorskip("bcrypt")
+    h = bcrypt.hashpw(b"s3cret", bcrypt.gensalt()).decode()
+    (env / "admin.pass").write_text(f"admin:{h}\n")
+    bad = base64.b64encode(b"admin:wrong").decode()
+    good = base64.b64encode(b"admin:s3cret").decode()
+    # прогреваем кэш: следующий успех пойдёт по fast-path, минуя bcrypt
+    assert client.get("/api/status", headers={"Authorization": f"Basic {good}"}).status_code == 200
+    for _ in range(app._AUTH_FAIL_LIMIT - 1):
+        client.get("/api/status", headers={"Authorization": f"Basic {bad}"})
+    # успех по кэшу тоже должен сбросить счётчик неудач
+    assert client.get("/api/status", headers={"Authorization": f"Basic {good}"}).status_code == 200
+    # счётчик сброшен: полный лимит ошибок снова даёт 401, а не 429
+    for _ in range(app._AUTH_FAIL_LIMIT):
+        assert client.get("/api/status", headers={"Authorization": f"Basic {bad}"}).status_code == 401
 
 
 # --- вспомогательные функции ------------------------------------------------
@@ -442,15 +493,70 @@ def test_security_headers_on_pages_and_api(client):
         assert r.headers.get("Referrer-Policy") == "no-referrer"
 
 
-def test_csp_blocks_external_scripts_but_allows_inline(client):
-    # UI — один файл с inline-скриптами без сборки: CSP обязан их пропускать
+def test_csp_uses_nonce_and_drops_unsafe_inline_script(client):
+    r = client.get("/")
+    csp = r.headers["Content-Security-Policy"]
+    assert "script-src 'nonce-" in csp
+    assert "script-src 'unsafe-inline'" not in csp
+    assert "style-src 'unsafe-inline'" in csp  # inline-стили и style="" остаются
+    nonce = csp.split("script-src 'nonce-", 1)[1].split("'", 1)[0]
+    assert f'nonce="{nonce}"' in r.get_data(as_text=True)
+
+
+def test_ui_has_no_inline_event_handlers(app):
+    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    assert not re.search(r"\son[a-z]+\s*=", html), "inline-обработчики блокирует nonce-CSP"
+
+
+def test_csp_has_no_external_origins(client):
     csp = client.get("/").headers["Content-Security-Policy"]
-    assert "script-src 'unsafe-inline'" in csp
-    assert "style-src 'unsafe-inline'" in csp
-    # никаких внешних origin'ов: у всех директив только 'self'/'none'/кёвоты
     for src in csp.split(";"):
         if "src" in src or "uri" in src:
             assert "://" not in src
+
+
+def test_export_and_logs_are_no_store(client):
+    _create(client)
+    assert client.get("/api/configs/export").headers.get("Cache-Control") == "no-store"
+    assert client.get("/api/logs").headers.get("Cache-Control") == "no-store"
+
+
+def test_ui_uses_dialog_not_native_confirm(app):
+    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    assert "<dialog" in html
+    assert "confirm(" not in html  # нативные confirm() убраны в пользу <dialog>
+
+
+def test_ui_log_viewer_has_controls(app):
+    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    assert 'data-action="logFilter"' in html
+    assert 'data-action="logDownload"' in html
+    assert 'data-action="logCopy"' in html
+
+
+def test_ui_has_skeleton_and_live_validation(app):
+    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    assert "skel" in html
+    assert 'id="f_upstream"' in html and 'id="upHint"' in html
+
+
+def test_ui_upstream_hint_accepts_credential_urls(app):
+    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    m = re.search(r"const UP_OK = /(.+)/;", html)
+    assert m, "UP_OK не найден в index.html"
+    # JS-экранирование \/ совместимо с Python re после раскрытия
+    up_ok = re.compile(m.group(1).replace(r"\/", "/"))
+    for url in ("https://user:pass@host:443/path?q=1#frag",
+                "https://proxy.example.com",
+                "quic://host:443",
+                "proxy.example.com"):
+        assert up_ok.match(url), f"должен приниматься: {url}"
+    assert not up_ok.match("file://x"), "чужая схема не должна приниматься"
+
+
+def test_ui_has_single_light_palette_definition(app):
+    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    assert html.count("--bg:#f4f5f7") == 1
 
 
 # --- duplicate ------------------------------------------------------------------
@@ -499,10 +605,29 @@ def test_activate_rejects_proxy_without_scheme(client, app):
     assert "proxy" in r.get_json()["error"]
 
 
+def test_validate_cfg_rejects_non_proxy_schemes(client, app):
+    app._ensure_dirs()
+    (app.CONF_D / "fileproto.json").write_text(
+        '{"listen": "socks://127.0.0.1:1080", "proxy": "file:///etc/passwd"}')
+    r = client.post("/api/configs/fileproto/activate", headers=CSRF)
+    assert r.status_code == 400
+    assert "proxy" in r.get_json()["error"]
+
+
+def test_create_rejects_non_proxy_scheme(client, app):
+    r, _ = _create(client, upstream="file://x@y", username="", password="")
+    assert r.status_code == 400
+    assert "proxy" in r.get_json()["error"]
+    assert not (app.CONF_D / "home.json").exists()  # ничего не сохранили
+
+
 def test_validate_cfg_ranges_and_types(app):
     good = {"listen": "socks://127.0.0.1:1080", "proxy": "https://h"}
     app._validate_cfg(good, "ok")  # не бросает
     app._validate_cfg({**good, "insecure-concurrency": 4}, "ok")
+    # схема проверяется без учёта регистра и с обрезкой пробелов
+    app._validate_cfg({**good, "proxy": "HTTPS://h"}, "ok")
+    app._validate_cfg({**good, "proxy": "  https://h  "}, "ok")
     for bad in [{"insecure-concurrency": 5}, {"insecure-concurrency": True},
                 {"log": 42}, {"extra-headers": []}]:
         with pytest.raises(Exception):
@@ -608,3 +733,26 @@ def test_probe_measures_real_tcp(client):
 
 def test_probe_requires_upstream(client):
     assert client.post("/api/probe", headers=CSRF, json={}).status_code == 400
+
+
+def test_serve_prefers_waitress(app, monkeypatch):
+    calls = {}
+    fake = types.SimpleNamespace(serve=lambda application, **kw: calls.update(kw))
+    monkeypatch.setitem(sys.modules, "waitress", fake)
+    app._serve(app.app, "127.0.0.1", 8089)
+    assert calls["host"] == "127.0.0.1" and calls["port"] == 8089
+    assert calls["threads"] == app.WAITRESS_THREADS
+
+
+def test_serve_falls_back_to_werkzeug(app, monkeypatch):
+    monkeypatch.setitem(sys.modules, "waitress", None)  # import waitress → ImportError
+    ran = {}
+    monkeypatch.setattr(app.app, "run", lambda **kw: ran.update(kw))
+    app._serve(app.app, "127.0.0.1", 8089)
+    assert ran.get("threaded") is True
+
+
+def test_invalid_threads_env_falls_back_to_default(env, monkeypatch):
+    monkeypatch.setenv("NAIVEPANEL_THREADS", "abc")
+    m = _reload()
+    assert m.WAITRESS_THREADS == 4

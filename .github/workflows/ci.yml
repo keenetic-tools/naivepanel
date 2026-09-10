@@ -16,3 +16,10 @@ jobs:
         run: sh -n S99naiveproxy && sh -n S99naivepanel && sh -n install.sh
       - name: Python tests
         run: pip install flask bcrypt pytest && pytest -q
+      - name: Lint (ruff)
+        run: pip install ruff && ruff check naivepanel.py tests/
+      - name: Security (bandit)
+        run: pip install bandit && bandit -q -ll -r naivepanel.py
+      - name: Dependency audit (advisory)
+        continue-on-error: true
+        run: pip install pip-audit && pip-audit

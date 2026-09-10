@@ -12,6 +12,8 @@ HTML page — no CDN, no build step. MIT-licensed.
 ## Что это
 
 - **Flask-приложение** (одна HTML-страница, без CDN / без build step).
+- Сервер — **waitress** (прод, ограниченное число потоков); если не установлен —
+  фолбэк на dev-сервер **Werkzeug** (`threaded=True`) с предупреждением в логе.
 - Хранит **N пресетов** конфигурации клиента в `/opt/etc/naive/proxy/conf.d/<name>.json`.
 - По activate копирует пресет в `/opt/etc/naive/proxy/config.json` (`chmod 0600`)
   и перезапускает `/opt/etc/init.d/S99naiveproxy`.
@@ -28,6 +30,15 @@ HTML page — no CDN, no build step. MIT-licensed.
 - Светлая/тёмная тема: автоматически по системной, клик по ☀/☾ фиксирует выбор.
 - Toast-уведомления, подсветка ERROR/WARNING в логе, горячие клавиши
   (Ctrl+S — сохранить, Esc — закрыть редактор).
+- Доступный диалог подтверждения на `<dialog>` (фокус-ловушка браузера,
+  Esc) вместо нативных `confirm()`.
+- Просмотр лога: фильтр «только ошибки», скачивание и копирование в буфер
+  (fallback через `execCommand` для прямого http-LAN, где Clipboard API
+  недоступен вне secure context).
+- Скелетон-заглушки при загрузке списка и live-подсветка некорректного
+  upstream в форме редактора.
+- Анти-перебор auth: >5 неудачных попыток ввода пароля с одного IP за 60с
+  → 429 (анонимные запросы без `Authorization` не считаются).
 - Визуальный полиш (v0.5.1): elevation-тени карточек, sticky-шапка
   с `backdrop-filter` (и фолбэком), пульсирующий индикатор «работает»,
   empty-states для пустого списка/поиска, `tabular-nums` для uptime/PID
@@ -40,7 +51,7 @@ HTML page — no CDN, no build step. MIT-licensed.
 | Метод | Путь | Что делает |
 |-------|------|------------|
 | `GET` | `/api/status` | `{active, current, init_present, init_script, pid, uptime, version}` |
-| `GET` | `/api/configs` | список пресетов `{name, active, listen, proxy, username}` |
+| `GET` | `/api/configs` | список пресетов `{name, active, listen, proxy, username}`; `proxy` замаскирован (`https://user:***@host`), ответ `no-store` |
 | `GET` | `/api/configs/<name>` | полный JSON-конфиг пресета |
 | `POST` | `/api/configs` | создать пресет |
 | `PUT` | `/api/configs/<name>` | обновить (если активный — propagate в `config.json` **и restart**; ответ содержит `restart:{rc,...}`) |
@@ -139,6 +150,7 @@ NAIVEPANEL_HOSTS="192.168.1.1:8089,router.local:8089"
 #NAIVEPROXY_INIT="/opt/etc/init.d/S99naiveproxy"
 #NAIVEPROXY_LOG="/opt/var/log/naiveproxy.log"
 #NAIVEPROXY_PID="/opt/var/run/naiveproxy.pid"
+#NAIVEPANEL_THREADS="4"
 ```
 
 Приоритет: **env > panel.conf > встроенный дефолт** — переменные окружения
@@ -327,16 +339,29 @@ NaivePanel собирает минимальный JSON, совместимый 
 - **Схема конфига валидируется** перед activate/PUT/импортом: непустые
   `listen`/`proxy`, URI со схемой, диапазон `insecure-concurrency` 1..4 — битый
   (например, руками отредактированный) пресет не перезапишет рабочий `config.json`.
+  Схема `proxy` ограничена `https://` / `http://` / `quic://` — `file://` и
+  прочие схемы отклоняются на activate/PUT/импорте.
 - **Security-заголовки** на каждом ответе: `Content-Security-Policy`
-  (`default-src 'none'`, внешние скрипты/стили запрещены, `connect-src 'self'`
-  против эксфильтрации), `X-Content-Type-Options: nosniff`,
-  `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`.
+  (`default-src 'none'`, скрипты только по одноразовому nonce
+  `script-src 'nonce-…'` — инъекция `<script>` без nonce не выполнится,
+  внешние origin'ы запрещены, `connect-src 'self'` против эксфильтрации;
+  `style-src 'unsafe-inline'` — inline-стили и `style=""` шаблона),
+  `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`,
+  `Referrer-Policy: no-referrer`.
 - Bind на `0.0.0.0` — warning в лог: на роутере это ещё и WAN/VPN/guest-сегменты.
 - 401 (auth failed) и 403 (host rejected) пишутся в лог панели.
 - Мутирующие запросы (POST/PUT/DELETE) требуют заголовок `X-Requested-With`
   (ставит UI) — защита от CSRF: Basic-креды браузер прикладывает к кросс-сайтовым
-  запросам автоматически, поэтому одной auth тут недостаточно. Неудачная auth
-  замедляется на 0.5с (анти-перебор).
+  запросам автоматически, поэтому одной auth тут недостаточно.
+- Анти-перебор: >5 неудачных auth **с предъявленными кредами** с одного IP за
+  60с → 429 (без блокирующего сна, чтобы флуд не занимал рабочие потоки).
+  Анонимные пробы без заголовка `Authorization` не считаются. За reverse-proxy
+  все клиенты делят один `remote_addr`, поэтому счётчик общий: ошибки ввода
+  пароля одним клиентом дают 429 всем.
+- `/api/configs/export` и `/api/logs` отдаются с `Cache-Control: no-store` —
+  ответы с секретами не оседают в кеше браузера и промежуточных прокси;
+  список `GET /api/configs` тоже `no-store` и маскирует пароли
+  (`https://user:***@host`).
 - Пароли upstream через API не возвращаются: `GET /api/configs/<name>` отдаёт
   upstream/username разобранными, но без пароля; пустое поле пароля в форме
   при сохранении означает «оставить прежний». Креденшалы в proxy-URI
@@ -373,6 +398,7 @@ naiveproxy-panel/
 ├── S99naiveproxy            # init: бинарник naive
 ├── S99naivepanel            # init: Flask-приложение
 ├── tests/test_naivepanel.py # pytest: API-семантика без сети
+├── ruff.toml                # конфиг линтера (CI)
 ├── docker-e2e.sh            # E2E: install.sh в Docker с настоящим Entware
 ├── SHA256SUMS               # контрольные суммы файлов релиза
 └── README.md                # этот файл
@@ -380,11 +406,31 @@ naiveproxy-panel/
 
 ## Разработка
 
-Перед PR-ом:
+Перед PR-ом (то же, что гоняет CI):
 
 ```bash
 ./.venv/bin/python -c "import ast; ast.parse(open('naivepanel.py').read())"  # syntax
 sh -n S99naiveproxy && sh -n S99naivepanel                                    # shell syntax
+./.venv/bin/python -m pytest -q                                              # API-тесты, без сети
+./.venv/bin/ruff check naivepanel.py tests/                                  # линт
+./.venv/bin/bandit -q -ll -r naivepanel.py                                   # security-скан
+```
+
+E2E на настоящем Entware (нужен Docker):
+
+```bash
+./docker-e2e.sh              # установка + API-проверки (--yes)
+./docker-e2e.sh --with-auth  # интерактивно: Basic auth
+```
+
+Скрипт поднимает локальный HTTPS-сервер, имитирующий
+`raw.githubusercontent.com`, и прогоняет `install.sh` в контейнере с Entware:
+сверка контрольных сумм, запуск панели, CSRF, write-only пароли, маскировка и
+`no-store` списка, отклонение схем `proxy`, апгрейд-миграции. Перед запуском
+`SHA256SUMS` должен соответствовать рабочей копии — иначе `sha256sum -c` упадёт:
+
+```bash
+shasum -a 256 S99naivepanel S99naiveproxy naivepanel.py templates/index.html > SHA256SUMS
 ```
 
 Smoke-тест после каждого изменения в `naivepanel.py`:

@@ -7,9 +7,8 @@
 <meta name="theme-color" media="(prefers-color-scheme: light)" content="#f4f5f7">
 <title>NaivePanel</title>
 <style>
-  /* Тёмная тема — базовая (как было), светлая — ниже в двух местах:
-     :root[data-theme="light"] (ручной выбор) и media-запрос (системная).
-     Оба блока должны оставаться синхронными. */
+  /* Тёмная тема — базовая, светлая — единственный набор ниже:
+     data-theme всегда выставляется bootstrap-скриптом (localStorage или система). */
   :root { color-scheme:dark;
     --bg:#0f1115; --fg:#e6e6e6; --mut:#9aa; --acc:#5dd2a4; --err:#ff7070; --warn:#e0b657;
     --btn-fg:#0f1115; --card:#181b22; --border:#2a2f38; --border-sel:#57606e;
@@ -33,19 +32,6 @@
     --dot-halo:rgba(14,138,95,.15);
     --shadow-1:0 1px 2px rgba(24,33,40,.06);
     --shadow-2:0 2px 6px rgba(24,33,40,.07), 0 10px 28px rgba(24,33,40,.10); }
-  @media (prefers-color-scheme: light) {
-    :root:not([data-theme="dark"]) { color-scheme:light;
-      --bg:#f4f5f7; --fg:#1c2128; --mut:#69707a; --acc:#0e8a5f; --err:#c43e3e; --warn:#8a6a1d;
-      --btn-fg:#ffffff; --card:#ffffff; --border:#d6dae0; --border-sel:#9aa3ad;
-      --sel-bg:rgba(0,0,0,.04); --hov:rgba(0,0,0,.06);
-      --acc-tint:rgba(14,138,95,.08); --badge-bg:rgba(14,138,95,.14); --mut-tint:rgba(105,112,122,.14);
-      --input-bg:#ffffff; --log-bg:#fbfcfd; --log-fg:#24292f;
-      --bg-glow:rgba(14,138,95,.05); --bg-glow2:rgba(58,106,255,.05);
-      --hdr-bg:#ffffff; --hdr-blur:rgba(255,255,255,.72);
-      --dot-halo:rgba(14,138,95,.15);
-      --shadow-1:0 1px 2px rgba(24,33,40,.06);
-      --shadow-2:0 2px 6px rgba(24,33,40,.07), 0 10px 28px rgba(24,33,40,.10); }
-  }
   * { box-sizing:border-box; }
   body { margin:0; font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;
          background:var(--bg); color:var(--fg); }
@@ -125,6 +111,14 @@
            border:1px dashed var(--border); border-radius:10px; }
   .empty .ico { display:block; font-size:22px; opacity:.55; margin-bottom:6px; }
   .empty .hint { display:block; font-size:12px; opacity:.75; margin-top:4px; }
+  .skel { list-style:none; height:46px; border-radius:10px; margin-bottom:8px;
+          border:1px solid var(--border); background:var(--sel-bg); }
+  @media (prefers-reduced-motion: no-preference) {
+    .skel { animation:skel 1.4s ease-in-out infinite; }
+    @keyframes skel { 0%,100% { opacity:.55; } 50% { opacity:1; } }
+  }
+  .hint-bad { color:var(--err); font-size:11px; margin-top:4px; display:none; }
+  .hint-bad.show { display:block; }
   button { background:var(--acc); color:var(--btn-fg); border:none; border-radius:8px; padding:7px 13px;
            cursor:pointer; font-weight:600; box-shadow:var(--shadow-1);
            transition:filter .12s ease, transform .08s ease, box-shadow .14s ease; }
@@ -164,23 +158,33 @@
   @keyframes toast-in { from { opacity:0; transform:translateY(6px); } to { opacity:1; transform:none; } }
   .toast.ok { border-color:var(--acc); color:var(--acc); }
   .toast.err { border-color:var(--err); color:var(--err); }
+  dialog { border:1px solid var(--border); border-radius:12px; background:var(--card);
+           color:var(--fg); padding:18px; max-width:min(420px, calc(100vw - 32px));
+           box-shadow:var(--shadow-2); }
+  dialog::backdrop { background:rgba(0,0,0,.45); }
+  #confirmMsg { margin:0; white-space:pre-line; }
+  .dlg-actions { display:flex; gap:8px; justify-content:flex-end; margin-top:16px; }
   /* Визуально скрытый aria-live: текст flash() анонсируется скринридером,
      а пользователь видит toast (двойной вывод был бы шумным). */
   .sr-only { position:absolute; width:1px; height:1px; margin:-1px; overflow:hidden;
              clip:rect(0 0 0 0); white-space:nowrap; }
 </style>
-<script>
+<script nonce="{{ csp_nonce }}">
   // Тема применяется до первой отрисовки — без вспышки неправильных цветов.
   try {
     const t = localStorage.getItem('naivepanel-theme');
-    if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t;
-  } catch (e) { /* private mode и т.п. — просто останемся на системной теме */ }
+    document.documentElement.dataset.theme = (t === 'light' || t === 'dark')
+      ? t
+      : (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+  } catch (e) {
+    document.documentElement.dataset.theme = 'dark';
+  }
 </script>
 </head>
 <body>
 <header>
   <h1><span class="logo" aria-hidden="true">N</span>NaivePanel</h1>
-  <button class="ghost iconbtn" id="themeToggle" onclick="toggleTheme()" title="Переключить тему (светлая/тёмная)">☀</button>
+  <button class="ghost iconbtn" id="themeToggle" data-action="theme" title="Переключить тему (светлая/тёмная)">☀</button>
   <span id="status" aria-live="polite">…</span>
 </header>
 <main>
@@ -188,30 +192,32 @@
     <h2>Сервис</h2>
     <div class="svcinfo" id="svcinfo"></div>
     <div class="actions">
-      <button onclick="svc('start')">Запуск</button>
-      <button class="ghost" onclick="svc('stop')">Стоп</button>
-      <button class="ghost" onclick="svc('restart')">Рестарт</button>
+      <button data-action="svc" data-arg="start">Запуск</button>
+      <button class="ghost" data-action="svc" data-arg="stop">Стоп</button>
+      <button class="ghost" data-action="svc" data-arg="restart">Рестарт</button>
     </div>
     <h2 class="sect">Пресеты</h2>
     <input id="search" placeholder="Поиск пресета — /" aria-label="Поиск пресета"
            autocomplete="off" spellcheck="false">
-    <ul class="presets" id="presets"></ul>
+    <ul class="presets" id="presets" aria-busy="true">
+      <li class="skel"></li><li class="skel"></li><li class="skel"></li>
+    </ul>
     <div class="actions" style="margin-top:10px">
-      <button class="ghost" onclick="newPreset()">+ Новый</button>
+      <button class="ghost" data-action="newPreset">+ Новый</button>
       <a class="btn" href="/api/configs/export" title="Скачать все пресеты одним JSON. ВНИМАНИЕ: файл содержит пароли upstream!">Экспорт</a>
-      <button class="ghost" onclick="document.getElementById('importFile').click()"
+      <button class="ghost" data-action="import"
               title="Загрузить пресеты из ранее экспортированного JSON">Импорт</button>
       <input type="file" id="importFile" accept=".json,application/json" style="display:none" aria-hidden="true" tabindex="-1">
     </div>
     <h2 class="sect">Панель</h2>
     <div class="actions" style="margin-top:10px">
-      <button class="ghost wide" onclick="panelRestart()" title="Перезапуск веб-панели (после обновления файлов)">Перезапуск</button>
+      <button class="ghost wide" data-action="panelRestart" title="Перезапуск веб-панели (после обновления файлов)">Перезапуск</button>
     </div>
   </section>
 
   <section class="card">
     <h2 id="editorTitle">Редактор</h2>
-    <form id="editor" style="display:none" onsubmit="save(event)">
+    <form id="editor" style="display:none">
       <label for="f_name">Имя пресета (a-z 0-9 _ - .)</label>
       <input id="f_name" pattern="[a-zA-Z0-9_\-.]{1,64}" autocomplete="off" spellcheck="false">
 
@@ -228,9 +234,10 @@
       <label for="f_upstream">Upstream URL (https://host или полный proxy URL)</label>
       <div style="display:flex;gap:8px">
         <input id="f_upstream" placeholder="https://proxy.example.com" autocomplete="off" spellcheck="false" style="flex:1">
-        <button type="button" class="ghost" id="btnProbe" onclick="probeUpstream()"
+        <button type="button" class="ghost" id="btnProbe" data-action="probe"
                 title="TCP-доступность upstream с роутера (без TLS и кредов, таймаут 3с)">пинг</button>
       </div>
+      <div class="hint-bad" id="upHint">Похоже на неверный адрес: ожидается host или https://host</div>
 
       <label for="f_username">Username (basic_auth)</label>
       <input id="f_username" autocomplete="off" spellcheck="false">
@@ -238,7 +245,7 @@
       <label for="f_password">Password (пусто = оставить прежний)</label>
       <div style="display:flex;gap:8px">
         <input id="f_password" type="password" autocomplete="new-password" placeholder="••••••••" style="flex:1">
-        <button type="button" class="ghost" id="btnPw" onclick="togglePw()">показать</button>
+        <button type="button" class="ghost" id="btnPw" data-action="togglePw">показать</button>
       </div>
       <div style="font-size:11px;color:var(--mut);margin-top:4px">
         Пароль не возвращается из API: пустое поле при сохранении переиспользует
@@ -262,20 +269,32 @@
 
       <div class="row">
         <button type="submit" id="btnSave" title="Ctrl+S">Сохранить</button>
-        <button type="button" class="ghost" onclick="activate()">Сделать активным</button>
-        <button type="button" class="danger" onclick="del()">Удалить</button>
+        <button type="button" class="ghost" data-action="activate">Сделать активным</button>
+        <button type="button" class="danger" data-action="del">Удалить</button>
       </div>
     </form>
     <div id="msg" class="sr-only" aria-live="polite"></div>
 
     <h2 class="sect">Лог</h2>
     <pre class="log" id="log">…</pre>
-    <div class="actions"><button class="ghost" onclick="loadLog()">Обновить лог</button></div>
+    <div class="actions">
+      <button class="ghost" data-action="loadLog">Обновить</button>
+      <button class="ghost" id="btnLogFilter" data-action="logFilter" aria-pressed="false">Только ошибки</button>
+      <button class="ghost" data-action="logDownload">Скачать</button>
+      <button class="ghost" data-action="logCopy">Копировать</button>
+    </div>
   </section>
 </main>
+<dialog id="confirmDlg" aria-labelledby="confirmMsg">
+  <p id="confirmMsg"></p>
+  <form method="dialog" class="dlg-actions">
+    <button class="ghost" value="cancel">Отмена</button>
+    <button id="confirmOk" value="ok">OK</button>
+  </form>
+</dialog>
 <div id="toasts"></div>
 
-<script>
+<script nonce="{{ csp_nonce }}">
 const $ = (id) => document.getElementById(id);
 let current = null; // выбранный пресет (имя) или null
 let dirty = false;  // есть несохранённые правки в редакторе
@@ -330,8 +349,8 @@ function flash(msg, ok, ms) {
   setTimeout(() => t.remove(), ms || (ok ? 5000 : 9000));
 }
 
-// --- Тема: без data-theme — по системной (prefers-color-scheme), клик
-// фиксирует выбор в localStorage. -------------------------------------
+// --- Тема: data-theme выставлен bootstrap-скриптом (localStorage или
+// системная), клик фиксирует выбор в localStorage. ---------------------
 const THEME_KEY = 'naivepanel-theme';
 function effTheme() {
   const t = document.documentElement.dataset.theme;
@@ -346,12 +365,37 @@ function toggleTheme() {
 }
 $('themeToggle').textContent = effTheme() === 'light' ? '☾' : '☀';
 
+// Следим за системной темой, пока пользователь не зафиксировал выбор.
+matchMedia('(prefers-color-scheme: light)').addEventListener('change', (e) => {
+  let stored = null;
+  try { stored = localStorage.getItem(THEME_KEY); } catch (err) { /* private mode */ }
+  if (!stored) {
+    document.documentElement.dataset.theme = e.matches ? 'light' : 'dark';
+    $('themeToggle').textContent = e.matches ? '☾' : '☀';
+  }
+});
+
 function setHash(name) {
   history.replaceState(null, '', name ? '#preset='+encodeURIComponent(name) : location.pathname);
 }
 
-function maybeDiscard() {
-  return !dirty || confirm('Есть несохранённые изменения. Отбросить?');
+function askConfirm(message, opts = {}) {
+  const dlg = $('confirmDlg');
+  if (dlg.open) return Promise.resolve(false); // повторный Escape — не переоткрываем
+  $('confirmMsg').textContent = message;
+  const ok = $('confirmOk');
+  ok.textContent = opts.ok || 'OK';
+  ok.className = opts.danger ? 'danger' : '';
+  return new Promise(resolve => {
+    dlg.addEventListener('close', () => resolve(dlg.returnValue === 'ok'), {once:true});
+    dlg.returnValue = '';
+    dlg.showModal();
+  });
+}
+
+async function maybeDiscard() {
+  return !dirty || await askConfirm('Есть несохранённые изменения. Отбросить?',
+                                     {ok:'Отбросить', danger:true});
 }
 
 async function refreshAll() {
@@ -404,7 +448,7 @@ function renderPresets(presets) {
   const q = ($('search').value || '').trim().toLowerCase();
   const shown = q ? presets.filter(p =>
     (p.name + ' ' + (p.proxy || '')).toLowerCase().includes(q)) : presets;
-  const ul = $('presets'); ul.innerHTML = '';
+  const ul = $('presets'); ul.setAttribute('aria-busy','false'); ul.innerHTML = '';
   if (!shown.length) {
     const search = presets.length;
     ul.innerHTML = '<li class="empty" aria-live="polite">'
@@ -420,15 +464,15 @@ function renderPresets(presets) {
     const li = document.createElement('li');
     li.className = (p.active ? 'active' : '') + (p.name === current ? ' selected' : '');
     li.innerHTML = '<button class="sel" '+(p.name === current ? 'aria-current="true" ' : '')
-      + 'onclick="selectPreset(decodeURIComponent(\''+encodeURIComponent(p.name)+'\'))">'
+      + 'data-action="select" data-arg="'+escapeHtml(p.name)+'">'
       + '<span class="name">'+escapeHtml(p.name)+'</span>'
       + (p.active ? '<span class="badge">активен</span>' : '')
       + (p.listen_count > 1 ? '<span class="badge listen" title="слушает '+p.listen_count+' адреса(ов)">×'+p.listen_count+'</span>' : '')
       + '</button>'
       + '<span class="acts">'
-      + (!p.active ? '<button class="act" aria-label="Активировать '+escapeHtml(p.name)+'" title="Активировать" onclick="event.stopPropagation();activate(decodeURIComponent(\''+encodeURIComponent(p.name)+'\'))">→</button>' : '')
-      + '<button class="act" aria-label="Дублировать '+escapeHtml(p.name)+'" title="Дублировать (пароль переносится)" onclick="event.stopPropagation();dupPreset(decodeURIComponent(\''+encodeURIComponent(p.name)+'\'))">⧉</button>'
-      + '<button class="del" aria-label="Удалить '+escapeHtml(p.name)+'" title="Удалить" onclick="event.stopPropagation();del(decodeURIComponent(\''+encodeURIComponent(p.name)+'\'))">✕</button>'
+      + (!p.active ? '<button class="act" aria-label="Активировать '+escapeHtml(p.name)+'" title="Активировать" data-action="activate" data-arg="'+escapeHtml(p.name)+'">→</button>' : '')
+      + '<button class="act" aria-label="Дублировать '+escapeHtml(p.name)+'" title="Дублировать (пароль переносится)" data-action="duplicate" data-arg="'+escapeHtml(p.name)+'">⧉</button>'
+      + '<button class="del" aria-label="Удалить '+escapeHtml(p.name)+'" title="Удалить" data-action="del" data-arg="'+escapeHtml(p.name)+'">✕</button>'
       + '</span>'
       + '<span class="proxy">'+escapeHtml(p.proxy.replace(/:\/\/[^@]+@/,'://***@'))+'</span>';
     ul.appendChild(li);
@@ -438,7 +482,7 @@ function renderPresets(presets) {
 function escapeHtml(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 
 async function selectPreset(name) {
-  if (name !== current && !maybeDiscard()) return;
+  if (name !== current && !(await maybeDiscard())) return;
   current = name;
   try {
     const cfg = await jget('/api/configs/'+encodeURIComponent(name));
@@ -464,8 +508,8 @@ async function selectPreset(name) {
   } catch (e) { flash(e.message, false); }
 }
 
-function newPreset() {
-  if (!maybeDiscard()) return;
+async function newPreset() {
+  if (!(await maybeDiscard())) return;
   current = null;
   $('editorTitle').textContent = 'Редактор — новый';
   $('editor').style.display = 'block';
@@ -478,8 +522,8 @@ function newPreset() {
   $('f_name').focus();
 }
 
-function closeEditor() {
-  if (!maybeDiscard()) return;
+async function closeEditor() {
+  if (!(await maybeDiscard())) return;
   current = null;
   $('editor').style.display = 'none';
   setHash(null);
@@ -564,7 +608,7 @@ function formPayload() {
 async function activate(name) {
   const n = name || current;
   if (!n) return;
-  if (dirty && !confirm('В форме есть несохранённые правки — активируется последняя СОХРАНЁННАЯ версия пресета. Продолжить?')) return;
+  if (dirty && !(await askConfirm('В форме есть несохранённые правки — активируется последняя СОХРАНЁННАЯ версия пресета. Продолжить?', {ok:'Активировать'}))) return;
   try {
     const d = await jpost('/api/configs/'+encodeURIComponent(n)+'/activate', null);
     flash(applyMsg('Активирован: '+n, d.restart), !restartFailed(d.restart));
@@ -575,7 +619,7 @@ async function activate(name) {
 async function del(name) {
   const n = name || current;
   if (!n) return;
-  if (!confirm('Удалить пресет '+n+'?')) return;
+  if (!(await askConfirm('Удалить пресет ' + n + '?', {ok:'Удалить', danger:true}))) return;
   try {
     await jdel('/api/configs/'+encodeURIComponent(n));
     if (current === n) { current = null; dirty = false; $('editor').style.display='none'; setHash(null); }
@@ -591,7 +635,7 @@ async function svc(action) {
 }
 
 async function panelRestart() {
-  if (!confirm('Перезапустить саму панель? Страница перезагрузится, когда сервер поднимется.')) return;
+  if (!(await askConfirm('Перезапустить саму панель? Страница перезагрузится, когда сервер поднимется.', {ok:'Перезапустить'}))) return;
   try {
     const r = await fetch('/api/panel/restart', {method:'POST', headers:CSRF});
     if (!(r.ok || r.status === 202)) { flash(await r.text(), false); return; }
@@ -616,15 +660,58 @@ async function panelRestart() {
 
 let lastLog = null;   // кэш — не трогаем DOM, если контент не изменился
 let logStuck = true;  // «прилип» к низу лога — автоскролл только когда true
+let logErrOnly = false; // показывать только ошибки/предупреждения
 
 // naive/Chromium пишет уровни в формате [pid:ERROR:…]; подсветим их.
 const LOG_ERR = /\b(ERROR|FATAL|PANIC)\b/, LOG_WARN = /\b(WARNING|WARN)\b/;
 function renderLog(content) {
   // сервер уже замаскировал креды; здесь — экранирование и подсветка уровней
-  $('log').innerHTML = content.split('\n').map(l => {
+  const lines = content.split('\n');
+  const shown = logErrOnly ? lines.filter(l => LOG_ERR.test(l) || LOG_WARN.test(l)) : lines;
+  $('log').innerHTML = shown.map(l => {
     const cls = LOG_ERR.test(l) ? ' class="lvl-err"' : (LOG_WARN.test(l) ? ' class="lvl-warn"' : '');
     return '<span'+cls+'>'+escapeHtml(l)+'</span>';
   }).join('\n');
+}
+
+function toggleLogFilter() {
+  logErrOnly = !logErrOnly;
+  const b = $('btnLogFilter');
+  b.setAttribute('aria-pressed', String(logErrOnly));
+  b.classList.toggle('on', logErrOnly);
+  lastLog = null;           // форсируем перерисовку
+  loadLog();
+}
+
+function downloadLog() {
+  const blob = new Blob([lastLog || ''], {type:'text/plain'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'naiveproxy.log';
+  a.click();
+  // отложенный revoke: синхронный может оборвать загрузку в Safari/Firefox
+  setTimeout(() => URL.revokeObjectURL(a.href), 0);
+}
+
+async function copyLog() {
+  const text = lastLog || '';
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+    } else {
+      // http-LAN: Clipboard API недоступен вне secure context — fallback
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand('copy');
+      ta.remove();
+      if (!ok) throw new Error('execCommand copy failed');
+    }
+    flash('Лог скопирован', true);
+  } catch (e) { flash('Не удалось скопировать: ' + e.message, false); }
 }
 
 async function loadLog() {
@@ -658,6 +745,13 @@ $('importFile').addEventListener('change', async () => {
 
 $('search').addEventListener('input', () => renderPresets(lastPresets));
 $('editor').addEventListener('input', () => { dirty = true; });
+// Известная схема + URL-безопасные символы (креды/путь/query) либо голый host.
+const UP_OK = /^(https?:\/\/|quic:\/\/)[A-Za-z0-9._~%!$&'()*+,;=:@\/?#\-\[\]]+$|^[A-Za-z0-9.\-\[\]:]+$/;
+function validateUpstream() {
+  const v = $('f_upstream').value.trim();
+  $('upHint').classList.toggle('show', v.length > 0 && !UP_OK.test(v));
+}
+$('f_upstream').addEventListener('input', validateUpstream);
 window.addEventListener('beforeunload', (e) => { if (dirty) { e.preventDefault(); e.returnValue = ''; } });
 
 // Горячие клавиши: Ctrl/Cmd+S — сохранить, «/» — поиск, Esc — закрыть редактор.
@@ -670,8 +764,10 @@ document.addEventListener('keydown', (e) => {
     e.preventDefault(); $('search').focus();
     return;
   }
-  // SUMMARY не трогаем: Esc там закрывает <details> нативно
-  if (e.key === 'Escape' && current && e.target.tagName !== 'SUMMARY') closeEditor();
+  // SUMMARY не трогаем: Esc там закрывает <details> нативно; открытый dialog
+  // закрывается сам — не даём Esc заодно снести редактор под ним
+  if (e.key === 'Escape' && !document.querySelector('dialog[open]')
+      && current && e.target.tagName !== 'SUMMARY') closeEditor();
 });
 
 // Следим за «прилипанием»: пользователь у самого низа → автоскролл включён,
@@ -684,6 +780,34 @@ $('log').addEventListener('scroll', () => {
 // Автообновление лога и статуса: раз в 3с, только на видимой вкладке.
 setInterval(() => { if (!document.hidden) { loadLog(); pollStatus(); } }, 3000);
 document.addEventListener('visibilitychange', () => { if (!document.hidden) { loadLog(); pollStatus(); } });
+
+// Делегирование кликов: inline-обработчики запрещены nonce-CSP.
+const ACTIONS = {
+  theme: () => toggleTheme(),
+  svc: (arg) => svc(arg),
+  newPreset: () => newPreset(),
+  import: () => $('importFile').click(),
+  panelRestart: () => panelRestart(),
+  select: (arg) => selectPreset(arg),
+  activate: (arg) => activate(arg),
+  duplicate: (arg) => dupPreset(arg),
+  del: (arg) => del(arg),
+  probe: () => probeUpstream(),
+  togglePw: () => togglePw(),
+  loadLog: () => loadLog(),
+  logFilter: () => toggleLogFilter(),
+  logDownload: () => downloadLog(),
+  logCopy: () => copyLog(),
+};
+
+document.addEventListener('click', (e) => {
+  const el = e.target.closest('[data-action]');
+  if (!el) return;
+  const fn = ACTIONS[el.dataset.action];
+  if (fn) { e.preventDefault(); fn(el.dataset.arg); }
+});
+
+$('editor').addEventListener('submit', save);
 
 refreshAll();
 const hashMatch = location.hash.match(/^#preset=(.+)$/);

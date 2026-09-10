@@ -8,3 +8,5 @@ var/
 .idea/
 .DS_Store
 /temp/
+docs/superpowers/
+.superpowers/

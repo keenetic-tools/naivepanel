@@ -13,17 +13,20 @@ Bind по умолчанию 127.0.0.1:8089 — публикация через 
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import os
 import re
+import secrets
 import socket
-import subprocess
+# subprocess вызывается только с фиксированными argv-списками (shell=False)
+import subprocess  # nosec B404
 import time
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, unquote
 
-from flask import Flask, Response, abort, jsonify, make_response, render_template, request
+from flask import Flask, Response, abort, g, jsonify, make_response, render_template, request
 from werkzeug.exceptions import HTTPException
 
 # --- panel.conf: постоянные настройки панели (переживают апгрейды) --------
@@ -41,7 +44,7 @@ PANEL_CONF = Path(os.environ.get("NAIVEPANEL_CONF", "/opt/etc/naive/panel/panel.
 CONF_KEYS = frozenset({
     "NAIVEPANEL_BIND", "NAIVEPANEL_HOSTS", "NAIVEPANEL_PASS",
     "NAIVEPROXY_DIR", "NAIVEPROXY_INIT", "NAIVEPROXY_LOG", "NAIVEPROXY_PID",
-    "NAIVEPANEL_INIT",
+    "NAIVEPANEL_INIT", "NAIVEPANEL_THREADS",
 })
 
 _CONF_SKIPPED: list[str] = []
@@ -88,8 +91,22 @@ PANEL_BIND = os.environ.get("NAIVEPANEL_BIND", "127.0.0.1:8089")
 ALLOWED_HOSTS = {h.strip() for h in os.environ.get("NAIVEPANEL_HOSTS", "").split(",") if h.strip()}
 # Init-скрипт самой панели — для self-restart после обновления файлов.
 PANEL_INIT = Path(os.environ.get("NAIVEPANEL_INIT", "/opt/etc/init.d/S99naivepanel"))
+# Прод-сервер waitress, если установлен; иначе — dev-сервер Werkzeug.
+# На роутере (LAN-bind) waitress ограничивает число потоков и переживает
+# медленных клиентов; в dev/Mac падать не должен.
+# Опечатка в panel.conf не должна ронять импорт — предупредим в _serve.
+_THREADS_RAW = os.environ.get("NAIVEPANEL_THREADS", "4") or "4"
+try:
+    WAITRESS_THREADS = max(1, int(_THREADS_RAW))
+except (TypeError, ValueError):
+    WAITRESS_THREADS = 4
+    _THREADS_INVALID = True
+else:
+    _THREADS_INVALID = False
 
 NAME_RE = re.compile(r"^[a-zA-Z0-9_\-.]{1,64}$")
+# Разрешённые схемы proxy-URI: только реально поддерживаемые naive.
+_ALLOWED_PROXY_SCHEMES = ("https://", "http://", "quic://")
 # Имена, занятые статическими маршрутами /api/configs/export|import:
 # такой пресет нельзя было бы получить через GET (роутинг отдаёт файл)
 RESERVED_NAMES = frozenset({"export", "import"})
@@ -233,7 +250,9 @@ def _summary(cfg: dict[str, Any]) -> dict[str, Any]:
     return {
         "listen": listen_uri,
         "listen_count": listen_count,
-        "proxy": proxy_uri,
+        # пароль в списке не отдаём: маскируем до сериализации (username
+        # извлекается из сырого значения выше)
+        "proxy": _mask_creds(proxy_uri),
         "username": user,
     }
 
@@ -358,8 +377,8 @@ def _validate_cfg(cfg: dict[str, Any], name: str) -> None:
     proxy = cfg.get("proxy")
     if not (isinstance(proxy, str) and proxy.strip()):
         errors.append("proxy обязателен")
-    elif not re.match(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://", proxy):
-        errors.append("proxy должен быть URI со схемой (https://…)")
+    elif not proxy.strip().lower().startswith(_ALLOWED_PROXY_SCHEMES):
+        errors.append("proxy: разрешены схемы https://, http://, quic://")
     ic = cfg.get("insecure-concurrency")
     if ic is not None and (not isinstance(ic, int) or isinstance(ic, bool) or not 1 <= ic <= 4):
         errors.append("insecure-concurrency: целое 1..4")
@@ -401,7 +420,8 @@ def _upstream_endpoint(upstream: str) -> tuple[str, int] | None:
 
 def _run(cmd: list[str], timeout: int = 10) -> dict[str, Any]:
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        # cmd — фиксированный argv-список, shell не используется
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)  # nosec B603
         return {
             "rc": r.returncode,
             "stdout": r.stdout.strip(),
@@ -535,32 +555,46 @@ def _api_json_errors(exc: HTTPException):
 
 # --- Security headers --------------------------------------------------------
 
-# CSP сознательно допускает 'unsafe-inline' для script/style: UI — один файл
-# с inline-обработчиками onclick и без сборки (это принцип проекта). Ценность
-# политики не в блокировке inline-XSS (первичная защита — экранирование в
-# escapeHtml() и JSON-only API), а в запрете подгрузки ВНЕШНИХ скриптов и
-# стилей: инъекция <script src=…>/<link href=…> с чужого хоста не сработает.
-# connect-src 'self' не даёт внедрённому коду эксфильтрировать данные fetch'ем
-# на сторонний домен.
-_CSP = (
-    "default-src 'none'; "
-    "script-src 'unsafe-inline'; "
-    "style-src 'unsafe-inline'; "
-    "connect-src 'self'; "
-    "img-src 'self' data:; "
-    "base-uri 'none'; "
-    "form-action 'self'; "
-    "frame-ancestors 'none'"
-)
+# Скрипты разрешены только по nonce (уникален на запрос): инъекция <script>
+# без nonce не выполнится, 'unsafe-inline' для script не нужен. style-src
+# оставляем 'unsafe-inline' — inline-стили и style="" в шаблоне. Внешние
+# origin'ы запрещены: connect-src 'self' не даёт внедрённому коду
+# эксфильтрировать данные fetch'ем на сторонний домен.
+def _csp(nonce: str) -> str:
+    return (
+        "default-src 'none'; "
+        f"script-src 'nonce-{nonce}'; "
+        "style-src 'unsafe-inline'; "
+        "connect-src 'self'; "
+        "img-src 'self' data:; "
+        "base-uri 'none'; "
+        "form-action 'self'; "
+        "frame-ancestors 'none'"
+    )
 
 
 @app.after_request
 def _security_headers(resp: Response) -> Response:
-    resp.headers.setdefault("Content-Security-Policy", _CSP)
+    resp.headers.setdefault("Content-Security-Policy", _csp(getattr(g, "csp_nonce", "")))
     resp.headers.setdefault("X-Content-Type-Options", "nosniff")
     resp.headers.setdefault("X-Frame-Options", "DENY")
     resp.headers.setdefault("Referrer-Policy", "no-referrer")
     return resp
+
+
+# --- CSP nonce ---------------------------------------------------------------
+
+# Регистрируется до Host-allowlist: nonce нужен и на 403-ответах (after_request
+# читает g.csp_nonce), поэтому должен существовать раньше любого abort.
+
+@app.before_request
+def _make_csp_nonce() -> None:
+    g.csp_nonce = secrets.token_urlsafe(16)
+
+
+@app.context_processor
+def _inject_csp_nonce() -> dict[str, str]:
+    return {"csp_nonce": getattr(g, "csp_nonce", "")}
 
 
 # --- Host allowlist (анти-DNS-rebinding) -----------------------------------
@@ -622,6 +656,31 @@ _AUTH_CACHE_LIMIT = 64
 _auth_cache: dict[str, float] = {}  # sha256(user\x00pass) → expiry (monotonic)
 _admin_pass_stamp: tuple[int, int] | None = None
 
+# Анти-перебор: счётчик неудач на IP. До лимита — обычный 401; сверх лимита —
+# 429 без time.sleep (флуд не должен держать рабочие потоки роутера).
+_AUTH_FAIL_WINDOW = 60.0
+_AUTH_FAIL_LIMIT = 5
+_auth_fails: dict[str, list] = {}  # ip -> [count, window_start_monotonic]
+
+
+def _auth_register_failure(ip: str) -> None:
+    now = time.monotonic()
+    rec = _auth_fails.get(ip)
+    if rec is None or now - rec[1] > _AUTH_FAIL_WINDOW:
+        _auth_fails[ip] = [1, now]
+    else:
+        rec[0] += 1
+
+
+def _auth_throttled(ip: str) -> bool:
+    rec = _auth_fails.get(ip)
+    if not rec:
+        return False
+    if time.monotonic() - rec[1] > _AUTH_FAIL_WINDOW:
+        _auth_fails.pop(ip, None)
+        return False
+    return rec[0] >= _AUTH_FAIL_LIMIT
+
 
 @app.before_request
 def _require_auth():
@@ -636,6 +695,9 @@ def _require_auth():
     global _admin_pass_stamp
     if not PANEL_ADMIN_PASS.exists():
         return  # auth выключен — только 127.0.0.1, публично не торчим
+    ip = request.remote_addr or ""
+    if _auth_throttled(ip):
+        abort(429, description="too many failed auth attempts, try later")
     try:
         st = PANEL_ADMIN_PASS.stat()
         stamp = (st.st_mtime_ns, st.st_size)
@@ -652,12 +714,14 @@ def _require_auth():
         now = time.monotonic()
         exp = _auth_cache.get(key)
         if exp is not None and exp > now:
+            _auth_fails.pop(ip, None)
             return
         stored = PANEL_ADMIN_PASS.read_text(encoding="utf-8")
         if _htpasswd_verify(stored, auth.username or "", auth.password or ""):
             if len(_auth_cache) >= _AUTH_CACHE_LIMIT:
                 _auth_cache.clear()
             _auth_cache[key] = now + _AUTH_CACHE_TTL
+            _auth_fails.pop(ip, None)
             return
     app.logger.warning(
         "auth failed: user=%r addr=%s path=%s",
@@ -665,7 +729,11 @@ def _require_auth():
         request.remote_addr,
         request.path,
     )
-    time.sleep(0.5)  # подрезать онлайн-перебор; bcrypt и так медленный
+    if auth is not None:
+        # неудачи считаем только при предъявленных кредах: анонимные пробы
+        # (без Authorization) за reverse-proxy с общим remote_addr иначе
+        # заблокировали бы всех админов
+        _auth_register_failure(ip)
     return Response(
         "auth required",
         401,
@@ -726,7 +794,9 @@ def api_status():
 
 @app.route("/api/configs")
 def api_configs_list():
-    return jsonify(_list_presets())
+    resp = jsonify(_list_presets())
+    resp.headers["Cache-Control"] = "no-store"  # список не должен кешироваться
+    return resp
 
 
 @app.route("/api/configs/<name>", methods=["GET"])
@@ -746,6 +816,7 @@ def api_configs_create():
     if name in RESERVED_NAMES:
         abort(400, description=f"name {name!r} is reserved")
     cfg = _build_payload(data)
+    _validate_cfg(cfg, name)
     path = CONF_D / f"{name}.json"
     if path.exists():
         abort(409, description=f"preset {name!r} already exists")
@@ -852,6 +923,7 @@ def api_configs_export():
         "presets": presets,
     })
     resp.headers["Content-Disposition"] = 'attachment; filename="naivepanel-presets.json"'
+    resp.headers["Cache-Control"] = "no-store"  # ответ содержит секреты
     return resp
 
 
@@ -935,9 +1007,9 @@ def api_panel_restart():
     if not PANEL_INIT.exists():
         abort(503, description=f"{PANEL_INIT} not found")
     # Новая сессия → ребёнок переживёт смерть Flask-процесса. Путь передаём
-    # argv ($1), а не интерполяцией в shell-строку.
-    subprocess.Popen(
-        ["sh", "-c", 'sleep 1; exec /bin/sh "$1" restart', "sh", str(PANEL_INIT)],
+    # argv ($1), а не интерполяцией в shell-строку. Команда фиксированная.
+    subprocess.Popen(  # nosec B603
+        ["/bin/sh", "-c", 'sleep 1; exec /bin/sh "$1" restart', "sh", str(PANEL_INIT)],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         start_new_session=True,
@@ -952,15 +1024,43 @@ def api_logs():
         lines = int(request.args.get("lines", "100"))
     except ValueError:
         lines = 100
-    return jsonify({"lines": lines, "content": _tail_log(lines)})
+    resp = jsonify({"lines": lines, "content": _tail_log(lines)})
+    resp.headers["Cache-Control"] = "no-store"  # логи могут содержать креды
+    return resp
 
 
 # --- Main -----------------------------------------------------------------
 
+
+def _serve(application: Flask, host: str, port: int) -> None:
+    if _THREADS_INVALID:
+        app.logger.warning(
+            "NAIVEPANEL_THREADS=%r is not a number — using %d",
+            _THREADS_RAW, WAITRESS_THREADS,
+        )
+    try:
+        from waitress import serve as waitress_serve  # type: ignore
+    except ImportError:
+        app.logger.warning(
+            "waitress not installed — falling back to Werkzeug dev server; "
+            "install python3-waitress (opkg) or `pip install waitress`"
+        )
+        application.run(host=host, port=port, debug=False, threaded=True)
+        return
+    app.logger.info("serving via waitress on %s:%s (threads=%s)", host, port, WAITRESS_THREADS)
+    waitress_serve(application, host=host, port=port, threads=WAITRESS_THREADS)
+
+
 if __name__ == "__main__":
     _ensure_dirs()
     host, port = _parse_bind(PANEL_BIND)
-    if host in ("0.0.0.0", "::"):
+    # host берётся из env/panel.conf: предупреждаем только для unspecified
+    # адресов (0.0.0.0 / ::) — фактического bind здесь нет.
+    try:
+        exposed = ipaddress.ip_address(host).is_unspecified
+    except ValueError:
+        exposed = False
+    if exposed:
         app.logger.warning(
             "bind %s exposes the panel on ALL interfaces (on a router incl. "
             "WAN/VPN/guest segments). Prefer a LAN address; ensure admin.pass, "
@@ -968,5 +1068,5 @@ if __name__ == "__main__":
             PANEL_BIND,
         )
     # threaded: поллинг UI каждые 3с не должен стоять за медленным запросом
-    # (bcrypt, рестарт сервиса до 30с, sleep на неудачной аутентификации)
-    app.run(host=host, port=port, debug=False, threaded=True)
+    # (bcrypt, рестарт сервиса до 30с)
+    _serve(app, host, port)

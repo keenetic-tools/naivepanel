@@ -237,6 +237,16 @@ if ! "$PYTHON" -c 'import flask' 2>/dev/null; then
     fi
 fi
 
+if ! "$PYTHON" -c 'import waitress' 2>/dev/null; then
+    info "waitress missing — installing via opkg"
+    opkg update >/dev/null
+    if ! opkg install python3-waitress 2>/dev/null; then
+        warn "python3-waitress unavailable via opkg — falling back to pip"
+        opkg install python3-pip || die "opkg install python3-pip failed"
+        /opt/bin/pip3 install --no-cache-dir waitress || warn "pip install waitress failed"
+    fi
+fi
+
 if [ "$WITH_AUTH" = 1 ]; then
     if ! "$PYTHON" -c 'import bcrypt' 2>/dev/null; then
         info "python3-bcrypt missing — installing via opkg"
