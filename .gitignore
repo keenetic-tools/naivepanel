@@ -7,6 +7,6 @@ var/
 *.log
 .idea/
 .DS_Store
-/temp/
+/tmp/
 docs/superpowers/
 .superpowers/
