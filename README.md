@@ -91,7 +91,7 @@ Entware с `opkg`). Скачивает файлы, закреплённые за
 контрольные суммы (`SHA256SUMS`), ставит init-скрипты и запускает панель:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/v0.6.0/install.sh | sh -s -- --with-auth
+curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/v0.6.1/install.sh | sh -s -- --with-auth
 ```
 
 Запуск через пайп безопасен: подтверждение установки и ввод пароля читаются
@@ -105,7 +105,7 @@ curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/v0.6.0/in
 | `--with-auth` | интерактивно создаёт `/opt/etc/naive/panel/admin.pass` (HTTP Basic) |
 | `--bind HOST:PORT` | пишет `NAIVEPANEL_BIND` в `/opt/etc/naive/panel/panel.conf` |
 | `--hosts LIST` | пишет `NAIVEPANEL_HOSTS` в `panel.conf` |
-| `--ref TAG` | устанавливает конкретный тег (по умолчанию `v0.6.0`) |
+| `--ref TAG` | устанавливает конкретный тег (по умолчанию `v0.6.1`) |
 | `--no-naive-init` | не ставить `S99naiveproxy` (если свой init-скрипт уже есть) |
 | `--yes` | неинтерактивный режим (без подтверждения) |
 | `--uninstall` | остановить сервисы и удалить файлы |
@@ -129,7 +129,7 @@ curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/v0.6.0/in
 Пример с LAN-доступом:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/v0.6.0/install.sh \
+curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/v0.6.1/install.sh \
   | sh -s -- --with-auth --bind 192.168.1.1:8089 --hosts '192.168.1.1:8089,router.local:8089'
 ```
 
