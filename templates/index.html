@@ -218,6 +218,12 @@
     <div class="actions" style="margin-top:10px">
       <button class="ghost wide" data-action="panelRestart" title="Перезапуск веб-панели (после обновления файлов)">Перезапуск</button>
     </div>
+    <div id="updInfo" style="font-size:12px;color:var(--mut);margin-top:12px">обновления: проверка…</div>
+    <div class="actions" style="margin-top:8px">
+      <button class="ghost" data-action="updateCheck" title="Сверить версию панели с последним релизом GitHub">Проверить обновления</button>
+      <button data-action="updateApply" id="btnUpdApply" hidden>Обновить</button>
+      <button class="ghost" data-action="updateNotes" id="btnUpdNotes" hidden title="Описание грядущего релиза">Что нового</button>
+    </div>
   </section>
 
   <section class="card">
@@ -295,6 +301,21 @@
   <form method="dialog" class="dlg-actions">
     <button class="ghost" value="cancel">Отмена</button>
     <button id="confirmOk" value="ok">OK</button>
+  </form>
+</dialog>
+<dialog id="notesDlg" aria-labelledby="notesTitle">
+  <p id="notesTitle" style="margin:0;font-weight:600"></p>
+  <pre class="log" id="notesBody" style="max-height:300px;margin-top:10px"></pre>
+  <p id="notesUrl" style="margin:10px 0 0;font-size:12px"></p>
+  <form method="dialog" class="dlg-actions">
+    <button class="ghost" value="close">Закрыть</button>
+  </form>
+</dialog>
+<dialog id="updDlg" aria-labelledby="updMsg">
+  <p id="updMsg" style="margin:0 0 10px"></p>
+  <pre class="log" id="updLog" style="max-height:180px"></pre>
+  <form method="dialog" class="dlg-actions">
+    <button class="ghost" value="close" title="Обновление продолжит идти в фоне">Свернуть</button>
   </form>
 </dialog>
 <div id="toasts"></div>
@@ -663,6 +684,102 @@ async function panelRestart() {
   flash('Сервер не поднялся за 30с — обновите страницу вручную', false);
 }
 
+// --- Обновление панели из UI ------------------------------------------------
+let upd = null; // ответ /api/update/check: {current, latest, available, notes, url}
+
+async function checkUpdate(manual) {
+  const btn = document.querySelector('[data-action="updateCheck"]');
+  btn.disabled = true;
+  try {
+    upd = await jget('/api/update/check' + (manual ? '?force=1' : ''));
+    renderUpdate();
+    if (manual && !upd.error && !upd.available) flash('Обновлений нет — v'+upd.current+' свежая', true);
+  } catch (e) {
+    upd = null;
+    renderUpdate(e.message);
+    if (manual) flash('Не удалось проверить обновления: '+e.message, false);
+  } finally { btn.disabled = false; }
+}
+
+function renderUpdate(err) {
+  const info = $('updInfo'), apply = $('btnUpdApply'), notes = $('btnUpdNotes');
+  apply.hidden = notes.hidden = true;
+  if (!upd) {
+    info.textContent = 'обновления: не проверены' + (err ? ' — '+err : '');
+    return;
+  }
+  if (upd.error) { // GitHub недоступен с роутера — штатный случай, тихая строка
+    info.textContent = 'обновления: не удалось проверить ('+escapeHtml(upd.error)+')';
+    return;
+  }
+  if (upd.available) {
+    info.innerHTML = 'доступна <b style="color:var(--acc)">v'+escapeHtml(upd.latest)+'</b>'
+      + ' · установлена v'+escapeHtml(upd.current);
+    apply.hidden = notes.hidden = false;
+    apply.textContent = 'Обновить до v'+upd.latest;
+  } else {
+    info.textContent = 'обновления: установлена последняя версия (v'+upd.current+')';
+  }
+}
+
+function showNotes() {
+  if (!upd) return;
+  $('notesTitle').textContent = 'NaivePanel v'+upd.latest;
+  $('notesBody').textContent = upd.notes || 'Описание релиза не заполнено — см. страницу релиза.';
+  $('notesUrl').innerHTML = upd.url
+    ? 'Полная заметка: <a style="color:var(--acc)" href="'+escapeHtml(upd.url)+'" target="_blank" rel="noopener">'+escapeHtml(upd.url)+'</a>'
+    : '';
+  $('notesDlg').showModal();
+}
+
+async function applyUpdate() {
+  if (!upd || !upd.available) return;
+  const ok = await askConfirm(
+    'Обновить панель до v'+upd.latest+'?\nВеб-панель перезапустится на несколько секунд; прокси (naive) продолжит работать без прерывания.',
+    {ok:'Обновить'});
+  if (!ok) return;
+  let d;
+  try { d = await jpost('/api/update/apply', null); }
+  catch (e) { flash('Обновление не запущено: '+e.message, false); return; }
+  const want = String(d.target || ('v'+upd.latest)).replace(/^v/, '');
+  $('updMsg').textContent = 'Обновление до v'+want+'…';
+  $('updLog').textContent = '';
+  $('updDlg').showModal();
+  flash('Обновление до v'+want+' запущено', true);
+  // Детект завершения — на клиенте (state на сервере не переживает рестарт):
+  // панель должна «упасть и подняться» с новой версией в /api/status.
+  const t0 = Date.now(), deadline = t0 + 180000;
+  let wentDown = false;
+  for (;;) {
+    await new Promise(res => setTimeout(res, 1000));
+    try { renderUpdLog(await jget('/api/update/log?lines=30')); } catch (e) { /* рестарт панели */ }
+    let st = null;
+    try { st = await (await fetch('/api/status', {cache:'no-store'})).json(); }
+    catch (e) { wentDown = true; }
+    // 15с-страховка от «рестарт проскочил между поллами»: смена версии и без
+    // наблюдённого падения — успех; без смены версии ждём именно падения
+    const changed = st && st.version !== upd.current;
+    if (st && st.version === want && (wentDown || (changed && Date.now() - t0 > 15000))) {
+      $('updMsg').textContent = 'Обновлено до v'+want+' — перезагружаю страницу…';
+      setTimeout(() => location.reload(), 900);
+      return;
+    }
+    if (Date.now() > deadline) {
+      $('updMsg').textContent = 'v'+want+' не поднялась за 3 мин — лог ниже; подробности в '
+        + String(d.log || '/opt/var/log/naivepanel-update.log');
+      flash('Обновление не завершилось вовремя — см. лог обновления', false);
+      return;
+    }
+  }
+}
+
+function renderUpdLog(d) {
+  const pre = $('updLog');
+  const txt = d.content || '(лог пока пуст)';
+  if (pre.textContent !== txt) pre.textContent = txt;
+  pre.scrollTop = pre.scrollHeight;
+}
+
 let lastLog = null;   // кэш — не трогаем DOM, если контент не изменился
 let logStuck = true;  // «прилип» к низу лога — автоскролл только когда true
 let logErrOnly = false; // показывать только ошибки/предупреждения
@@ -793,6 +910,9 @@ const ACTIONS = {
   newPreset: () => newPreset(),
   import: () => $('importFile').click(),
   panelRestart: () => panelRestart(),
+  updateCheck: () => checkUpdate(true),
+  updateApply: () => applyUpdate(),
+  updateNotes: () => showNotes(),
   select: (arg) => selectPreset(arg),
   activate: (arg) => activate(arg),
   duplicate: (arg) => dupPreset(arg),
@@ -815,6 +935,9 @@ document.addEventListener('click', (e) => {
 $('editor').addEventListener('submit', save);
 
 refreshAll();
+// Тихий авто-check после первичной загрузки: если есть обновление — бейдж,
+// нет или сеть недоступна — тихая строка в секции «Панель», без тостов.
+setTimeout(() => checkUpdate(false), 1500);
 const hashMatch = location.hash.match(/^#preset=(.+)$/);
 if (hashMatch) selectPreset(decodeURIComponent(hashMatch[1]));
 </script>

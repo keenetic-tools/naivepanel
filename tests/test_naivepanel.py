@@ -28,6 +28,9 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setenv("NAIVEPANEL_INIT", str(tmp_path / "absent-init.sh"))
     monkeypatch.setenv("NAIVEPROXY_LOG", str(tmp_path / "naiveproxy.log"))
     monkeypatch.setenv("NAIVEPROXY_PID", str(tmp_path / "naiveproxy.pid"))
+    # self-update пишет в каталог панели и свой лог — только в tmp
+    monkeypatch.setenv("NAIVEPANEL_DIR", str(tmp_path / "panel"))
+    monkeypatch.setenv("NAIVEPANEL_UPDATE_LOG", str(tmp_path / "update.log"))
     monkeypatch.syspath_prepend(str(APP_DIR))
     return tmp_path
 
@@ -756,3 +759,253 @@ def test_invalid_threads_env_falls_back_to_default(env, monkeypatch):
     monkeypatch.setenv("NAIVEPANEL_THREADS", "abc")
     m = _reload()
     assert m.WAITRESS_THREADS == 4
+
+
+# --- self-update: сравнение версий и резолв тега ------------------------------
+
+def test_ver_key_compares_numerically(app):
+    assert app._ver_key("0.10.0") > app._ver_key("0.9.0")   # строкой было бы <
+    assert app._ver_key("v0.6.1") == app._ver_key("0.6.1") == (0, 6, 1)
+    assert app._ver_key("0.6") < app._ver_key("0.6.1")      # недостающие = 0
+    assert app._ver_key("") == (0,)
+
+
+def _github(monkeypatch, app, release=None, tags=()):
+    """Подменяем сетевой слой: релиз и/или теги, как их отдаёт GitHub API."""
+    def fake_get(url, timeout=6.0):
+        if "/releases/latest" in url:
+            if release is None:
+                raise RuntimeError("404 no releases")
+            return json.dumps(release)
+        if "/tags" in url:
+            return json.dumps([{"name": t} for t in tags])
+        raise AssertionError(f"unexpected url: {url}")
+    monkeypatch.setattr(app, "_http_get", fake_get)
+
+
+def test_latest_release_prefers_newer_tag_over_release(app, monkeypatch):
+    # реальный кейс репозитория: релиз-нота v0.6.0, но тег v0.6.1 уже существует
+    _github(monkeypatch, app,
+            release={"tag_name": "v0.6.0", "body": "notes", "html_url": "u"},
+            tags=["v0.6.1", "v0.6.0"])
+    rel = app._latest_release()
+    assert rel["tag"] == "v0.6.1"
+    assert rel["notes"] == ""  # у «голого» тега описания нет
+
+
+def test_latest_release_keeps_notes_when_release_is_newest(app, monkeypatch):
+    _github(monkeypatch, app,
+            release={"tag_name": "v0.7.0", "body": "changelog", "html_url": "url"},
+            tags=["v0.7.0", "v0.6.1"])
+    rel = app._latest_release()
+    assert rel["tag"] == "v0.7.0" and rel["notes"] == "changelog"
+
+
+def test_latest_release_without_releases_uses_tags(app, monkeypatch):
+    _github(monkeypatch, app, tags=["v0.5.1", "v0.6.1"])
+    assert app._latest_release()["tag"] == "v0.6.1"
+
+
+def test_latest_release_ignores_non_semver_tags(app, monkeypatch):
+    # main/experimental-теги не должны предлагаться как «обновление»
+    _github(monkeypatch, app, tags=["main", "v0.6.1-x", "nightly"])
+    with pytest.raises(RuntimeError):
+        app._latest_release()
+
+
+def test_latest_release_no_network_raises(app, monkeypatch):
+    def dead(url, timeout=6.0):
+        raise RuntimeError("timeout")
+    monkeypatch.setattr(app, "_http_get", dead)
+    with pytest.raises(RuntimeError):
+        app._latest_release()
+
+
+def test_http_get_reports_missing_tools(app, monkeypatch):
+    def no_tools(cmd, **kw):
+        raise FileNotFoundError(cmd[0])
+    monkeypatch.setattr(app.subprocess, "run", no_tools)
+    with pytest.raises(RuntimeError) as ei:
+        app._http_get("https://example.invalid/x")
+    assert "not found" in str(ei.value)
+
+
+# --- self-update: /api/update/check ---------------------------------------------
+
+def test_check_reports_available_update(client, app, monkeypatch):
+    monkeypatch.setattr(app, "_latest_release",
+                        lambda: {"tag": "v9.9.9", "notes": "big release",
+                                 "url": "https://x"})
+    d = client.get("/api/update/check").get_json()
+    assert d["available"] is True
+    assert d["current"] == app.APP_VERSION and d["latest"] == "9.9.9"
+    assert d["notes"] == "big release"
+
+
+def test_check_cache_and_force(client, app, monkeypatch):
+    calls = {"n": 0}
+    def latest():
+        calls["n"] += 1
+        return {"tag": "v9.9.9", "notes": "", "url": ""}
+    monkeypatch.setattr(app, "_latest_release", latest)
+    assert client.get("/api/update/check").get_json().get("cached") is None
+    d = client.get("/api/update/check").get_json()
+    assert d["cached"] is True          # второй вызов — из кэша, без сети
+    assert calls["n"] == 1
+    d = client.get("/api/update/check?force=1").get_json()
+    assert d.get("cached") is None and calls["n"] == 2
+
+
+def test_check_failsoft_on_network_error(client, app, monkeypatch):
+    def dead():
+        raise RuntimeError("GitHub unreachable")
+    monkeypatch.setattr(app, "_latest_release", dead)
+    r = client.get("/api/update/check")
+    assert r.status_code == 200         # недоступный GitHub — не ошибка панели
+    d = r.get_json()
+    assert d["available"] is False and d["latest"] is None and d["error"]
+    # ошибки тоже кэшируются (коротким TTL), чтобы не долбить сеть
+    assert client.get("/api/update/check").get_json()["cached"] is True
+
+
+def test_check_same_version_is_not_available(client, app, monkeypatch):
+    monkeypatch.setattr(app, "_latest_release",
+                        lambda: {"tag": "v" + app.APP_VERSION, "notes": "", "url": ""})
+    assert client.get("/api/update/check").get_json()["available"] is False
+
+
+# --- self-update: /api/update/apply ----------------------------------------------
+
+def _apply_stub(env, monkeypatch, app, tag="v9.9.9"):
+    """Каталог панели с файлами + подменные _latest_release/install.sh."""
+    panel = env / "panel"
+    (panel / "templates").mkdir(parents=True, exist_ok=True)
+    (panel / "naivepanel.py").write_text("# old panel code")
+    marker = env / "update-ran.txt"
+    monkeypatch.setattr(app, "_latest_release",
+                        lambda: {"tag": tag, "notes": "", "url": ""})
+    def fake_install(url, timeout=6.0):
+        assert f"{tag}/install.sh" in url, f"install.sh должен качаться с тега: {url}"
+        return f'#!/bin/sh\necho "ran $*" >> "{marker}"\n'
+    monkeypatch.setattr(app, "_http_get", fake_install)
+    return marker
+
+
+def test_apply_spawns_installer_and_backs_up(client, app, env, monkeypatch):
+    marker = _apply_stub(env, monkeypatch, app)
+    r = client.post("/api/update/apply", headers=CSRF)
+    assert r.status_code == 202
+    body = r.get_json()
+    assert body["target"] == "v9.9.9" and body["current"] == app.APP_VERSION
+    # бэкап заменяемых файлов создан до запуска установщика
+    backup = app.PANEL_DIR / "backup" / f"v{app.APP_VERSION}"
+    assert (backup / "naivepanel.py").read_text() == "# old panel code"
+    # state зафиксировал «running» с целью
+    st = json.loads(app.UPDATE_STATE.read_text())
+    assert st["phase"] == "running" and st["target"] == "v9.9.9"
+    for _ in range(50):  # установщик spawn'ится отсоединённо — ждём маркер
+        if marker.exists():
+            break
+        time.sleep(0.1)
+    assert "--yes --ref v9.9.9" in marker.read_text()
+
+
+def test_apply_concurrent_returns_409(client, app, env, monkeypatch):
+    _apply_stub(env, monkeypatch, app)
+    assert client.post("/api/update/apply", headers=CSRF).status_code == 202
+    # state «running» (цель v9.9.9 ≠ текущая версия — сам не закроется)
+    r = client.post("/api/update/apply", headers=CSRF)
+    assert r.status_code == 409
+    assert "in progress" in r.get_json()["error"]
+
+
+def test_apply_refuses_exposed_panel_without_password(client, app, monkeypatch):
+    app.PANEL_BIND = "192.168.1.1:8089"  # admin.pass не существует (fixture)
+    monkeypatch.setattr(app, "_latest_release",
+                        lambda: {"tag": "v9.9.9", "notes": "", "url": ""})
+    r = client.post("/api/update/apply", headers=CSRF)
+    assert r.status_code == 403
+    assert "password" in r.get_json()["error"]
+
+
+def test_apply_with_password_allowed_on_lan_bind(client, app, env, monkeypatch):
+    bcrypt = pytest.importorskip("bcrypt")
+    h = bcrypt.hashpw(b"s3cret", bcrypt.gensalt()).decode()
+    app.PANEL_ADMIN_PASS.write_text(f"admin:{h}\n", encoding="utf-8")
+    app.PANEL_BIND = "192.168.1.1:8089"  # не loopback, но auth включён — можно
+    _apply_stub(env, monkeypatch, app)
+    token = base64.b64encode(b"admin:s3cret").decode()
+    r = client.post("/api/update/apply", headers={**CSRF, "Authorization": f"Basic {token}"})
+    assert r.status_code == 202
+
+
+def test_apply_502_when_release_unreachable(client, app, monkeypatch):
+    def dead():
+        raise RuntimeError("GitHub unreachable")
+    monkeypatch.setattr(app, "_latest_release", dead)
+    assert client.post("/api/update/apply", headers=CSRF).status_code == 502
+
+
+def test_apply_502_when_install_sh_fails(client, app, env, monkeypatch):
+    monkeypatch.setattr(app, "_latest_release",
+                        lambda: {"tag": "v9.9.9", "notes": "", "url": ""})
+    def no_install(url, timeout=6.0):
+        if url.endswith("/install.sh"):
+            raise RuntimeError("404")
+        raise AssertionError(url)
+    monkeypatch.setattr(app, "_http_get", no_install)
+    assert client.post("/api/update/apply", headers=CSRF).status_code == 502
+
+
+# --- self-update: state и лог ------------------------------------------------------
+
+def test_update_state_reconciles_after_restart(app):
+    app._update_state_write({"phase": "running", "target": "v" + app.APP_VERSION,
+                             "started": time.time() - 60})
+    st = app._update_state()
+    assert st["phase"] == "done"  # новый процесс видит себя равным цели
+    assert json.loads(app.UPDATE_STATE.read_text())["phase"] == "done"
+
+
+def test_update_state_marks_stale(app):
+    old = time.time() - app._UPDATE_STALE_S - 1
+    app._update_state_write({"phase": "running", "target": "v0.0.1", "started": old})
+    st = app._update_state()
+    assert st.get("stale") is True  # зависший апдейт больше не блокирует apply
+
+
+def test_bind_is_loopback_variants(app):
+    assert app._bind_is_loopback() is True            # дефолт 127.0.0.1:8089
+    for bind in ("localhost:8089", "[::1]:8089", "127.0.0.1:8089"):
+        app.PANEL_BIND = bind
+        assert app._bind_is_loopback() is True, bind
+    for bind in ("0.0.0.0:8089", "192.168.1.1:8089"):
+        app.PANEL_BIND = bind
+        assert app._bind_is_loopback() is False, bind
+
+
+def test_update_log_tails_and_is_no_store(client, app, env):
+    app.UPDATE_LOG.write_text("".join(f"u{i}\n" for i in range(50)),
+                              encoding="utf-8")
+    r = client.get("/api/update/log?lines=5")
+    assert r.headers.get("Cache-Control") == "no-store"
+    d = r.get_json()
+    assert d["content"].splitlines() == [f"u{i}" for i in range(45, 50)]
+    assert d["state"] == {}  # state-файла нет — пусто, не ошибка
+
+
+# --- self-update: UI -----------------------------------------------------------------
+
+def test_ui_has_update_controls(app):
+    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    for marker in ('data-action="updateCheck"', 'data-action="updateApply"',
+                   'data-action="updateNotes"', 'id="updDlg"', 'id="notesDlg"',
+                   '/api/update/check', '/api/update/apply', '/api/update/log'):
+        assert marker in html, marker
+
+
+def test_install_sh_repo_override_present(app):
+    # self-update спавнит install.sh, наследуя окружение: зеркало задаётся
+    # одним NAIVEPANEL_REPO и для панели, и для установщика
+    text = (APP_DIR / "install.sh").read_text(encoding="utf-8")
+    assert 'NAIVEPANEL_REPO:-keenetic-tools/naivepanel' in text

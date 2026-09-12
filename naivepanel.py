@@ -18,6 +18,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import socket
 # subprocess вызывается только с фиксированными argv-списками (shell=False)
 import subprocess  # nosec B404
@@ -103,6 +104,23 @@ except (TypeError, ValueError):
     _THREADS_INVALID = True
 else:
     _THREADS_INVALID = False
+
+# --- Self-update: репозиторий и пути ---------------------------------------
+# Обновление из UI повторяет ручной флоу `install.sh --yes`: панель лишь
+# узнаёт последний тег и отсоединённо spawn'ит установщик (см. /api/update/*).
+# Базовые URL и репозиторий переопределяются env'ом — для зеркал и тестов.
+UPDATE_REPO = os.environ.get("NAIVEPANEL_REPO", "keenetic-tools/naivepanel")
+UPDATE_API_BASE = os.environ.get("NAIVEPANEL_UPDATE_API", "https://api.github.com").rstrip("/")
+UPDATE_RAW_BASE = os.environ.get("NAIVEPANEL_UPDATE_RAW", "https://raw.githubusercontent.com").rstrip("/")
+# Каталог самой панели (naivepanel.py + templates/): бэкапы и state обновления
+PANEL_DIR = Path(os.environ.get("NAIVEPANEL_DIR", "/opt/etc/naive/panel"))
+UPDATE_LOG = Path(os.environ.get("NAIVEPANEL_UPDATE_LOG", "/opt/var/log/naivepanel-update.log"))
+UPDATE_STATE = PANEL_DIR / "update.state"
+# Источник обновления — только строгие vX.Y.Z: ни веток, ни хэшей, ни main
+_TAG_RE = re.compile(r"^v\d+\.\d+\.\d+$")
+_UPDATE_CHECK_TTL = 6 * 3600.0  # авто-check при загрузке страницы не должен
+_UPDATE_ERR_TTL = 10 * 60.0     # расходовать лимит GitHub API; недоступный
+_UPDATE_STALE_S = 15 * 60       # GitHub не долбим чаще раза в 10 минут
 
 NAME_RE = re.compile(r"^[a-zA-Z0-9_\-.]{1,64}$")
 # Разрешённые схемы proxy-URI: только реально поддерживаемые naive.
@@ -499,18 +517,18 @@ def _mask_creds(text: str) -> str:
     return _CRED_RE.sub(r"\1:***@", text)
 
 
-def _tail_log(lines: int = 100) -> str:
-    """Последние `lines` строк лога — чтением с конца, а не всего файла.
+def _tail_path(path: Path, lines: int = 100) -> str:
+    """Последние `lines` строк файла — чтением с конца, а не всего файла.
 
     Между рестартами лог может вырасти далеко за урезающий лимит init-скрипта,
     а /api/logs дёргается поллингом каждые 3с — readlines() всего файла на
     роутере был бы заметен по памяти/CPU. Заодно маскируем креды в URI.
     """
-    if not LOG_FILE.exists():
+    if not path.exists():
         return ""
     lines = max(1, min(lines, 1000))
     try:
-        with LOG_FILE.open("rb") as fh:
+        with path.open("rb") as fh:
             fh.seek(0, os.SEEK_END)
             end = fh.tell()
             chunk = 8192
@@ -527,6 +545,10 @@ def _tail_log(lines: int = 100) -> str:
     except OSError as exc:
         return f"<log read error: {exc}>"
     return _mask_creds("".join(data.splitlines(keepends=True)[-lines:]))
+
+
+def _tail_log(lines: int = 100) -> str:
+    return _tail_path(LOG_FILE, lines)
 
 
 # --- Flask app ------------------------------------------------------------
@@ -1016,6 +1038,227 @@ def api_panel_restart():
     )
     app.logger.warning("panel self-restart triggered by %s", request.remote_addr)
     return jsonify({"restart": True, "note": "panel restarting in ~1s"}), 202
+
+
+# --- Self-update: проверка и установка обновлений из UI ---------------------
+
+def _http_get(url: str, timeout: float = 6.0) -> str:
+    """GET внешнего URL через curl/wget — как fetch() в install.sh.
+
+    python-urllib на Entware завязан на системный CA-бандл, которого часто
+    нет; curl же был обязателен при установке панели. Оба недоступны/упали —
+    RuntimeError: панель нередко стоит в сетях без прямого хода в GitHub,
+    это штатный отказ, а не авария.
+    """
+    last = ""
+    for cmd in (["curl", "-fsSL", "--max-time", str(int(timeout)), url],
+                ["wget", "-qO-", "-T", str(int(timeout)), url]):
+        try:
+            # cmd — фиксированный шаблон, url передаётся argv-элементом
+            r = subprocess.run(cmd, capture_output=True, text=True,
+                               timeout=timeout + 2)  # nosec B603
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            continue
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout
+        last = f"{cmd[0]}: rc={r.returncode}"
+    raise RuntimeError(f"GET {url} failed ({last or 'curl and wget not found'})")
+
+
+def _ver_key(v: str) -> tuple[int, ...]:
+    """Версия → числовой кортеж для сравнения: 0.10.0 > 0.9.0 (строкой — нет)."""
+    parts: list[int] = []
+    for p in v.strip().lstrip("vV").split("."):
+        m = re.match(r"\d+", p)
+        parts.append(int(m.group()) if m else 0)
+    return tuple(parts) or (0,)
+
+
+def _latest_release() -> dict[str, Any]:
+    """Самый свежий тег репозитория + notes релиза, если тот оформлен.
+
+    `releases/latest` отстаёт от тегов (релиз-ноту создают не под каждый
+    тег), поэтому сверяем и список тегов, выбирая максимум по версии —
+    независимо от порядка, который GitHub API не гарантирует.
+    """
+    rel: dict[str, Any] = {}
+    try:
+        data = json.loads(_http_get(f"{UPDATE_API_BASE}/repos/{UPDATE_REPO}/releases/latest"))
+        tag = data.get("tag_name") or ""
+        if _TAG_RE.match(tag):
+            rel = {"tag": tag,
+                   "notes": (data.get("body") or "").strip()[:4000],
+                   "url": data.get("html_url") or ""}
+    except (RuntimeError, ValueError):
+        pass  # релизов нет или API недоступен — решит список тегов
+    best: str | None = None
+    try:
+        tags = json.loads(_http_get(f"{UPDATE_API_BASE}/repos/{UPDATE_REPO}/tags?per_page=10"))
+        names = (t.get("name") or "" for t in tags if isinstance(t, dict))
+        best = max((n for n in names if _TAG_RE.match(n)),
+                   key=_ver_key, default=None)
+    except (RuntimeError, ValueError) as exc:
+        if not rel:
+            raise RuntimeError(f"cannot reach {UPDATE_API_BASE}: {exc}") from exc
+    if best and (not rel or _ver_key(best) > _ver_key(rel["tag"])):
+        return {"tag": best, "notes": "",
+                "url": f"https://github.com/{UPDATE_REPO}/releases/tag/{best}"}
+    if rel:
+        return rel
+    raise RuntimeError(f"no vX.Y.Z tags/releases found in {UPDATE_REPO}")
+
+
+def _bind_is_loopback() -> bool:
+    host, _ = _parse_bind(PANEL_BIND)
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False  # нераспознанный адрес считаем публичным (fail-closed)
+
+
+def _update_state_read() -> dict[str, Any]:
+    try:
+        st = json.loads(UPDATE_STATE.read_text(encoding="utf-8"))
+        return st if isinstance(st, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _update_state_write(st: dict[str, Any]) -> None:
+    try:
+        UPDATE_STATE.parent.mkdir(parents=True, exist_ok=True)
+        UPDATE_STATE.write_text(json.dumps(st) + "\n", encoding="utf-8")
+    except OSError as exc:  # state не критичен: обновление переживёт и без него
+        app.logger.warning("cannot write %s: %s", UPDATE_STATE, exc)
+
+
+def _update_state() -> dict[str, Any]:
+    """Состояние обновления с самодиагностикой после рестарта панели.
+
+    Успешный апдейт перезапускает панель: новый процесс видит state
+    «running» с целью, равной собственной версии, и закрывает его как
+    «done». Висящий дольше _UPDATE_STALE_S считаем мёртвым (сеть упала).
+    """
+    st = _update_state_read()
+    if st.get("phase") == "running":
+        if str(st.get("target") or "").lstrip("vV") == APP_VERSION:
+            _update_state_write({**st, "phase": "done", "finished": time.time()})
+            st["phase"] = "done"
+        elif time.time() - float(st.get("started") or 0) > _UPDATE_STALE_S:
+            st["stale"] = True
+    return st
+
+
+_update_check_cache: dict[str, Any] = {}
+
+
+@app.route("/api/update/check")
+def api_update_check():
+    """Есть ли свежий релиз: APP_VERSION против тегов GitHub.
+
+    Результат кэшируется на 6ч (?force=1 обходит кэш). Сеть/GitHub
+    недоступны — 200 с полем error и available=false: UI показывает это
+    тихой строкой, а не ошибкой.
+    """
+    force = request.args.get("force") in ("1", "true")
+    now = time.monotonic()
+    if not force and _update_check_cache:
+        if now - _update_check_cache["at"] < _update_check_cache.get("ttl", _UPDATE_CHECK_TTL):
+            out = dict(_update_check_cache["data"])
+            out["cached"] = True
+            return jsonify(out)
+    checked = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    try:
+        rel = _latest_release()
+    except RuntimeError as exc:
+        out = {"current": APP_VERSION, "latest": None, "available": False,
+               "error": str(exc), "checked_at": checked}
+        _update_check_cache.update({"at": now, "ttl": _UPDATE_ERR_TTL, "data": out})
+        return jsonify(out)
+    latest = rel["tag"].lstrip("vV")
+    out = {
+        "current": APP_VERSION,
+        "latest": latest,
+        "available": _ver_key(latest) > _ver_key(APP_VERSION),
+        "notes": rel["notes"],
+        "url": rel["url"],
+        "checked_at": checked,
+    }
+    _update_check_cache.update({"at": now, "ttl": _UPDATE_CHECK_TTL, "data": out})
+    return jsonify(out)
+
+
+@app.route("/api/update/apply", methods=["POST"])
+def api_update_apply():
+    """Запуск обновления: spawn отсоединённого `install.sh --yes --ref <тег>`.
+
+    Установщик скачивает файлы тега, сверяет SHA256SUMS, ставит их и в конце
+    сам делает `S99naivepanel restart` — Flask-процесс умирает посреди
+    установки, поэтому ребёнок живёт в новой сессии (как /api/panel/restart).
+    Реф клиент не передаёт: сервер сам резолвит последний тег. Прокси
+    (S99naiveproxy) установщик не перезапускает — соединения не рвутся.
+    """
+    # Обновление подменяет код панели: без пароля — только loopback-bind
+    if not PANEL_ADMIN_PASS.exists() and not _bind_is_loopback():
+        abort(403, description="panel is exposed without a password — set one "
+                               "(install.sh --with-auth) before updating")
+    state = _update_state()
+    if state.get("phase") == "running" and not state.get("stale"):
+        abort(409, description=f"update to {state.get('target')} already in progress")
+    try:
+        rel = _latest_release()
+    except RuntimeError as exc:
+        abort(502, description=str(exc))
+    tag = rel["tag"]
+    try:
+        installer = _http_get(f"{UPDATE_RAW_BASE}/{UPDATE_REPO}/{tag}/install.sh")
+    except RuntimeError as exc:
+        abort(502, description=f"cannot download install.sh@{tag}: {exc}")
+    try:
+        PANEL_DIR.mkdir(parents=True, exist_ok=True)
+        # бэкап заменяемых файлов — для ручного отката после неудачного апдейта
+        backup = PANEL_DIR / "backup" / f"v{APP_VERSION}"
+        backup.mkdir(parents=True, exist_ok=True)
+        for src in (PANEL_DIR / "naivepanel.py",
+                    PANEL_DIR / "templates" / "index.html",
+                    PANEL_INIT, INIT_SCRIPT):
+            if src.exists():
+                shutil.copy2(src, backup / src.name)
+        stage = PANEL_DIR / ".update-install.sh"
+        stage.write_text(installer, encoding="utf-8")
+        os.chmod(stage, 0o700)
+        UPDATE_LOG.parent.mkdir(parents=True, exist_ok=True)
+        UPDATE_LOG.write_text("", encoding="utf-8")  # лог заново на каждый запуск
+    except OSError as exc:
+        abort(500, description=f"cannot prepare update: {exc}")
+    _update_state_write({"phase": "running", "target": tag, "started": time.time()})
+    # Команда фиксированная, tag и пути передаются argv ($1..$3), а не
+    # интерполяцией в shell-строку; сам tag прошёл _TAG_RE.
+    subprocess.Popen(  # nosec B603
+        ["/bin/sh", "-c", 'exec /bin/sh "$1" --yes --ref "$2" >>"$3" 2>&1',
+         "sh", str(stage), tag, str(UPDATE_LOG)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    app.logger.warning("self-update to %s triggered by %s", tag, request.remote_addr)
+    return jsonify({"started": True, "target": tag, "current": APP_VERSION,
+                    "log": str(UPDATE_LOG)}), 202
+
+
+@app.route("/api/update/log")
+def api_update_log():
+    """Tail лога установщика + текущий state (UI поллит во время апдейта)."""
+    try:
+        lines = int(request.args.get("lines", "60"))
+    except ValueError:
+        lines = 60
+    resp = jsonify({"lines": lines,
+                    "content": _tail_path(UPDATE_LOG, lines),
+                    "state": _update_state()})
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 @app.route("/api/logs")

@@ -23,7 +23,9 @@
 
 set -u
 
-REPO="keenetic-tools/naivepanel"
+# NAIVEPANEL_REPO: переопределение репозитория (зеркала, e2e-тесты с локальным
+# сервером). Панель при self-update передаёт его в окружение потомку.
+REPO="${NAIVEPANEL_REPO:-keenetic-tools/naivepanel}"
 REF="v0.6.1"
 BIND=""
 HOSTS=""
