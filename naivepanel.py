@@ -1159,18 +1159,40 @@ def _update_state_write(st: dict[str, Any]) -> None:
         app.logger.warning("cannot write %s: %s", UPDATE_STATE, exc)
 
 
+def _pid_alive(pid: Any) -> bool:
+    """Жив ли процесс установщика (pid пишем в state с v0.8.1)."""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False  # pid нет (state от версии до v0.8.1) — считаем мёртвым
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # существует, но чужой — на роутере один пользователь
+    return True
+
+
 def _update_state() -> dict[str, Any]:
     """Состояние обновления с самодиагностикой после рестарта панели.
 
     Успешный апдейт перезапускает панель: новый процесс видит state
     «running» с целью, равной собственной версии, и закрывает его как
-    «done». Висящий дольше _UPDATE_STALE_S считаем мёртвым (сеть упала).
+    «done». Умерший установщик (сеть/checksum/диск) распознаём по pid —
+    state помечается «failed» и не блокирует retry фиктивным
+    «already in progress». Записи без pid протухают через _UPDATE_STALE_S.
     """
     st = _update_state_read()
     if st.get("phase") == "running":
         if str(st.get("target") or "").lstrip("vV") == APP_VERSION:
             _update_state_write({**st, "phase": "done", "finished": time.time()})
             st["phase"] = "done"
+        elif not _pid_alive(st.get("pid")):
+            st["phase"] = "failed"
+            _update_state_write(st)
         elif time.time() - float(st.get("started") or 0) > _UPDATE_STALE_S:
             st["stale"] = True
     return st
@@ -1231,7 +1253,8 @@ def api_update_apply():
                                "(install.sh --with-auth) before updating")
     state = _update_state()
     if state.get("phase") == "running" and not state.get("stale"):
-        abort(409, description=f"update to {state.get('target')} already in progress")
+        abort(409, description=f"update to {state.get('target')} already in "
+                               f"progress — installer log: {UPDATE_LOG}")
     try:
         rel = _latest_release()
     except RuntimeError as exc:
@@ -1258,15 +1281,18 @@ def api_update_apply():
         UPDATE_LOG.write_text("", encoding="utf-8")  # лог заново на каждый запуск
     except OSError as exc:
         abort(500, description=f"cannot prepare update: {exc}")
-    _update_state_write({"phase": "running", "target": tag, "started": time.time()})
     # Команда фиксированная, tag и пути передаются argv ($1..$3), а не
     # интерполяцией в shell-строку; сам tag прошёл _TAG_RE.
-    subprocess.Popen(  # nosec B603
+    proc = subprocess.Popen(  # nosec B603
         ["/bin/sh", "-c", 'exec /bin/sh "$1" --yes --ref "$2" >>"$3" 2>&1',
          "sh", str(stage), tag, str(UPDATE_LOG)],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
+    # pid в state: умерший установщик распознаётся при следующем же запросе,
+    # а не через 15 минут (_update_state помечает такой state «failed»)
+    _update_state_write({"phase": "running", "target": tag,
+                         "started": time.time(), "pid": proc.pid})
     app.logger.warning("self-update to %s triggered by %s", tag, request.remote_addr)
     return jsonify({"started": True, "target": tag, "current": APP_VERSION,
                     "log": str(UPDATE_LOG)}), 202

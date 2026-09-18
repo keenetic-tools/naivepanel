@@ -8,6 +8,7 @@ import importlib
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 import types
@@ -912,11 +913,28 @@ def test_apply_spawns_installer_and_backs_up(client, app, env, monkeypatch):
 
 def test_apply_concurrent_returns_409(client, app, env, monkeypatch):
     _apply_stub(env, monkeypatch, app)
-    assert client.post("/api/update/apply", headers=CSRF).status_code == 202
-    # state «running» (цель v9.9.9 ≠ текущая версия — сам не закроется)
+    # state «running» с ЖИВЫМ установщиком (свой pid в его роли): цель
+    # v9.9.9 ≠ текущая версия — сам не закроется
+    app._update_state_write({"phase": "running", "target": "v9.9.9",
+                             "started": time.time(), "pid": os.getpid()})
     r = client.post("/api/update/apply", headers=CSRF)
     assert r.status_code == 409
     assert "in progress" in r.get_json()["error"]
+
+
+def _dead_pid():
+    """pid завершившегося процесса — гарантированно мёртвый."""
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    proc.wait()
+    return proc.pid
+
+
+def test_apply_retry_allowed_after_installer_dies(client, app, env, monkeypatch):
+    _apply_stub(env, monkeypatch, app)
+    # установщик умер, не обновив панель: retry разрешён сразу, без 15 минут
+    app._update_state_write({"phase": "running", "target": "v9.9.9",
+                             "started": time.time(), "pid": _dead_pid()})
+    assert client.post("/api/update/apply", headers=CSRF).status_code == 202
 
 
 def test_apply_refuses_exposed_panel_without_password(client, app, monkeypatch):
@@ -969,9 +987,19 @@ def test_update_state_reconciles_after_restart(app):
 
 def test_update_state_marks_stale(app):
     old = time.time() - app._UPDATE_STALE_S - 1
-    app._update_state_write({"phase": "running", "target": "v0.0.1", "started": old})
+    # живой (по pid) установщик без прогресса дольше 15 минут → stale
+    app._update_state_write({"phase": "running", "target": "v0.0.1",
+                             "started": old, "pid": os.getpid()})
     st = app._update_state()
     assert st.get("stale") is True  # зависший апдейт больше не блокирует apply
+
+
+def test_update_state_marks_failed_when_installer_dead(app):
+    app._update_state_write({"phase": "running", "target": "v0.0.1",
+                             "started": time.time(), "pid": _dead_pid()})
+    st = app._update_state()
+    assert st["phase"] == "failed"
+    assert json.loads(app.UPDATE_STATE.read_text())["phase"] == "failed"
 
 
 def test_bind_is_loopback_variants(app):

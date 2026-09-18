@@ -48,10 +48,12 @@ warn() { echo "WARN: $*" >&2; }
 die()  { echo "ERROR: $*" >&2; exit 1; }
 
 fetch() {  # $1=url -> stdout
+    # таймауты обязательны: self-update из панели крутит этот скрипт в фоне,
+    # и зависший curl оставлял бы update.state «running» до протухания
     if command -v curl >/dev/null 2>&1; then
-        curl -fsSL "$1" || die "download failed: $1"
+        curl -fsSL --connect-timeout 15 --retry 2 "$1" || die "download failed: $1"
     elif command -v wget >/dev/null 2>&1; then
-        wget -qO- "$1" || die "download failed: $1"
+        wget -q -T 30 -t 2 -O- "$1" || die "download failed: $1"
     else
         die "need curl or wget (opkg install curl)"
     fi
