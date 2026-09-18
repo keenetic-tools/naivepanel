@@ -937,6 +937,20 @@ def test_apply_retry_allowed_after_installer_dies(client, app, env, monkeypatch)
     assert client.post("/api/update/apply", headers=CSRF).status_code == 202
 
 
+def test_apply_spawn_failure_is_visible_and_leaves_no_state(client, app, env, monkeypatch):
+    _apply_stub(env, monkeypatch, app)
+
+    def boom(*args, **kwargs):
+        raise OSError(12, "Cannot allocate memory")
+
+    monkeypatch.setattr(app.subprocess, "Popen", boom)
+    r = client.post("/api/update/apply", headers=CSRF)
+    assert r.status_code == 500
+    assert "cannot spawn installer" in r.get_json()["error"]
+    # state не должен остаться «running» без процесса (ловушка v0.7.0)
+    assert not app.UPDATE_STATE.exists()
+
+
 def test_apply_refuses_exposed_panel_without_password(client, app, monkeypatch):
     app.PANEL_BIND = "192.168.1.1:8089"  # admin.pass не существует (fixture)
     monkeypatch.setattr(app, "_latest_release",

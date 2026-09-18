@@ -1283,12 +1283,17 @@ def api_update_apply():
         abort(500, description=f"cannot prepare update: {exc}")
     # Команда фиксированная, tag и пути передаются argv ($1..$3), а не
     # интерполяцией в shell-строку; сам tag прошёл _TAG_RE.
-    proc = subprocess.Popen(  # nosec B603
-        ["/bin/sh", "-c", 'exec /bin/sh "$1" --yes --ref "$2" >>"$3" 2>&1',
-         "sh", str(stage), tag, str(UPDATE_LOG)],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
+    try:
+        proc = subprocess.Popen(  # nosec B603
+            ["/bin/sh", "-c", 'exec /bin/sh "$1" --yes --ref "$2" >>"$3" 2>&1',
+             "sh", str(stage), tag, str(UPDATE_LOG)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        # v0.7.0 писал state до спавна: ошибка fork/exec (ENOMEM на тесной
+        # памяти роутера) оставляла «running» без процесса и с пустым логом
+        abort(500, description=f"cannot spawn installer: {exc}")
     # pid в state: умерший установщик распознаётся при следующем же запросе,
     # а не через 15 минут (_update_state помечает такой state «failed»)
     _update_state_write({"phase": "running", "target": tag,
