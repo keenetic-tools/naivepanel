@@ -1009,3 +1009,62 @@ def test_install_sh_repo_override_present(app):
     # одним NAIVEPANEL_REPO и для панели, и для установщика
     text = (APP_DIR / "install.sh").read_text(encoding="utf-8")
     assert 'NAIVEPANEL_REPO:-keenetic-tools/naivepanel' in text
+
+
+# --- периодическая обрезка логов ------------------------------------------------------
+
+def test_trim_oversized_log_keeps_tail_and_inode(env, monkeypatch):
+    monkeypatch.setenv("NAIVEPANEL_LOG_MAX", "100")
+    monkeypatch.setenv("NAIVEPANEL_LOG_KEEP", "30")
+    m = _reload()
+    log = m.LOG_FILE
+    log.write_bytes(b"123456789\n" * 12)  # 120 байт (строки по 10) > лимита
+    inode = log.stat().st_ino
+    trimmed = m._trim_logs_once()
+    # хвост 30 байт = 3 строки; первая срезана как обрубок → 2 полные строки
+    assert [(p, was, now) for p, was, now in trimmed] == [(log, 120, 20)]
+    assert log.read_bytes() == b"123456789\n123456789\n"
+    # инод сохранён: пишущий процесс (naive с append-fd) не теряет файл
+    assert log.stat().st_ino == inode
+
+
+def test_trim_skips_small_and_missing_logs(env, monkeypatch):
+    monkeypatch.setenv("NAIVEPANEL_LOG_MAX", "1000")
+    m = _reload()
+    m.LOG_FILE.write_bytes(b"short\n")
+    # PANEL_LOG/UPDATE_LOG не существуют — не ошибка, просто пропускаем
+    assert m._trim_logs_once() == []
+    assert m.LOG_FILE.read_bytes() == b"short\n"
+
+
+def test_trim_covers_log_file_from_active_config(env, monkeypatch):
+    monkeypatch.setenv("NAIVEPANEL_LOG_MAX", "10")
+    monkeypatch.setenv("NAIVEPANEL_LOG_KEEP", "4")
+    m = _reload()
+    extra = env / "naive-own.log"
+    extra.write_text("".join(f"line{i:03d}\n" for i in range(20)),
+                     encoding="utf-8")
+    m.ACTIVE_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    m.ACTIVE_CONFIG.write_text(
+        json.dumps({"listen": "socks://127.0.0.1:1080", "log": str(extra)}),
+        encoding="utf-8")
+    trimmed = m._trim_logs_once()
+    assert [p for p, _, _ in trimmed] == [extra]
+    assert extra.stat().st_size <= 4
+
+
+def test_trim_disabled_with_zero_max(env, monkeypatch):
+    monkeypatch.setenv("NAIVEPANEL_LOG_MAX", "0")
+    m = _reload()
+    m.LOG_FILE.write_bytes(b"x" * 10000)
+    assert m._trim_logs_once() == []
+    assert m.LOG_FILE.stat().st_size == 10000
+
+
+def test_trim_invalid_settings_fall_back_to_defaults(env, monkeypatch):
+    monkeypatch.setenv("NAIVEPANEL_LOG_MAX", "5MB")
+    monkeypatch.setenv("NAIVEPANEL_LOG_KEEP", "-")
+    m = _reload()
+    assert m._LOG_MAX_INVALID and m._LOG_KEEP_INVALID
+    assert m.LOG_TRIM_MAX == 5242880
+    assert m.LOG_TRIM_KEEP == 524288

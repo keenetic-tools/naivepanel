@@ -358,6 +358,14 @@ if [ ! -f "$PANEL_CONF" ]; then
 #NAIVEPROXY_INIT="/opt/etc/init.d/S99naiveproxy"
 #NAIVEPROXY_LOG="/opt/var/log/naiveproxy.log"
 #NAIVEPROXY_PID="/opt/var/run/naiveproxy.pid"
+
+# Log trimming: a background thread in the panel checks known logs hourly
+# and trims files over NAIVEPANEL_LOG_MAX bytes down to the last
+# NAIVEPANEL_LOG_KEEP bytes (same 5M threshold as init scripts).
+# NAIVEPANEL_LOG_MAX=0 disables trimming entirely.
+#NAIVEPANEL_LOG="/opt/var/log/naivepanel.log"
+#NAIVEPANEL_LOG_MAX="5242880"
+#NAIVEPANEL_LOG_KEEP="524288"
 EOF
     chmod 0644 "$PANEL_CONF"
     info "created $PANEL_CONF (settings template — uncomment what you need)"

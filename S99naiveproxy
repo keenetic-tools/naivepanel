@@ -23,10 +23,13 @@ LOGFILE=/opt/var/log/naiveproxy.log
 log()  { logger -t naiveproxy "$@"; echo "$@"; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
-# грубая ротация: лог аппендится без ограничений, не даём разрастись на USB
+# грубая ротация при старте: пока сервис работает, лог аппендится без
+# ограничений; между рестартами его периодически обрезает NaivePanel
+# (фоновый поток, тот же порог 5M). Размер берём stat'ом: busybox wc -c
+# читает файл целиком — на гигабайтном логе старт висел бы минутами.
 truncate_log() {
     [ -f "$LOGFILE" ] || return 0
-    if [ "$(wc -c <"$LOGFILE")" -gt 5242880 ]; then
+    if [ "$(stat -c %s "$LOGFILE" 2>/dev/null || echo 0)" -gt 5242880 ]; then
         : > "$LOGFILE"
         log "truncated oversized $LOGFILE (>5M)"
     fi

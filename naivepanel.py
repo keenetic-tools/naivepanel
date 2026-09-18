@@ -22,6 +22,7 @@ import shutil
 import socket
 # subprocess вызывается только с фиксированными argv-списками (shell=False)
 import subprocess  # nosec B404
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -46,6 +47,7 @@ CONF_KEYS = frozenset({
     "NAIVEPANEL_BIND", "NAIVEPANEL_HOSTS", "NAIVEPANEL_PASS",
     "NAIVEPROXY_DIR", "NAIVEPROXY_INIT", "NAIVEPROXY_LOG", "NAIVEPROXY_PID",
     "NAIVEPANEL_INIT", "NAIVEPANEL_THREADS",
+    "NAIVEPANEL_LOG", "NAIVEPANEL_LOG_MAX", "NAIVEPANEL_LOG_KEEP",
 })
 
 _CONF_SKIPPED: list[str] = []
@@ -104,6 +106,29 @@ except (TypeError, ValueError):
     _THREADS_INVALID = True
 else:
     _THREADS_INVALID = False
+
+# --- Периодическая обрезка логов -------------------------------------------
+# Логи аппендятся без ограничений всё время, пока сервисы работают;
+# init-скрипты обрезают их только при старте (см. инцидент с разросшимся
+# /opt/var/log/naiveproxy.log на полный раздел entware). Панель и так
+# крутится 24/7 — фоновый поток раз в час проверяет известные логи и у
+# больших оставляет только хвост. NAIVEPANEL_LOG_MAX=0 отключает обрезку.
+PANEL_LOG = Path(os.environ.get("NAIVEPANEL_LOG", "/opt/var/log/naivepanel.log"))
+LOG_TRIM_INTERVAL = 3600.0
+_LOG_MAX_RAW = os.environ.get("NAIVEPANEL_LOG_MAX", "5242880") or "5242880"
+_LOG_KEEP_RAW = os.environ.get("NAIVEPANEL_LOG_KEEP", "524288") or "524288"
+
+
+def _int_or_default(raw: str, default: int) -> tuple[int, bool]:
+    try:
+        return max(0, int(raw)), False
+    except (TypeError, ValueError):
+        return default, True
+
+
+# 5 МБ — тот же порог, что у truncate_log в init-скриптах; хвост 512 КБ
+LOG_TRIM_MAX, _LOG_MAX_INVALID = _int_or_default(_LOG_MAX_RAW, 5242880)
+LOG_TRIM_KEEP, _LOG_KEEP_INVALID = _int_or_default(_LOG_KEEP_RAW, 524288)
 
 # --- Self-update: репозиторий и пути ---------------------------------------
 # Обновление из UI повторяет ручной флоу `install.sh --yes`: панель лишь
@@ -1272,6 +1297,87 @@ def api_logs():
     return resp
 
 
+# --- Периодическая обрезка логов (фоновый поток) ---------------------------
+
+
+def _active_extra_log() -> Path | None:
+    """Путь к log-файлу из активного config.json (ключ `log` у naive).
+
+    Пресет может задавать naive собственный файл лога — его никто, кроме
+    панели, не знает: init-скрипт обрезает только /opt/var/log/naiveproxy.log.
+    """
+    try:
+        cfg = json.loads(ACTIVE_CONFIG.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    extra = cfg.get("log")
+    if isinstance(extra, str) and extra.strip():
+        return Path(extra)
+    return None
+
+
+def _trim_file(path: Path, max_bytes: int, keep: int) -> tuple[int, int] | None:
+    """Обрезает файл до последних `keep` байт; возвращает (было, стало).
+
+    Инод обязан сохраняться (r+b + truncate, не replace/rename): пишущий
+    процесс держит файл открытым в append-режиме — при rename он продолжил
+    бы писать в отсоединённый старый инод, и место не освободилось бы до
+    рестарта. Строки, добавленные между чтением хвоста и truncate,
+    теряются — для лога допустимо.
+    """
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return None
+    if size <= max_bytes:
+        return None
+    keep = min(keep, size)
+    try:
+        with path.open("r+b") as fh:
+            fh.seek(size - keep)
+            tail = fh.read(keep)
+            nl = tail.find(b"\n")
+            if nl != -1:
+                tail = tail[nl + 1:]  # хвост не должен начинаться с обрубка строки
+            fh.seek(0)
+            fh.write(tail)
+            fh.truncate()
+            fh.flush()
+            os.fsync(fh.fileno())
+    except OSError as exc:
+        app.logger.warning("log trim %s: %s", path, exc)
+        return None
+    return size, len(tail)
+
+
+def _trim_logs_once() -> list[tuple[Path, int, int]]:
+    """Один проход по всем известным логам; возвращает обрезанные (путь, было, стало)."""
+    if LOG_TRIM_MAX <= 0:
+        return []
+    targets: set[Path] = {LOG_FILE, PANEL_LOG, UPDATE_LOG}
+    extra = _active_extra_log()
+    if extra:
+        targets.add(extra)
+    trimmed: list[tuple[Path, int, int]] = []
+    for path in sorted(targets):
+        result = _trim_file(path, LOG_TRIM_MAX, LOG_TRIM_KEEP)
+        if result:
+            trimmed.append((path, *result))
+    return trimmed
+
+
+def _log_trim_loop() -> None:
+    # daemon-поток: переживает рестарт панели вместе с процессом; каждая
+    # итерация под try, чтобы поток не умер из-за неожиданной ошибки
+    while True:
+        try:
+            for path, was, now in _trim_logs_once():
+                app.logger.info("trimmed %s: %d -> %d bytes", path, was, now)
+        except Exception:  # триммер не должен ронять поток целиком
+            app.logger.warning("log trim cycle failed", exc_info=True)
+        time.sleep(LOG_TRIM_INTERVAL)
+
+
 # --- Main -----------------------------------------------------------------
 
 
@@ -1296,6 +1402,20 @@ def _serve(application: Flask, host: str, port: int) -> None:
 
 if __name__ == "__main__":
     _ensure_dirs()
+    if _LOG_MAX_INVALID:
+        app.logger.warning(
+            "NAIVEPANEL_LOG_MAX=%r is not a number — using %d",
+            _LOG_MAX_RAW, LOG_TRIM_MAX,
+        )
+    if _LOG_KEEP_INVALID:
+        app.logger.warning(
+            "NAIVEPANEL_LOG_KEEP=%r is not a number — using %d",
+            _LOG_KEEP_RAW, LOG_TRIM_KEEP,
+        )
+    if LOG_TRIM_MAX > 0:
+        threading.Thread(
+            target=_log_trim_loop, name="log-trim", daemon=True
+        ).start()
     host, port = _parse_bind(PANEL_BIND)
     # host берётся из env/panel.conf: предупреждаем только для unspecified
     # адресов (0.0.0.0 / ::) — фактического bind здесь нет.

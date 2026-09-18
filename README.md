@@ -191,6 +191,11 @@ NAIVEPANEL_HOSTS="192.168.1.1:8089,router.local:8089"
 #NAIVEPROXY_LOG="/opt/var/log/naiveproxy.log"
 #NAIVEPROXY_PID="/opt/var/run/naiveproxy.pid"
 #NAIVEPANEL_THREADS="4"
+# Логи: фоновый поток панели раз в час обрезает файлы больше NAIVEPANEL_LOG_MAX
+# до последних NAIVEPANEL_LOG_KEEP байт (0 в NAIVEPANEL_LOG_MAX отключает обрезку)
+#NAIVEPANEL_LOG="/opt/var/log/naivepanel.log"
+#NAIVEPANEL_LOG_MAX="5242880"
+#NAIVEPANEL_LOG_KEEP="524288"
 ```
 
 Приоритет: **env > panel.conf > встроенный дефолт** — переменные окружения
@@ -202,6 +207,20 @@ NAIVEPANEL_HOSTS="192.168.1.1:8089,router.local:8089"
 файла. Историческая схема с `/opt/etc/init.d/rc.conf` не работала (файл никто
 не читал) — установщик, начиная с v0.4.1, переносит найденные там
 `NAIVEPANEL_BIND/HOSTS` в `panel.conf`.
+
+### Ротация логов
+
+Логи аппендятся без ограничений всё время, пока сервисы работают, а раздел
+entware на роутере маленький — разросшийся `/opt/var/log/naiveproxy.log`
+умеет заполнить его целиком (после чего ни naive, ни панель не стартуют).
+Поэтому панель фоновым потоком раз в час проверяет все известные логи:
+`naiveproxy.log`, `naivepanel.log`, `naivepanel-update.log` и log-файл из
+ключа `log` активного пресета. Файлы больше `NAIVEPANEL_LOG_MAX` (по умолчанию
+5 МБ, как в init-скриптах) обрезаются до последних `NAIVEPANEL_LOG_KEEP` байт
+(512 КБ). Инод файла сохраняется — работающий naive продолжает писать в тот же
+файл, место освобождается сразу. Init-скрипты дополнительно обнуляют слишком
+большой лог при старте: страховка на случай, если панель остановлена, а прокси
+работает. `NAIVEPANEL_LOG_MAX=0` отключает обрезку.
 
 ### Установка бинарника naive
 
