@@ -16,6 +16,9 @@
 #   --bind HOST:PORT     write NAIVEPANEL_BIND to /opt/etc/naive/panel/panel.conf
 #   --hosts LIST         write NAIVEPANEL_HOSTS to /opt/etc/naive/panel/panel.conf
 #   --ref TAG            git tag/ref to install (default: v0.9.0)
+#   --from-update        internal: spawned by the panel's self-update —
+#                        skips python/deps checks (the running panel already
+#                        proves they work; their forks die on tight router RAM)
 #   --no-naive-init      do not install S99naiveproxy init script
 #   --yes                non-interactive (no confirmation prompt)
 #   --uninstall          stop services and remove installed files
@@ -30,6 +33,7 @@ REF="v0.9.0"
 BIND=""
 HOSTS=""
 WITH_AUTH=0
+FROM_UPDATE=0
 NO_NAIVE_INIT=0
 YES=0
 UNINSTALL=0
@@ -67,6 +71,7 @@ Usage: install.sh [flags]
   --bind HOST:PORT     write NAIVEPANEL_BIND to /opt/etc/naive/panel/panel.conf
   --hosts LIST         write NAIVEPANEL_HOSTS to /opt/etc/naive/panel/panel.conf
   --ref TAG            git tag/ref to install (default: v0.9.0)
+  --from-update        internal: spawned by self-update, skips python checks
   --no-naive-init      do not install S99naiveproxy init script
   --yes                non-interactive (no confirmation prompt)
   --uninstall          stop services and remove installed files
@@ -105,6 +110,7 @@ conf_upsert() {  # $1=KEY $2=value — обновить ключ, остальн
 while [ $# -gt 0 ]; do
     case "$1" in
         --with-auth)      WITH_AUTH=1 ;;
+        --from-update)    FROM_UPDATE=1 ;;
         --no-naive-init)  NO_NAIVE_INIT=1 ;;
         --yes)            YES=1 ;;
         --uninstall)      UNINSTALL=1 ;;
@@ -211,51 +217,61 @@ fi
 # well), so on an opkg system never settle for a system python3.
 PYTHON=/opt/bin/python3
 [ -x "$PYTHON" ] || PYTHON=/opt/bin/python
-if [ ! -x "$PYTHON" ] && command -v opkg >/dev/null 2>&1; then
-    info "Entware python3 missing — installing via opkg"
-    opkg update >/dev/null
-    opkg install python3 || die "opkg install python3 failed"
-    PYTHON=/opt/bin/python3
-    [ -x "$PYTHON" ] || PYTHON=/opt/bin/python
-fi
-[ -x "$PYTHON" ] || PYTHON=$(command -v python3 2>/dev/null || echo python3)
 
-if ! "$PYTHON" -c 'import sys; sys.exit(0 if sys.version_info >= (3,10) else 1)' 2>/dev/null; then
-    info "python3 >= 3.10 missing — installing via opkg"
-    opkg update >/dev/null
-    opkg install python3 || die "opkg install python3 failed"
-    PYTHON=/opt/bin/python3
-    [ -x "$PYTHON" ] || PYTHON=/opt/bin/python
-fi
-
-info "python: $("$PYTHON" -V 2>&1)"
-
-if ! "$PYTHON" -c 'import flask' 2>/dev/null; then
-    info "flask missing — installing via opkg"
-    opkg update >/dev/null
-    # some Entware targets (e.g. aarch64-k3.10) ship no python3-flask package
-    if ! opkg install python3-flask 2>/dev/null; then
-        warn "python3-flask unavailable via opkg — falling back to pip"
-        opkg install python3-pip || die "opkg install python3-pip failed"
-        /opt/bin/pip3 install --no-cache-dir flask || die "pip install flask failed"
-    fi
-fi
-
-if ! "$PYTHON" -c 'import waitress' 2>/dev/null; then
-    info "waitress missing — installing via opkg"
-    opkg update >/dev/null
-    if ! opkg install python3-waitress 2>/dev/null; then
-        warn "python3-waitress unavailable via opkg — falling back to pip"
-        opkg install python3-pip || die "opkg install python3-pip failed"
-        /opt/bin/pip3 install --no-cache-dir waitress || warn "pip install waitress failed"
-    fi
-fi
-
-if [ "$WITH_AUTH" = 1 ]; then
-    if ! "$PYTHON" -c 'import bcrypt' 2>/dev/null; then
-        info "python3-bcrypt missing — installing via opkg"
+if [ "$FROM_UPDATE" = 1 ]; then
+    # Проверки ниже трижды форкают python, чтобы убедиться в том, что уже
+    # доказано самим фактом работы панели, из которой мы запущены. На тесной
+    # памяти роутера (naive + панель) именно эти форки — самое вероятное
+    # место тихой смерти фонового обновления (кейс v0.9.0).
+    [ -x "$PYTHON" ] || PYTHON=$(command -v python3 2>/dev/null || echo python3)
+    info "python/deps checks skipped (--from-update)"
+else
+    if [ ! -x "$PYTHON" ] && command -v opkg >/dev/null 2>&1; then
+        info "Entware python3 missing — installing via opkg"
         opkg update >/dev/null
-        opkg install python3-bcrypt || warn "python3-bcrypt unavailable via opkg (fallback: pip install bcrypt)"
+        opkg install python3 || die "opkg install python3 failed"
+        PYTHON=/opt/bin/python3
+        [ -x "$PYTHON" ] || PYTHON=/opt/bin/python
+    fi
+    [ -x "$PYTHON" ] || PYTHON=$(command -v python3 2>/dev/null || echo python3)
+
+    if ! "$PYTHON" -c 'import sys; sys.exit(0 if sys.version_info >= (3,10) else 1)' 2>/dev/null; then
+        info "python3 >= 3.10 missing — installing via opkg"
+        opkg update >/dev/null
+        opkg install python3 || die "opkg install python3 failed"
+        PYTHON=/opt/bin/python3
+        [ -x "$PYTHON" ] || PYTHON=/opt/bin/python
+    fi
+
+    info "python: $("$PYTHON" -V 2>&1)"
+
+    if ! "$PYTHON" -c 'import flask' 2>/dev/null; then
+        info "flask missing — installing via opkg"
+        opkg update >/dev/null
+        # some Entware targets (e.g. aarch64-k3.10) ship no python3-flask package
+        if ! opkg install python3-flask 2>/dev/null; then
+            warn "python3-flask unavailable via opkg — falling back to pip"
+            opkg install python3-pip || die "opkg install python3-pip failed"
+            /opt/bin/pip3 install --no-cache-dir flask || die "pip install flask failed"
+        fi
+    fi
+
+    if ! "$PYTHON" -c 'import waitress' 2>/dev/null; then
+        info "waitress missing — installing via opkg"
+        opkg update >/dev/null
+        if ! opkg install python3-waitress 2>/dev/null; then
+            warn "python3-waitress unavailable via opkg — falling back to pip"
+            opkg install python3-pip || die "opkg install python3-pip failed"
+            /opt/bin/pip3 install --no-cache-dir waitress || warn "pip install waitress failed"
+        fi
+    fi
+
+    if [ "$WITH_AUTH" = 1 ]; then
+        if ! "$PYTHON" -c 'import bcrypt' 2>/dev/null; then
+            info "python3-bcrypt missing — installing via opkg"
+            opkg update >/dev/null
+            opkg install python3-bcrypt || warn "python3-bcrypt unavailable via opkg (fallback: pip install bcrypt)"
+        fi
     fi
 fi
 

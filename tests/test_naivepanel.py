@@ -926,11 +926,18 @@ def test_apply_spawns_installer_and_backs_up(client, app, env, monkeypatch):
     # state зафиксировал «running» с целью
     st = json.loads(app.UPDATE_STATE.read_text())
     assert st["phase"] == "running" and st["target"] == "v9.9.9"
+    # пролог панелью: даже умерший до первой строки установщик оставит след
+    assert app.UPDATE_LOG.read_text().startswith("== self-update")
     for _ in range(50):  # установщик spawn'ится отсоединённо — ждём маркер
         if marker.exists():
             break
         time.sleep(0.1)
-    assert "--yes --ref v9.9.9" in marker.read_text()
+    assert "--yes --from-update --ref v9.9.9" in marker.read_text()
+    for _ in range(50):  # обёртка дожидается и дописывает exit-код в лог
+        if "installer exit code" in app.UPDATE_LOG.read_text():
+            break
+        time.sleep(0.1)
+    assert "installer exit code: 0" in app.UPDATE_LOG.read_text()
 
 
 def test_apply_concurrent_returns_409(client, app, env, monkeypatch):
@@ -971,6 +978,25 @@ def test_apply_spawn_failure_is_visible_and_leaves_no_state(client, app, env, mo
     assert "cannot spawn installer" in r.get_json()["error"]
     # state не должен остаться «running» без процесса (ловушка v0.7.0)
     assert not app.UPDATE_STATE.exists()
+
+
+def test_apply_wrapper_records_installer_exit_code(client, app, env, monkeypatch):
+    # тихая смерть установщика (OOM при exec, кейс v0.9.0) оставляла пустой
+    # лог — обёртка спавна обязана дописать exit-код даже при ненулевом rc
+    _apply_stub(env, monkeypatch, app)
+
+    def failing_install(url, timeout=6.0):
+        return '#!/bin/sh\nexit 3\n'
+
+    monkeypatch.setattr(app, "_http_get", failing_install)
+    r = client.post("/api/update/apply", headers=CSRF)
+    assert r.status_code == 202
+    for _ in range(50):
+        log = app.UPDATE_LOG.read_text()
+        if "installer exit code" in log:
+            break
+        time.sleep(0.1)
+    assert "installer exit code: 3" in app.UPDATE_LOG.read_text()
 
 
 def test_apply_refuses_exposed_panel_without_password(client, app, monkeypatch):
@@ -1085,6 +1111,15 @@ def test_install_sh_repo_override_present(app):
     # одним NAIVEPANEL_REPO и для панели, и для установщика
     text = (APP_DIR / "install.sh").read_text(encoding="utf-8")
     assert 'NAIVEPANEL_REPO:-keenetic-tools/naivepanel' in text
+
+
+def test_install_sh_from_update_skips_python_checks(app):
+    # self-update не должен форкать python ради проверок того, что уже
+    # доказано работающей панелью (тесная память роутера, кейс v0.9.0)
+    text = (APP_DIR / "install.sh").read_text(encoding="utf-8")
+    assert '--from-update)    FROM_UPDATE=1 ;;' in text
+    assert 'FROM_UPDATE" = 1' in text
+    assert 'checks skipped (--from-update)' in text
 
 
 # --- периодическая обрезка логов ------------------------------------------------------

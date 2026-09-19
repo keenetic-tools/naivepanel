@@ -1235,7 +1235,8 @@ def api_update_check():
 
 @app.route("/api/update/apply", methods=["POST"])
 def api_update_apply():
-    """Запуск обновления: spawn отсоединённого `install.sh --yes --ref <тег>`.
+    """Запуск обновления: spawn отсоединённого `install.sh --yes --from-update
+    --ref <тег>` с записью exit-кода установщика в лог.
 
     Установщик скачивает файлы тега, сверяет SHA256SUMS, ставит их и в конце
     сам делает `S99naivepanel restart` — Flask-процесс умирает посреди
@@ -1257,7 +1258,8 @@ def api_update_apply():
         abort(502, description=str(exc))
     tag = rel["tag"]
     try:
-        installer = _http_get(f"{UPDATE_RAW_BASE}/{UPDATE_REPO}/{tag}/install.sh")
+        installer = _http_get(f"{UPDATE_RAW_BASE}/{UPDATE_REPO}/{tag}/install.sh",
+                              timeout=30.0)
     except RuntimeError as exc:
         abort(502, description=f"cannot download install.sh@{tag}: {exc}")
     try:
@@ -1274,14 +1276,27 @@ def api_update_apply():
         stage.write_text(installer, encoding="utf-8")
         os.chmod(stage, 0o700)
         UPDATE_LOG.parent.mkdir(parents=True, exist_ok=True)
-        UPDATE_LOG.write_text("", encoding="utf-8")  # лог заново на каждый запуск
+        # Пролог панелью, а не установщиком: реальный кейс (v0.9.0, роутер) —
+        # ребёнок умер до первой строки скрипта (OOM при exec) и лог остался
+        # пустым, ничего не отличалось от «лог не создан». Теперь пустой лог
+        # после пролога сам по себе диагноз.
+        UPDATE_LOG.write_text(
+            f"== self-update {APP_VERSION} -> {tag}, "
+            f"spawn {time.strftime('%Y-%m-%d %H:%M:%S')}\n",
+            encoding="utf-8")
     except OSError as exc:
         abort(500, description=f"cannot prepare update: {exc}")
     # Команда фиксированная, tag и пути передаются argv ($1..$3), а не
-    # интерполяцией в shell-строку; сам tag прошёл _TAG_RE.
+    # интерполяцией в shell-строку; сам tag прошёл _TAG_RE. Обёртка без
+    # exec дожидается установщика и дописывает его exit-код в лог —
+    # мгновенная тихая смерть (OOM: rc=137) перестаёт быть невидимой.
+    # --from-update: python/flask уже подняты самим фактом работы панели —
+    # установщик пропускает их проверки и не форкает python на тесной памяти.
     try:
         proc = subprocess.Popen(  # nosec B603
-            ["/bin/sh", "-c", 'exec /bin/sh "$1" --yes --ref "$2" >>"$3" 2>&1',
+            ["/bin/sh", "-c",
+             '/bin/sh "$1" --yes --from-update --ref "$2" >>"$3" 2>&1; '
+             'rc=$?; echo "installer exit code: $rc" >>"$3"',
              "sh", str(stage), tag, str(UPDATE_LOG)],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             start_new_session=True,
