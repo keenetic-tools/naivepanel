@@ -572,10 +572,6 @@ def _tail_path(path: Path, lines: int = 100) -> str:
     return _mask_creds("".join(data.splitlines(keepends=True)[-lines:]))
 
 
-def _tail_log(lines: int = 100) -> str:
-    return _tail_path(LOG_FILE, lines)
-
-
 # --- Flask app ------------------------------------------------------------
 
 app = Flask(__name__)
@@ -1305,16 +1301,26 @@ def api_update_apply():
 
 @app.route("/api/update/log")
 def api_update_log():
-    """Tail лога установщика + текущий state (UI поллит во время апдейта)."""
+    """Tail лога установщика + state (UI поллит во время апдейта).
+
+    `panel` — короткий хвост naivepanel.log: при зависшем/умершем
+    установщике причина (spawn failure, ошибка записи state) попадает
+    в лог самой панели, пока она ещё жива.
+    """
     try:
         lines = int(request.args.get("lines", "60"))
     except ValueError:
         lines = 60
     resp = jsonify({"lines": lines,
                     "content": _tail_path(UPDATE_LOG, lines),
+                    "panel": _tail_path(PANEL_LOG, 20),
                     "state": _update_state()})
     resp.headers["Cache-Control"] = "no-store"
     return resp
+
+
+# Лог какого хвоста показывать: по умолчанию — naive, src=panel — сама панель
+LOG_SOURCES: dict[str, Path] = {"proxy": LOG_FILE, "panel": PANEL_LOG}
 
 
 @app.route("/api/logs")
@@ -1323,7 +1329,8 @@ def api_logs():
         lines = int(request.args.get("lines", "100"))
     except ValueError:
         lines = 100
-    resp = jsonify({"lines": lines, "content": _tail_log(lines)})
+    path = LOG_SOURCES.get(request.args.get("src", "proxy"), LOG_FILE)
+    resp = jsonify({"lines": lines, "content": _tail_path(path, lines)})
     resp.headers["Cache-Control"] = "no-store"  # логи могут содержать креды
     return resp
 

@@ -28,6 +28,7 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setenv("NAIVEPROXY_INIT", str(tmp_path / "absent-init.sh"))
     monkeypatch.setenv("NAIVEPANEL_INIT", str(tmp_path / "absent-init.sh"))
     monkeypatch.setenv("NAIVEPROXY_LOG", str(tmp_path / "naiveproxy.log"))
+    monkeypatch.setenv("NAIVEPANEL_LOG", str(tmp_path / "naivepanel.log"))
     monkeypatch.setenv("NAIVEPROXY_PID", str(tmp_path / "naiveproxy.pid"))
     # self-update пишет в каталог панели и свой лог — только в tmp
     monkeypatch.setenv("NAIVEPANEL_DIR", str(tmp_path / "panel"))
@@ -467,6 +468,27 @@ def test_logs_tail_reads_only_requested_lines(client, env):
     assert lines[0] == "line490"
     assert lines[-1] == "line499"
     assert len(lines) == 10
+
+
+def test_logs_src_panel_tails_panel_log(client, env):
+    (env / "naivepanel.log").write_text(
+        "WARNING in naivepanel: rejected Host 'evil.com' from 203.0.113.7\n"
+        "WARNING in naivepanel: self-update to v9.9.9 triggered by 192.168.1.5\n",
+        encoding="utf-8",
+    )
+    (env / "naiveproxy.log").write_text("proxy line\n", encoding="utf-8")
+    d = client.get("/api/logs?src=panel&lines=10").get_json()
+    assert "rejected Host" in d["content"]
+    assert "self-update to v9.9.9" in d["content"]
+    assert "proxy line" not in d["content"]
+
+
+def test_logs_src_defaults_and_unknown_to_proxy(client, env):
+    (env / "naiveproxy.log").write_text("proxy line\n", encoding="utf-8")
+    (env / "naivepanel.log").write_text("panel line\n", encoding="utf-8")
+    # без src и с неизвестным src — прокси, а не 500
+    assert "proxy line" in client.get("/api/logs").get_json()["content"]
+    assert "proxy line" in client.get("/api/logs?src=bogus").get_json()["content"]
 
 
 # --- JSON-ошибки для API ------------------------------------------------------
@@ -1029,10 +1051,15 @@ def test_bind_is_loopback_variants(app):
 def test_update_log_tails_and_is_no_store(client, app, env):
     app.UPDATE_LOG.write_text("".join(f"u{i}\n" for i in range(50)),
                               encoding="utf-8")
+    app.PANEL_LOG.write_text(
+        "WARNING in naivepanel: self-update to v9.9.9 triggered by 192.168.1.5\n",
+        encoding="utf-8",
+    )
     r = client.get("/api/update/log?lines=5")
     assert r.headers.get("Cache-Control") == "no-store"
     d = r.get_json()
     assert d["content"].splitlines() == [f"u{i}" for i in range(45, 50)]
+    assert "self-update to v9.9.9" in d["panel"]  # хвост лога панели
     assert d["state"] == {}  # state-файла нет — пусто, не ошибка
 
 
@@ -1043,6 +1070,13 @@ def test_ui_has_update_controls(app):
     for marker in ('data-action="updateCheck"', 'data-action="updateApply"',
                    'data-action="updateNotes"', 'id="updDlg"', 'id="notesDlg"',
                    '/api/update/check', '/api/update/apply', '/api/update/log'):
+        assert marker in html, marker
+
+
+def test_ui_has_log_source_switch_and_panel_tail_in_update_dlg(app):
+    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    for marker in ('data-action="logSrc"', 'id="btnSrcPanel"', 'id="updPanelLog"',
+                   'naivepanel-logsrc', "src='+logSrc"):
         assert marker in html, marker
 
 

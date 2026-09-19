@@ -130,6 +130,9 @@
   button:hover:not(:disabled) { filter:brightness(1.1); box-shadow:var(--shadow-2); }
   button:active:not(:disabled) { transform:scale(.97); box-shadow:var(--shadow-1); }
   button.ghost, a.btn { background:transparent; color:var(--fg); border:1px solid var(--border); box-shadow:none; }
+  /* Включённое состояние ghost-переключателей (aria-pressed=true):
+     button.ghost по специфичности перебивает голый .on, поэтому здесь */
+  button.ghost[aria-pressed="true"] { color:var(--acc); border-color:var(--acc); }
   button.ghost:hover:not(:disabled) { border-color:var(--acc); filter:none; background:var(--hov); box-shadow:none; }
   button.danger { background:var(--err); color:var(--btn-fg); }
   button.wide { width:100%; }
@@ -287,6 +290,12 @@
     <div id="msg" class="sr-only" aria-live="polite"></div>
 
     <h2 class="sect">Лог</h2>
+    <div class="actions" style="margin-top:0;margin-bottom:10px" role="group" aria-label="Источник лога">
+      <button class="ghost iconbtn" id="btnSrcProxy" data-action="logSrc" data-arg="proxy"
+              aria-pressed="true" title="naiveproxy.log — вывод прокси">прокси</button>
+      <button class="ghost iconbtn" id="btnSrcPanel" data-action="logSrc" data-arg="panel"
+              aria-pressed="false" title="naivepanel.log — события самой панели: безопасность, обновление, обслуживание">панель</button>
+    </div>
     <pre class="log" id="log">…</pre>
     <div class="actions">
       <button class="ghost" data-action="loadLog">Обновить</button>
@@ -314,6 +323,8 @@
 <dialog id="updDlg" aria-labelledby="updMsg">
   <p id="updMsg" style="margin:0 0 10px"></p>
   <pre class="log" id="updLog" style="max-height:180px"></pre>
+  <p style="margin:10px 0 4px;font-size:12px;color:var(--mut)">Лог панели (naivepanel.log)</p>
+  <pre class="log" id="updPanelLog" style="max-height:140px"></pre>
   <form method="dialog" class="dlg-actions">
     <button class="ghost" value="close" title="Обновление продолжит идти в фоне">Свернуть</button>
   </form>
@@ -744,6 +755,7 @@ async function applyUpdate() {
   const want = String(d.target || ('v'+upd.latest)).replace(/^v/, '');
   $('updMsg').textContent = 'Обновление до v'+want+'…';
   $('updLog').textContent = '';
+  $('updPanelLog').textContent = '';
   $('updDlg').showModal();
   flash('Обновление до v'+want+' запущено', true);
   // Детект завершения — на клиенте (state на сервере не переживает рестарт):
@@ -778,11 +790,42 @@ function renderUpdLog(d) {
   const txt = d.content || '(лог пока пуст)';
   if (pre.textContent !== txt) pre.textContent = txt;
   pre.scrollTop = pre.scrollHeight;
+  // Хвост лога панели: при зависшем/умершем установщике причина — здесь
+  const pp = $('updPanelLog');
+  const ptxt = d.panel || '(пока пусто)';
+  if (pp.textContent !== ptxt) pp.textContent = ptxt;
+  pp.scrollTop = pp.scrollHeight;
 }
 
 let lastLog = null;   // кэш — не трогаем DOM, если контент не изменился
 let logStuck = true;  // «прилип» к низу лога — автоскролл только когда true
 let logErrOnly = false; // показывать только ошибки/предупреждения
+
+// Источник лога: 'proxy' (naiveproxy.log) | 'panel' (naivepanel.log).
+// Выбор переживает перезагрузку страницы, как и тема.
+const LOG_SRC_KEY = 'naivepanel-logsrc';
+let logSrc = 'proxy';
+try {
+  if (localStorage.getItem(LOG_SRC_KEY) === 'panel') logSrc = 'panel';
+} catch (e) { /* приватный режим — остаёмся на дефолте */ }
+
+function renderLogSrc() {
+  for (const [id, src] of [['btnSrcProxy','proxy'], ['btnSrcPanel','panel']]) {
+    const b = $(id), on = src === logSrc;
+    b.setAttribute('aria-pressed', String(on));
+    b.classList.toggle('on', on);
+  }
+}
+
+function setLogSrc(src) {
+  if (src === logSrc) return;
+  logSrc = src;
+  try { localStorage.setItem(LOG_SRC_KEY, src); } catch (e) { /* приватный режим */ }
+  lastLog = null;   // форсируем перерисовку другим контентом
+  logStuck = true;  // новый источник — снова прилипаем к низу
+  renderLogSrc();
+  loadLog();
+}
 
 // naive/Chromium пишет уровни в формате [pid:ERROR:…]; подсветим их.
 const LOG_ERR = /\b(ERROR|FATAL|PANIC)\b/, LOG_WARN = /\b(WARNING|WARN)\b/;
@@ -809,7 +852,7 @@ function downloadLog() {
   const blob = new Blob([lastLog || ''], {type:'text/plain'});
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
-  a.download = 'naiveproxy.log';
+  a.download = logSrc === 'panel' ? 'naivepanel.log' : 'naiveproxy.log';
   a.click();
   // отложенный revoke: синхронный может оборвать загрузку в Safari/Firefox
   setTimeout(() => URL.revokeObjectURL(a.href), 0);
@@ -839,7 +882,7 @@ async function copyLog() {
 async function loadLog() {
   let content;
   try {
-    const r = await jget('/api/logs?lines=100');
+    const r = await jget('/api/logs?lines=100&src='+logSrc);
     content = r.content || '(пусто)';
   } catch (e) {
     content = 'log error: '+e.message;
@@ -921,6 +964,7 @@ const ACTIONS = {
   togglePw: () => togglePw(),
   loadLog: () => loadLog(),
   logFilter: () => toggleLogFilter(),
+  logSrc: (arg) => setLogSrc(arg),
   logDownload: () => downloadLog(),
   logCopy: () => copyLog(),
 };
@@ -934,6 +978,7 @@ document.addEventListener('click', (e) => {
 
 $('editor').addEventListener('submit', save);
 
+renderLogSrc();
 refreshAll();
 // Тихий авто-check после первичной загрузки: если есть обновление — бейдж,
 // нет или сеть недоступна — тихая строка в секции «Панель», без тостов.

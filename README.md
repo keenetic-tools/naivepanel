@@ -69,8 +69,8 @@ HTML page — no CDN, no build step. MIT-licensed.
 | `POST` | `/api/panel/restart` | перезапуск самой панели (после обновления файлов) |
 | `GET` | `/api/update/check?force=1` | сверить версию с последним релизом GitHub (`{current, latest, available, notes, url}`; кэш 6ч, `force` обходит; сеть недоступна → 200 с `error`) |
 | `POST` | `/api/update/apply` | запустить self-update: spawn отсоединённого `install.sh --yes --ref <тег>`; `202 {target,...}`, повторный запуск → `409` |
-| `GET` | `/api/update/log?lines=60` | tail лога установщика + state обновления, `no-store` |
-| `GET` | `/api/logs?lines=100` | tail лог-файла |
+| `GET` | `/api/update/log?lines=60` | tail лога установщика + хвост лога панели (`panel`) + state обновления, `no-store` |
+| `GET` | `/api/logs?lines=100` | tail лог-файла: по умолчанию naive, `&src=panel` — лог самой панели (события безопасности, обновления, обрезки логов) |
 
 ## Локальный запуск (для разработки)
 
