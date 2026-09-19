@@ -154,7 +154,7 @@ _ALLOWED_PROXY_SCHEMES = ("https://", "http://", "quic://")
 # такой пресет нельзя было бы получить через GET (роутинг отдаёт файл)
 RESERVED_NAMES = frozenset({"export", "import"})
 
-APP_VERSION = "0.9.1"
+APP_VERSION = "0.9.2"
 
 
 def _ensure_dirs() -> None:
@@ -1049,10 +1049,14 @@ def api_panel_restart():
     """
     if not PANEL_INIT.exists():
         abort(503, description=f"{PANEL_INIT} not found")
-    # Новая сессия → ребёнок переживёт смерть Flask-процесса. Путь передаём
-    # argv ($1), а не интерполяцией в shell-строку. Команда фиксированная.
+    # Новая сессия → ребёнок переживёт смерть Flask-процесса. Путь — через
+    # окружение, не позиционные аргументы -c: busybox на Keenetic их не
+    # передаёт (тот же баг, что молча убивал self-update в v0.9.0–v0.9.1).
+    # Команда фиксированная.
+    env = {**os.environ, "NP_INIT": str(PANEL_INIT)}
     subprocess.Popen(  # nosec B603
-        ["/bin/sh", "-c", 'sleep 1; exec /bin/sh "$1" restart', "sh", str(PANEL_INIT)],
+        ["/bin/sh", "-c", 'sleep 1; exec /bin/sh "$NP_INIT" restart'],
+        env=env,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         start_new_session=True,
@@ -1286,18 +1290,24 @@ def api_update_apply():
             encoding="utf-8")
     except OSError as exc:
         abort(500, description=f"cannot prepare update: {exc}")
-    # Команда фиксированная, tag и пути передаются argv ($1..$3), а не
-    # интерполяцией в shell-строку; сам tag прошёл _TAG_RE. Обёртка без
-    # exec дожидается установщика и дописывает его exit-код в лог —
-    # мгновенная тихая смерть (OOM: rc=137) перестаёт быть невидимой.
-    # --from-update: python/flask уже подняты самим фактом работы панели —
-    # установщик пропускает их проверки и не форкает python на тесной памяти.
+    # Команда фиксированная, а tag и пути передаются ЧЕРЕЗ ОКРУЖЕНИЕ
+    # (NP_STAGE/NP_TAG/NP_LOG), не argv после -c: busybox на Keenetic
+    # (Entware) не передаёт позиционные аргументы после `sh -c 'строка'`
+    # — реальные $1..$3 оказываются пустыми, и v0.9.0–v0.9.1 умирали
+    # молча, не сумев открыть `>>""` (кейс тихой смерти self-update).
+    # Обёртка без exec дожидается установщика и дописывает его exit-код
+    # в лог: мгновенная смерть перестаёт быть невидимой. --from-update:
+    # python/flask уже подняты самим фактом работы панели — установщик
+    # пропускает их проверки и не форкает python на тесной памяти.
+    env = {**os.environ,
+           "NP_STAGE": str(stage), "NP_TAG": tag, "NP_LOG": str(UPDATE_LOG)}
     try:
         proc = subprocess.Popen(  # nosec B603
             ["/bin/sh", "-c",
-             '/bin/sh "$1" --yes --from-update --ref "$2" >>"$3" 2>&1; '
-             'rc=$?; echo "installer exit code: $rc" >>"$3"',
-             "sh", str(stage), tag, str(UPDATE_LOG)],
+             '/bin/sh "$NP_STAGE" --yes --from-update --ref "$NP_TAG" '
+             '>>"$NP_LOG" 2>&1; '
+             'rc=$?; echo "installer exit code: $rc" >>"$NP_LOG"'],
+            env=env,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             start_new_session=True,
         )

@@ -421,6 +421,46 @@ def test_panel_restart_spawns_init(client, app, env):
     assert marker.read_text().strip() == "restart"
 
 
+def test_spawns_do_not_rely_on_dash_c_positionals(client, app, env, monkeypatch):
+    """busybox на Keenetic не передаёт позиционные аргументы после
+    `sh -c 'строка'` (реальный кейс v0.9.0–v0.9.1: $1..$3 пусты →
+    self-update умирал молча на `>>""`). Аргументы ходят через env —
+    строки -c не должны содержать $1..$9 ни в одном спавне.
+    macOS/bash и Debian/dash этот баг не ловят: расхождение только
+    на целевой платформе — потому охраняем регрессией по форме команды.
+    """
+    captured = []
+
+    class FakeProc:
+        pid = 424242
+
+        def wait(self):
+            return 0
+
+    def rec(cmd, **kwargs):
+        captured.append((cmd, kwargs.get("env")))
+        return FakeProc()
+
+    monkeypatch.setattr(app.subprocess, "Popen", rec)
+    _apply_stub(env, monkeypatch, app)
+    app.PANEL_INIT.parent.mkdir(parents=True, exist_ok=True)
+    app.PANEL_INIT.write_text("#!/bin/sh\n")
+    assert client.post("/api/update/apply", headers=CSRF).status_code == 202
+    assert client.post("/api/panel/restart", headers=CSRF).status_code == 202
+    assert len(captured) == 2
+    for cmd, cenv in captured:
+        script = cmd[cmd.index("-c") + 1]
+        assert not re.search(r"\$[0-9@*#]", script), \
+            f"позиционные параметры в -c не работают на busybox Keenetic: {cmd}"
+        assert cmd[-1] != "sh" or len(cmd) <= 3, \
+            f"argv после -c не доходят на busybox Keenetic: {cmd}"
+        assert cenv, "аргументы должны передаваться через env"
+    envs = {k: v for _, e in captured if e for k, v in e.items()
+            if k.startswith("NP_")}
+    assert envs.get("NP_STAGE") and envs.get("NP_TAG") and envs.get("NP_LOG")
+    assert envs.get("NP_INIT")
+
+
 # --- percent-encoding креденшалов --------------------------------------------
 
 def test_password_special_chars_encoded_roundtrip(client, app):
