@@ -625,6 +625,17 @@ def test_ui_has_single_light_palette_definition(app):
     assert html.count("--bg:#f4f5f7") == 1
 
 
+def test_ui_editor_closable_by_button_and_esc(app):
+    # Редактор закрывается ✕ в заголовке и по Esc; Esc проверяет видимость
+    # формы, а не current — работает и в режиме нового пресета (current === null)
+    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    for marker in ('data-action="closeEditor"', 'id="btnCloseEditor"',
+                   'id="editorTitleText"', 'closeEditor: () => closeEditor(),',
+                   "if ($('editor').style.display !== 'none'"):
+        assert marker in html, marker
+    assert "&& current &&" not in html  # Esc не привязан к выбранному пресету
+
+
 # --- duplicate ------------------------------------------------------------------
 
 def test_duplicate_copies_config_with_password(client, app):

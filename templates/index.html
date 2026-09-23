@@ -79,6 +79,11 @@
   .card h2::after { content:""; flex:1; height:1px; background:var(--border); opacity:.6; }
   h2.sect { margin-top:24px; padding-top:18px; border-top:1px solid var(--border); }
   h2.sect::after { display:none; }
+  /* ✕ закрытия редактора: order=2 ставит его за разделительной линией заголовка */
+  #editorTitle .close { order:2; flex:none; background:none; border:none; box-shadow:none;
+                        color:var(--mut); font-size:13px; font-weight:400; padding:2px 7px;
+                        border-radius:6px; cursor:pointer; }
+  #editorTitle .close:hover { background:var(--hov); color:var(--fg); filter:none; box-shadow:none; }
   .svcinfo { display:grid; gap:4px; margin-bottom:14px; font-size:13px; }
   .svcinfo .kv { display:flex; justify-content:space-between; gap:10px; min-width:0;
                  padding:3px 8px; margin:0 -8px; border-radius:6px; }
@@ -230,7 +235,9 @@
   </section>
 
   <section class="card">
-    <h2 id="editorTitle">Редактор</h2>
+    <h2 id="editorTitle"><span id="editorTitleText">Редактор</span><button type="button"
+        class="close" id="btnCloseEditor" data-action="closeEditor" hidden
+        aria-label="Закрыть редактор" title="Закрыть (Esc)">✕</button></h2>
     <form id="editor" style="display:none">
       <label for="f_name">Имя пресета (a-z 0-9 _ - .)</label>
       <input id="f_name" pattern="[a-zA-Z0-9_\-.]{1,64}" autocomplete="off" spellcheck="false">
@@ -524,8 +531,9 @@ async function selectPreset(name) {
   try {
     const cfg = await jget('/api/configs/'+encodeURIComponent(name));
     const listen = Array.isArray(cfg.listen) ? cfg.listen.join('\n') : (cfg.listen || '');
-    $('editorTitle').textContent = 'Редактор — '+name;
+    $('editorTitleText').textContent = 'Редактор — '+name;
     $('editor').style.display = 'block';
+    $('btnCloseEditor').hidden = false;
     $('f_name').value = name;
     $('f_name').disabled = true;
     $('f_listen').value = listen.replace(/^socks:\/\//gm, '');
@@ -548,8 +556,9 @@ async function selectPreset(name) {
 async function newPreset() {
   if (!(await maybeDiscard())) return;
   current = null;
-  $('editorTitle').textContent = 'Редактор — новый';
+  $('editorTitleText').textContent = 'Редактор — новый';
   $('editor').style.display = 'block';
+  $('btnCloseEditor').hidden = false;
   $('f_name').disabled = false;
   ['f_name','f_listen','f_upstream','f_username','f_password','f_log','f_host_resolver_rules','f_extra_headers','f_insecure_concurrency']
     .forEach(id => $(id).value = '');
@@ -559,11 +568,19 @@ async function newPreset() {
   $('f_name').focus();
 }
 
+// Единственная точка фактического закрытия редактора: del() переиспользует,
+// ведь пресета уже нет — спрашивать «отбросить?» не нужно.
+function hideEditor() {
+  current = null;
+  dirty = false;
+  $('editor').style.display = 'none';
+  $('btnCloseEditor').hidden = true;
+  setHash(null);
+}
+
 async function closeEditor() {
   if (!(await maybeDiscard())) return;
-  current = null;
-  $('editor').style.display = 'none';
-  setHash(null);
+  hideEditor();
   renderPresets(lastPresets);
 }
 
@@ -659,7 +676,7 @@ async function del(name) {
   if (!(await askConfirm('Удалить пресет ' + n + '?', {ok:'Удалить', danger:true}))) return;
   try {
     await jdel('/api/configs/'+encodeURIComponent(n));
-    if (current === n) { current = null; dirty = false; $('editor').style.display='none'; setHash(null); }
+    if (current === n) hideEditor();
     flash('Удалён: '+n, true);
     await refreshAll();
   } catch (e) { flash(e.message, false); }
@@ -920,6 +937,7 @@ $('f_upstream').addEventListener('input', validateUpstream);
 window.addEventListener('beforeunload', (e) => { if (dirty) { e.preventDefault(); e.returnValue = ''; } });
 
 // Горячие клавиши: Ctrl/Cmd+S — сохранить, «/» — поиск, Esc — закрыть редактор.
+let escSawDialog = false;
 document.addEventListener('keydown', (e) => {
   if ((e.ctrlKey || e.metaKey) && (e.key === 's' || e.key === 'S')) {
     if ($('editor').style.display !== 'none') { e.preventDefault(); save(null); }
@@ -929,10 +947,17 @@ document.addEventListener('keydown', (e) => {
     e.preventDefault(); $('search').focus();
     return;
   }
-  // SUMMARY не трогаем: Esc там закрывает <details> нативно; открытый dialog
-  // закрывается сам — не даём Esc заодно снести редактор под ним
-  if (e.key === 'Escape' && !document.querySelector('dialog[open]')
-      && current && e.target.tagName !== 'SUMMARY') closeEditor();
+  // Esc на keydown только запоминает, был ли открыт dialog: тот закроется сам,
+  // и keyup не должен переоткрыть confirm поверх только что закрытого
+  if (e.key === 'Escape') escSawDialog = !!document.querySelector('dialog[open]');
+});
+// Esc закрываем редактор по keyup: close-watcher того же Esc успевает отменить
+// confirm, открытый при dirty-форме из keydown (замер: cancel через +0.3мс)
+document.addEventListener('keyup', (e) => {
+  if (e.key !== 'Escape' || escSawDialog || document.querySelector('dialog[open]')) return;
+  // Условие — видимость формы, а не current: Esc работает и в режиме нового
+  // пресета (current === null); SUMMARY — Esc там закрыл <details> на keydown
+  if ($('editor').style.display !== 'none' && e.target.tagName !== 'SUMMARY') closeEditor();
 });
 
 // Следим за «прилипанием»: пользователь у самого низа → автоскролл включён,
@@ -951,6 +976,7 @@ const ACTIONS = {
   theme: () => toggleTheme(),
   svc: (arg) => svc(arg),
   newPreset: () => newPreset(),
+  closeEditor: () => closeEditor(),
   import: () => $('importFile').click(),
   panelRestart: () => panelRestart(),
   updateCheck: () => checkUpdate(true),
