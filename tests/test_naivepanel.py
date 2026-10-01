@@ -1521,9 +1521,13 @@ def test_naive_update_downloads_validates_and_replaces(client, app, env, monkeyp
     m = _naive_env_reload(env, monkeypatch)
     stub, marker = _stub_init(env, "naive-restarts.txt")
     m.INIT_SCRIPT = stub
-    # «работающий» прокси: pid-файл с живым процессом → рестарт обязателен
+    # «работающий» прокси: pid-файл с живым процессом → рестарт обязателен.
+    # На Linux _pid_is_naive читает /proc/<pid>/comm и справедливо бракует
+    # pytest-процесс (это не naive) — подменяем только анти-pid-reuse проверку:
+    # тестируем логику воркера, а не классификатор имён процессов.
     m.PID_FILE.parent.mkdir(parents=True, exist_ok=True)
     m.PID_FILE.write_text(str(os.getpid()))
+    monkeypatch.setattr(m, "_pid_is_naive", lambda pid: True)
     old = env / "naive"
     old.write_text('#!/bin/sh\necho "naive 113.0.5672.3"\n')
     old.chmod(0o755)
