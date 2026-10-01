@@ -1230,3 +1230,411 @@ def test_trim_invalid_settings_fall_back_to_defaults(env, monkeypatch):
     assert m._LOG_MAX_INVALID and m._LOG_KEEP_INVALID
     assert m.LOG_TRIM_MAX == 5242880
     assert m.LOG_TRIM_KEEP == 524288
+
+
+# --- бинарник naive: версии, детект таргета, выбор ассета ----------------------
+
+def test_naive_ver_key_counts_build_suffix(app):
+    k = app._naive_ver_key
+    assert k("v154.0.8037.49-2") == (154, 0, 8037, 49, 2)
+    assert k("v154.0.8037.49-1") < k("v154.0.8037.49-2")
+    # вывод `naive --version` без суффикса пересборки старше любого -N
+    assert k("154.0.8037.49") < k("v154.0.8037.49-1")
+    assert k("v113.0.5672.3-1") < k("v154.0.8037.49-2")
+    assert k("") == (0, 0)
+
+
+def test_naive_bin_version_parses_output(app, env):
+    p = env / "naive"
+    p.write_text('#!/bin/sh\necho "naive 154.0.8037.49"\n')
+    p.chmod(0o755)
+    app.NAIVE_BIN = p
+    assert app._naive_bin_version() == "154.0.8037.49"
+
+
+def test_naive_bin_version_missing_or_broken(app, env):
+    assert app._naive_bin_version() is None  # файла нет
+    p = env / "naive"
+    p.write_text('#!/bin/sh\nexit 3\n')  # есть, но не работает
+    p.chmod(0o755)
+    app.NAIVE_BIN = p
+    assert app._naive_bin_version() is None
+
+
+def _cpuinfo(tmp_path, text):
+    p = tmp_path / ("cpuinfo-" + str(abs(hash(text)))[:8])
+    p.write_text(text, encoding="utf-8")
+    return p
+
+
+@pytest.mark.parametrize("machine,cputext,want", [
+    # Keenetic Giga/Ultra/Peak 2021+ (IPQ8074A): 4x Cortex-A53
+    ("aarch64", "CPU part\t: 0xd03\n", "aarch64_cortex-a53"),
+    ("aarch64", "CPU part\t: 0xd08\n", "aarch64_cortex-a72"),
+    ("aarch64", "CPU part\t: 0xd0e\n", "aarch64_cortex-a76"),
+    # неизвестное ядро (напр. Apple/KNF) → безопасный generic
+    ("aarch64", "CPU part\t: 0x612\n", "aarch64_generic"),
+    ("arm64", "CPU part\t: 0xd03\n", "aarch64_cortex-a53"),
+    # armv7: суффиксы FPU по Features (неон+vfpv4 → neon-vfpv4, есть -static)
+    ("armv7l", "CPU part\t: 0xc07\nFeatures\t: half thumb fastmult vfp edsp neon vfpv3 vfpv4\n",
+     "arm_cortex-a7_neon-vfpv4"),
+    ("armv7l", "CPU part\t: 0xc07\nFeatures\t: half thumb fastmult vfp vfpv3 vfpv4\n",
+     "arm_cortex-a7_vfpv4"),
+    ("armv7l", "CPU part\t: 0xc07\nFeatures\t: half thumb fastmult vfp\n",
+     "arm_cortex-a7"),
+    ("armv7l", "CPU part\t: 0xc09\nFeatures\t: half thumb vfp neon\n", "arm_cortex-a9_neon"),
+    ("armv7l", "CPU part\t: 0xc09\nFeatures\t: half thumb vfp\n", "arm_cortex-a9"),
+    ("armv7l", "CPU part\t: 0xc0f\nFeatures\t: vfp neon vfpv4\n", "arm_cortex-a15_neon-vfpv4"),
+    ("armv7l", "CPU part\t: 0xc05\nFeatures\t: vfp vfpv4\n", "arm_cortex-a5_vfpv4"),
+    ("armv7l", "CPU part\t: 0xc08\nFeatures\t: vfp vfpv3\n", "arm_cortex-a8_vfpv3"),
+    # неизвестный armv7 → самый массовый базовый таргет
+    ("armv7l", "CPU part\t: 0xc0d\nFeatures\t: vfp\n", "arm_cortex-a7"),
+    ("armv6l", "", "arm_arm1176jzf-s_vfp"),
+    ("armv5tel", "", "arm_arm926ej-s"),
+    ("x86_64", "", "x86_64"),
+    ("i686", "", "x86"),
+])
+def test_naive_detect_target_variants(app, env, monkeypatch, machine, cputext, want):
+    monkeypatch.setenv("NAIVEPROXY_UNAME_M", machine)
+    monkeypatch.setenv("NAIVEPROXY_CPUINFO", str(_cpuinfo(env, cputext)))
+    assert app._naive_detect_target() == want
+
+
+def test_naive_detect_target_mips_uses_elf_endianness(app, env, monkeypatch):
+    le = env / "elf-le"
+    le.write_bytes(b"\x7fELF\x01\x01")
+    be = env / "elf-be"
+    be.write_bytes(b"\x7fELF\x01\x02")
+    cpu = _cpuinfo(env, "cpu model\t\t: MIPS 1004Kc V2.15\n")
+    monkeypatch.setenv("NAIVEPROXY_UNAME_M", "mips")
+    monkeypatch.setenv("NAIVEPROXY_CPUINFO", str(cpu))
+    # MT7621 (Keenetic на mips): 1004Kc — совместим с таргетом 24kc
+    monkeypatch.setenv("NAIVEPROXY_ELF", str(le))
+    assert app._naive_detect_target() == "mipsel_24kc"
+    monkeypatch.setenv("NAIVEPROXY_ELF", str(be))
+    assert app._naive_detect_target() is None  # big-endian: prebuilt нет
+
+
+ASSETS = [
+    ("naiveproxy-v154.0.8037.49-2-openwrt-aarch64_cortex-a53.tar.xz", "u-plain"),
+    ("naiveproxy-v154.0.8037.49-2-openwrt-aarch64_cortex-a53-static.tar.xz", "u-static"),
+    ("naiveproxy-v154.0.8037.49-2-openwrt-aarch64_generic.tar.xz", "u-gen"),
+    ("naiveproxy-v154.0.8037.49-2-openwrt-aarch64_generic-static.tar.xz", "u-gen-static"),
+    ("naiveproxy-v154.0.8037.49-2-openwrt-aarch64_cortex-a76.tar.xz", "u-a76"),
+    ("naiveproxy-v154.0.8037.49-2-openwrt-mipsel_24kc-static.tar.xz", "u-mips"),
+    ("naiveproxy-v154.0.8037.49-2-linux-arm64.tar.xz", "u-linux"),
+]
+
+
+def test_naive_pick_asset_prefers_static(app):
+    pick = lambda t: app._naive_pick_asset(ASSETS, t)  # noqa: E731
+    assert pick("aarch64_cortex-a53") == \
+        ("naiveproxy-v154.0.8037.49-2-openwrt-aarch64_cortex-a53-static.tar.xz", "u-static")
+    # у a76 нет -static — берётся обычный, а не фолбэк на generic
+    assert pick("aarch64_cortex-a76")[1] == "u-a76"
+    # неизвестный aarch64 → фолбэк на generic (-static)
+    assert pick("aarch64_cortex-a34")[1] == "u-gen-static"
+    # таргет с флейвором из маркера: -static отрезается до выбора
+    assert app._naive_pick_asset(ASSETS, "aarch64_cortex-a53-static")[1] == "u-static"
+    # linux-ассеты не матчатся под openwrt-таргет; пустой таргет — None
+    assert app._naive_pick_asset(ASSETS, "x86_64") is None
+    assert app._naive_pick_asset(ASSETS, None) is None
+
+
+def test_naive_release_requires_tag_and_assets(app, monkeypatch):
+    def fake_get(url, timeout=6.0):
+        return json.dumps({"tag_name": "", "assets": []})
+    monkeypatch.setattr(app, "_http_get", fake_get)
+    with pytest.raises(RuntimeError):
+        app._naive_release()
+
+
+# --- /api/naive/check -----------------------------------------------------------
+
+def _naive_env_reload(env, monkeypatch):
+    monkeypatch.setenv("NAIVEPROXY_BIN", str(env / "naive"))
+    monkeypatch.setenv("NAIVEPROXY_SRC_REPO", "test/naiveproxy")
+    monkeypatch.setenv("NAIVEPROXY_UPDATE_LOG", str(env / "naive-upd.log"))
+    m = _reload()
+    m.NAIVEPROXY_DIR.mkdir(parents=True, exist_ok=True)  # маркеры/.state пишем тут
+    return m
+
+
+def _naive_rel(monkeypatch, app, tag="v154.0.8037.49-2",
+               assets=(("naiveproxy-v154.0.8037.49-2-openwrt-x86_64.tar.xz", "u1"),)):
+    monkeypatch.setattr(app, "_naive_release",
+                        lambda: {"tag": tag, "notes": "", "url": "", "assets": list(assets)})
+
+
+def test_naive_check_reports_available_for_older_tag(client, app, env, monkeypatch):
+    m = _naive_env_reload(env, monkeypatch)
+    c = m.app.test_client()
+    p = env / "naive"
+    p.write_text('#!/bin/sh\necho "naive 113.0.5672.3"\n')
+    p.chmod(0o755)
+    m.NAIVE_TAG.parent.mkdir(parents=True, exist_ok=True)
+    m.NAIVE_TAG.write_text("v113.0.5672.3-1\n")
+    _naive_rel(monkeypatch, m)
+    d = c.get("/api/naive/check").get_json()
+    assert d["version"] == "113.0.5672.3" and d["tag"] == "v113.0.5672.3-1"
+    assert d["latest"] == "v154.0.8037.49-2" and d["available"] is True
+
+
+def test_naive_check_same_tag_not_available(client, app, env, monkeypatch):
+    m = _naive_env_reload(env, monkeypatch)
+    c = m.app.test_client()
+    p = env / "naive"
+    p.write_text('#!/bin/sh\necho "naive 154.0.8037.49"\n')
+    p.chmod(0o755)
+    m.NAIVE_TAG.write_text("v154.0.8037.49-2\n")
+    _naive_rel(monkeypatch, m)
+    d = c.get("/api/naive/check").get_json()
+    assert d["available"] is False
+
+
+def test_naive_check_build_suffix_beats_plain_version(client, app, env, monkeypatch):
+    # бинарник без маркера (ручная установка): --version теряет суффикс -2,
+    # поэтому свежий релиз с пересборкой считается доступным
+    m = _naive_env_reload(env, monkeypatch)
+    c = m.app.test_client()
+    p = env / "naive"
+    p.write_text('#!/bin/sh\necho "naive 154.0.8037.49"\n')
+    p.chmod(0o755)
+    _naive_rel(monkeypatch, m)
+    d = c.get("/api/naive/check").get_json()
+    assert d["tag"] is None and d["available"] is True
+
+
+def test_naive_check_no_binary_available_true(client, app, env, monkeypatch):
+    m = _naive_env_reload(env, monkeypatch)
+    c = m.app.test_client()
+    _naive_rel(monkeypatch, m)
+    d = c.get("/api/naive/check").get_json()
+    assert d["version"] is None and d["available"] is True  # можно установить
+
+
+def test_naive_check_failsoft_and_cache(client, app, env, monkeypatch):
+    m = _naive_env_reload(env, monkeypatch)
+    c = m.app.test_client()
+    calls = {"n": 0}
+
+    def dead():
+        calls["n"] += 1
+        raise RuntimeError("GitHub unreachable")
+
+    monkeypatch.setattr(m, "_naive_release", dead)
+    r = c.get("/api/naive/check")
+    assert r.status_code == 200  # недоступный GitHub — не ошибка панели
+    d = r.get_json()
+    assert d["available"] is False and d["latest"] is None and d["error"]
+    assert c.get("/api/naive/check").get_json()["cached"] is True
+    assert c.get("/api/naive/check?force=1").get_json().get("cached") is None
+    assert calls["n"] == 2
+
+
+# --- /api/naive/update ----------------------------------------------------------
+
+def test_naive_update_refuses_exposed_panel_without_password(client, app, env, monkeypatch):
+    m = _naive_env_reload(env, monkeypatch)
+    m.PANEL_BIND = "192.168.1.1:8089"
+    _naive_rel(monkeypatch, m)
+    r = m.app.test_client().post("/api/naive/update", headers=CSRF)
+    assert r.status_code == 403
+    assert "password" in r.get_json()["error"]
+
+
+def test_naive_update_502_when_release_unreachable(client, app, env, monkeypatch):
+    m = _naive_env_reload(env, monkeypatch)
+
+    def dead():
+        raise RuntimeError("GitHub unreachable")
+
+    monkeypatch.setattr(m, "_naive_release", dead)
+    assert m.app.test_client().post("/api/naive/update", headers=CSRF).status_code == 502
+
+
+def test_naive_update_concurrent_returns_409(client, app, env, monkeypatch):
+    m = _naive_env_reload(env, monkeypatch)
+    _naive_rel(monkeypatch, m)
+    m._naive_state_write({"phase": "running", "target": "v9.9.9",
+                          "started": time.time()})
+    r = m.app.test_client().post("/api/naive/update", headers=CSRF)
+    assert r.status_code == 409
+    assert "in progress" in r.get_json()["error"]
+
+
+def test_naive_state_stale_allows_retry(app):
+    old = time.time() - app._NAIVE_STALE_S - 1
+    app._naive_state_write({"phase": "running", "target": "v1.0", "started": old})
+    assert app._naive_state().get("stale") is True
+
+
+def _serve_tarball(tarball: Path):
+    """Локальный http-сервер, отдающий один файл; возвращает (url, stop)."""
+    import http.server
+    import threading
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            data = tarball.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def log_message(self, *a):  # не шумим в вывод pytest
+            pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+
+    def stop():
+        srv.shutdown()
+        srv.server_close()
+
+    return f"http://127.0.0.1:{srv.server_address[1]}/naive.tar.xz", stop
+
+
+def _build_naive_tarball(path: Path, script: str, tag="v154.0.8037.49-2") -> None:
+    import io
+    import tarfile
+    data = script.encode()
+    with tarfile.open(path, "w:xz") as tf:
+        info = tarfile.TarInfo(f"naiveproxy-{tag}-openwrt-x86_64/naive")
+        info.mode = 0o755
+        info.size = len(data)  # без size addfile пишет 0 байт
+        tf.addfile(info, io.BytesIO(data))
+
+
+def _naive_done(m, timeout=30.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        st = m._naive_state()
+        if st.get("phase") in ("done", "failed"):
+            return st
+        time.sleep(0.1)
+    return m._naive_state()
+
+
+def test_naive_update_downloads_validates_and_replaces(client, app, env, monkeypatch):
+    m = _naive_env_reload(env, monkeypatch)
+    stub, marker = _stub_init(env, "naive-restarts.txt")
+    m.INIT_SCRIPT = stub
+    # «работающий» прокси: pid-файл с живым процессом → рестарт обязателен
+    m.PID_FILE.parent.mkdir(parents=True, exist_ok=True)
+    m.PID_FILE.write_text(str(os.getpid()))
+    old = env / "naive"
+    old.write_text('#!/bin/sh\necho "naive 113.0.5672.3"\n')
+    old.chmod(0o755)
+    m.NAIVE_TAG.write_text("v113.0.5672.3-1\n")
+    m.NAIVE_BUILD.write_text("x86_64\n")
+
+    tarball = env / "naive.tar.xz"
+    _build_naive_tarball(tarball, '#!/bin/sh\necho "naive 154.0.8037.49"\n')
+    url, stop = _serve_tarball(tarball)
+    try:
+        _naive_rel(monkeypatch, m,
+                   assets=(("naiveproxy-v154.0.8037.49-2-openwrt-x86_64.tar.xz", url),))
+        r = m.app.test_client().post("/api/naive/update", headers=CSRF)
+        assert r.status_code == 202
+        assert r.get_json()["target"] == "v154.0.8037.49-2"
+        st = _naive_done(m)
+    finally:
+        stop()
+
+    assert st["phase"] == "done", st
+    assert st["version"] == "naive 154.0.8037.49"
+    # бинарник заменён и валиден; маркеры обновлены точным тегом
+    assert m._naive_bin_version() == "154.0.8037.49"
+    assert m.NAIVE_TAG.read_text().strip() == "v154.0.8037.49-2"
+    assert m.NAIVE_BUILD.read_text().strip() == "x86_64"
+    # рабочий процесс был жив → сервис перезапущен; прежний образ — в бэкапе
+    assert marker.read_text().splitlines()[-1] == "restart"
+    assert (m.NAIVEPROXY_DIR / "backup" / "naive.previous").exists()
+    assert not (m.NAIVEPROXY_DIR / ".naive-update").exists()  # stage убран
+
+
+def test_naive_update_failed_check_keeps_old_binary(client, app, env, monkeypatch):
+    # скачанный бинарник не проходит --version → рабочий не трогаем
+    m = _naive_env_reload(env, monkeypatch)
+    old = env / "naive"
+    old.write_text('#!/bin/sh\necho "naive 113.0.5672.3"\n')
+    old.chmod(0o755)
+    m.NAIVE_TAG.write_text("v113.0.5672.3-1\n")
+    m.NAIVE_BUILD.write_text("x86_64\n")
+
+    tarball = env / "bad.tar.xz"
+    _build_naive_tarball(tarball, '#!/bin/sh\nexit 7\n')
+    url, stop = _serve_tarball(tarball)
+    try:
+        _naive_rel(monkeypatch, m,
+                   assets=(("naiveproxy-v154.0.8037.49-2-openwrt-x86_64.tar.xz", url),))
+        assert m.app.test_client().post("/api/naive/update", headers=CSRF).status_code == 202
+        st = _naive_done(m)
+    finally:
+        stop()
+
+    assert st["phase"] == "failed"
+    assert "--version" in st["error"]
+    assert m._naive_bin_version() == "113.0.5672.3"  # прежний на месте
+
+
+def test_naive_update_no_asset_for_target_fails(client, app, env, monkeypatch):
+    m = _naive_env_reload(env, monkeypatch)
+    m.NAIVE_BUILD.write_text("aarch64_cortex-a9999\n")  # маркер с экзотикой
+    _naive_rel(monkeypatch, m,
+               assets=(("naiveproxy-v154.0.8037.49-2-openwrt-x86_64.tar.xz", "u1"),))
+    assert m.app.test_client().post("/api/naive/update", headers=CSRF).status_code == 202
+    st = _naive_done(m)
+    assert st["phase"] == "failed"
+    assert "no openwrt asset" in st["error"]
+
+
+def test_naive_status_tails_log_and_no_store(client, app, env, monkeypatch):
+    m = _naive_env_reload(env, monkeypatch)
+    m.NAIVE_UPDATE_LOG.write_text("".join(f"n{i}\n" for i in range(50)),
+                                  encoding="utf-8")
+    m._naive_state_write({"phase": "done", "target": "v1"})
+    r = m.app.test_client().get("/api/naive/status?lines=5")
+    assert r.headers.get("Cache-Control") == "no-store"
+    d = r.get_json()
+    assert d["content"].splitlines() == [f"n{i}" for i in range(45, 50)]
+    assert d["state"]["phase"] == "done"
+
+
+# --- install.sh: установка бинарника -------------------------------------------
+
+def test_install_sh_naive_source_overridable(app):
+    # зеркало/локальный сервер для e2e задаётся одним env, как NAIVEPANEL_REPO
+    text = (APP_DIR / "install.sh").read_text(encoding="utf-8")
+    assert 'NAIVEPROXY_SRC_REPO:-klzgrad/naiveproxy' in text
+    assert 'NAIVEPROXY_SRC_API:-https://api.github.com' in text
+    for flag in ("--naive-target)", "--naive-ref)", "--skip-naive)", "--naive-force)"):
+        assert flag in text, flag
+
+
+def test_install_sh_from_update_skips_naive_step(app):
+    # self-update панели не должен качать бинарник и трогать прокси
+    text = (APP_DIR / "install.sh").read_text(encoding="utf-8")
+    guard = 'if [ "$FROM_UPDATE" = 1 ]; then\n' \
+            '    :  # см. комментарий выше — бинарник обновляется панелью отдельно\n' \
+            'elif [ "$SKIP_NAIVE" = 1 ]; then'
+    assert guard in text, "гейт --from-update вокруг установки naive сломан"
+
+
+def test_install_sh_writes_naive_markers(app):
+    # тег и таргет переживают установку — панель по ним считает available
+    text = (APP_DIR / "install.sh").read_text(encoding="utf-8")
+    assert 'echo "$tag"   > "$NAIVEPROXY_DIR/naive-version"' in text
+    assert 'echo "$build" > "$NAIVEPROXY_DIR/naive-build"' in text
+
+
+# --- UI: секция «Бинарник naive» ------------------------------------------------
+
+def test_ui_has_naive_binary_controls(app):
+    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    for marker in ('data-action="naiveCheck"', 'data-action="naiveUpdate"',
+                   'id="nvInfo"', 'id="btnNvUpd"', 'id="btnNvCheck"',
+                   '/api/naive/check', '/api/naive/update', '/api/naive/status'):
+        assert marker in html, marker

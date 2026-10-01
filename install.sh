@@ -11,14 +11,26 @@
 # Idempotent upgrade: just run it again. Config (admin.pass, conf.d/*) is kept;
 # a pre-0.2.0 layout is migrated automatically.
 #
+# The naive client binary: when missing, the installer detects the openwrt
+# target from the hardware (uname/cpuinfo) and downloads a matching prebuilt
+# from klzgrad/naiveproxy releases (see README «Установка бинарника naive»).
+# An existing binary is never touched — updates go through the panel's
+# «Бинарник naive» section.
+#
 # Flags:
 #   --with-auth          create /opt/etc/naive/panel/admin.pass (interactive)
 #   --bind HOST:PORT     write NAIVEPANEL_BIND to /opt/etc/naive/panel/panel.conf
 #   --hosts LIST         write NAIVEPANEL_HOSTS to /opt/etc/naive/panel/panel.conf
 #   --ref TAG            git tag/ref to install (default: v0.10.0)
+#   --naive-target TGT   openwrt target for the naive binary, overrides
+#                        hardware detection (e.g. aarch64_cortex-a53)
+#   --naive-ref TAG      klzgrad/naiveproxy tag to install (default: latest)
+#   --naive-force        (re)install the naive binary even if one exists
+#   --skip-naive         never touch the naive binary, warn only
 #   --from-update        internal: spawned by the panel's self-update —
 #                        skips python/deps checks (the running panel already
 #                        proves they work; their forks die on tight router RAM)
+#                        and the naive step (panel updates binary separately)
 #   --no-naive-init      do not install S99naiveproxy init script
 #   --yes                non-interactive (no confirmation prompt)
 #   --uninstall          stop services and remove installed files
@@ -30,6 +42,13 @@ set -u
 # сервером). Панель при self-update передаёт его в окружение потомку.
 REPO="${NAIVEPANEL_REPO:-keenetic-tools/naivepanel}"
 REF="v0.10.0"
+# Источник prebuilt-бинарников naive (зеркала, e2e с локальным сервером).
+NAIVE_SRC_REPO="${NAIVEPROXY_SRC_REPO:-klzgrad/naiveproxy}"
+NAIVE_SRC_API="${NAIVEPROXY_SRC_API:-https://api.github.com}"
+NAIVE_TARGET=""   # --naive-target: override детекта таргета
+NAIVE_REF=""      # --naive-ref: конкретный тег naiveproxy вместо latest
+NAIVE_FORCE=0     # --naive-force: заменить даже существующий бинарник
+SKIP_NAIVE=0      # --skip-naive: не трогать бинарник вовсе
 BIND=""
 HOSTS=""
 WITH_AUTH=0
@@ -71,6 +90,10 @@ Usage: install.sh [flags]
   --bind HOST:PORT     write NAIVEPANEL_BIND to /opt/etc/naive/panel/panel.conf
   --hosts LIST         write NAIVEPANEL_HOSTS to /opt/etc/naive/panel/panel.conf
   --ref TAG            git tag/ref to install (default: v0.10.0)
+  --naive-target TGT   openwrt target for naive binary (override detection)
+  --naive-ref TAG      klzgrad/naiveproxy tag (default: latest release)
+  --naive-force        (re)install naive binary even if one exists
+  --skip-naive         never touch the naive binary
   --from-update        internal: spawned by self-update, skips python checks
   --no-naive-init      do not install S99naiveproxy init script
   --yes                non-interactive (no confirmation prompt)
@@ -118,6 +141,10 @@ while [ $# -gt 0 ]; do
         --bind)           BIND="${2:-}"; shift ;;
         --hosts)          HOSTS="${2:-}"; shift ;;
         --ref)            REF="${2:-}"; shift ;;
+        --naive-target)   NAIVE_TARGET="${2:-}"; shift ;;
+        --naive-ref)      NAIVE_REF="${2:-}"; shift ;;
+        --naive-force)    NAIVE_FORCE=1 ;;
+        --skip-naive)     SKIP_NAIVE=1 ;;
         -h|--help)        usage ;;
         *) die "unknown flag: $1 (try --help)" ;;
     esac
@@ -275,26 +302,173 @@ else
     fi
 fi
 
-# --- naive binary check -----------------------------------------------------
+# --- naive binary: детект таргета и установка -------------------------------
 
-NAIVE_PATH=""
-for cand in /opt/bin/naive /opt/bin/naiveproxy /opt/naiveproxy/bin/naiveproxy; do
-    [ -x "$cand" ] && NAIVE_PATH="$cand" && break
-done
-[ -z "$NAIVE_PATH" ] && command -v naive >/dev/null 2>&1 && NAIVE_PATH="$(command -v naive)"
-
-if [ -z "$NAIVE_PATH" ]; then
-    warn "naive binary not found (the panel does NOT install it)"
+naive_hint() {  # ручная установка — когда авто-детект не справился
     echo "  Download a prebuilt client from klzgrad/naiveproxy releases:"
     echo "    https://github.com/klzgrad/naiveproxy/releases"
     echo "  Pick the openwrt-* asset matching your router CPU (prefer -static), then:"
     echo "    tar -xJf naiveproxy-v*-openwrt-*.tar.xz"
     echo "    cp naiveproxy-v*/naive /opt/bin/naive && chmod +x /opt/bin/naive"
+    echo "  Or re-run the installer with --naive-target <openwrt-target>."
     echo "  See README «Установка бинарника naive» for CPU/asset matching."
-elif [ "$NAIVE_PATH" != "/opt/bin/naive" ]; then
-    warn "naive found at $NAIVE_PATH, but S99naiveproxy expects /opt/bin/naive"
-    echo "  Fix with: ln -sf '$NAIVE_PATH' /opt/bin/naive"
-fi
+}
+
+naive_fetch() {  # $1=url $2=dst — без die: бинарник вторичен, панель важнее
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL --connect-timeout 15 --retry 2 -o "$2" "$1" && return 0
+    fi
+    command -v wget >/dev/null 2>&1 && wget -q -T 30 -t 2 -O "$2" "$1" && return 0
+    return 1
+}
+
+# openwrt-таргет по железу (имена ассетов klzgrad/naiveproxy = таргеты OpenWrt):
+# uname -m даёт базу, /proc/cpuinfo — модель ядра (CPU part / Features /
+# cpu model). Для MIPS энддиан берём из ELF-заголовка (EI_DATA, байт 5):
+# 1 = little, 2 = big. NAIVEPROXY_UNAME_M / NAIVEPROXY_CPUINFO / NAIVEPROXY_ELF
+# переопределяют источники (тесты); в проде всегда системные значения.
+detect_naive_target() {  # -> stdout: таргет; return 1 — сборки под железо нет
+    um="${NAIVEPROXY_UNAME_M:-$(uname -m)}"
+    ci="${NAIVEPROXY_CPUINFO:-/proc/cpuinfo}"
+    part=$(sed -n 's/^CPU part[^:]*:[[:space:]]*//p' "$ci" 2>/dev/null | head -n 1 | tr 'A-F' 'a-f')
+    case "$um" in
+        x86_64|amd64) echo "x86_64"; return 0 ;;
+        i?86)         echo "x86";    return 0 ;;
+        aarch64|arm64)
+            case "$part" in
+                0xd03) echo "aarch64_cortex-a53" ;;
+                0xd08) echo "aarch64_cortex-a72" ;;
+                0xd0e) echo "aarch64_cortex-a76" ;;
+                *)     echo "aarch64_generic" ;;
+            esac
+            return 0 ;;
+        armv7*)
+            feats=$(sed -n 's/^Features[^:]*:[[:space:]]*//p' "$ci" 2>/dev/null | head -n 1)
+            has_neon=0; has_vfp4=0
+            echo "$feats" | grep -qw neon  && has_neon=1
+            echo "$feats" | grep -qw vfpv4 && has_vfp4=1
+            case "$part" in
+                0xc05) echo "arm_cortex-a5_vfpv4" ;;
+                0xc08) echo "arm_cortex-a8_vfpv3" ;;
+                0xc09) if [ "$has_neon" = 1 ]; then echo "arm_cortex-a9_neon"; else echo "arm_cortex-a9"; fi ;;
+                0xc0f) echo "arm_cortex-a15_neon-vfpv4" ;;
+                0xc07|*)
+                    if [ "$has_neon" = 1 ] && [ "$has_vfp4" = 1 ]; then
+                        echo "arm_cortex-a7_neon-vfpv4"
+                    elif [ "$has_vfp4" = 1 ]; then
+                        echo "arm_cortex-a7_vfpv4"
+                    else
+                        echo "arm_cortex-a7"
+                    fi ;;
+            esac
+            return 0 ;;
+        armv6*) echo "arm_arm1176jzf-s_vfp"; return 0 ;;
+        armv5*) echo "arm_arm926ej-s";       return 0 ;;
+        mips)
+            elf="${NAIVEPROXY_ELF:-/bin/sh}"
+            ei=$(od -An -tu1 -j5 -N1 "$elf" 2>/dev/null | tr -d '[:space:]')
+            [ -n "$ei" ] || ei=$(hexdump -s 5 -n 1 -e '1/1 "%u"' "$elf" 2>/dev/null | tr -d '[:space:]')
+            if [ -z "$ei" ]; then
+                warn "cannot detect MIPS endianness — assuming little-endian"
+                ei=1
+            fi
+            [ "$ei" = "2" ] && return 1  # big-endian: prebuilt-сборок нет
+            model=$(sed -n 's/^cpu model[^:]*:[[:space:]]*//p' "$ci" 2>/dev/null | head -n 1)
+            case "$model" in
+                *24Kc*|*24KEc*|*34Kc*|*1004Kc*|*mips32r2*) echo "mipsel_24kc" ;;
+                *) echo "mipsel_mips32" ;;
+            esac
+            return 0 ;;
+    esac
+    return 1
+}
+
+install_naive() {  # ставит /opt/bin/naive из релиза klzgrad/naiveproxy
+    target="$NAIVE_TARGET"
+    if [ -z "$target" ]; then
+        target=$(detect_naive_target) || target=""
+        if [ -z "$target" ]; then
+            warn "cannot map this hardware to an openwrt-* target — naive NOT installed"
+            naive_hint
+            return 1
+        fi
+    fi
+    if [ -n "$NAIVE_REF" ]; then
+        rel="releases/tags/$NAIVE_REF"
+    else
+        rel="releases/latest"
+    fi
+    info "naive: resolving ${NAIVE_SRC_REPO} ${NAIVE_REF:-latest} for target '$target'"
+    if ! naive_fetch "${NAIVE_SRC_API}/repos/${NAIVE_SRC_REPO}/${rel}" "$STAGE/naive-rel.json"; then
+        warn "cannot reach ${NAIVE_SRC_API} — naive NOT installed"
+        naive_hint
+        return 1
+    fi
+    tag=$(sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' "$STAGE/naive-rel.json" | head -n 1)
+    [ -n "$tag" ] || { warn "no tag_name in release JSON — naive NOT installed"; return 1; }
+    # кандидаты: точный таргет, затем arch-фолбэк; в каждом сначала -static
+    # (musl, без зависимостей от библиотек в /opt/lib — см. README)
+    fb=""
+    case "$target" in
+        aarch64_*) fb="aarch64_generic" ;;
+        arm_*)     fb="arm_cortex-a7" ;;
+        mipsel_*)  fb="mipsel_mips32" ;;
+    esac
+    url=""
+    build=""
+    for cand in "$target" "$fb"; do
+        [ -n "$cand" ] || continue
+        for flavor in "$cand-static" "$cand"; do
+            url=$(grep -o '"browser_download_url":[[:space:]]*"[^"]*"' "$STAGE/naive-rel.json" \
+                  | sed 's/.*"\(https:[^"]*\)"$/\1/' \
+                  | grep -E -- "-openwrt-${flavor}\.tar\.xz$" | head -n 1)
+            if [ -n "$url" ]; then build="$flavor"; break 2; fi
+        done
+    done
+    [ -n "$url" ] || {
+        warn "release $tag has no openwrt asset for target '$target' — naive NOT installed"
+        naive_hint
+        return 1
+    }
+    info "naive: downloading $tag ($build)"
+    if ! naive_fetch "$url" "$STAGE/naive.tar.xz"; then
+        warn "download failed: $url — naive NOT installed"
+        naive_hint
+        return 1
+    fi
+    if ! tar -xJf "$STAGE/naive.tar.xz" -C "$STAGE" 2>/dev/null; then
+        opkg install xz >/dev/null 2>&1
+        tar -xJf "$STAGE/naive.tar.xz" -C "$STAGE" || {
+            warn "tar -xJf failed (xz missing? try: opkg install xz)"
+            return 1
+        }
+    fi
+    nb=""
+    for f in "$STAGE"/naiveproxy-*/naive; do [ -f "$f" ] && nb="$f" && break; done
+    [ -n "$nb" ] || { warn "tarball contains no naiveproxy-*/naive"; return 1; }
+    chmod +x "$nb"
+    if ! nout=$("$nb" --version 2>&1); then
+        # несовместимый таргет умирает с illegal instruction — ловим ДО
+        # того, как сломали рабочий бинарник
+        warn "downloaded naive fails to run (wrong target '$build'?) — NOT installed"
+        naive_hint
+        return 1
+    fi
+    # заменяем через rename в той же ФС: открытый для записи работающий
+    # бинарник дал бы ETXTBSY, rename оставляет старый образ процессу
+    if ! cp -f "$nb" /opt/bin/naive.new || ! chmod 0755 /opt/bin/naive.new \
+       || ! mv -f /opt/bin/naive.new /opt/bin/naive; then
+        rm -f /opt/bin/naive.new
+        warn "cannot install /opt/bin/naive"
+        return 1
+    fi
+    mkdir -p "$NAIVEPROXY_DIR"
+    echo "$tag"   > "$NAIVEPROXY_DIR/naive-version"
+    echo "$build" > "$NAIVEPROXY_DIR/naive-build"
+    info "naive: installed $(echo "$nout" | head -n 1) -> /opt/bin/naive ($build)"
+    [ -n "$NAIVE_PATH" ] && echo "  previous binary replaced; restart the proxy service to apply"
+    return 0
+}
 
 # --- download + verify -----------------------------------------------------
 
@@ -348,6 +522,34 @@ mkdir -p /opt/etc/rc.d
 ln -sf "$INIT_DIR/S99naivepanel" /opt/etc/rc.d/S99naivepanel
 [ -f "$INIT_DIR/S99naiveproxy" ] && ln -sf "$INIT_DIR/S99naiveproxy" /opt/etc/rc.d/S99naiveproxy
 
+# --- naive binary: поставить, если нет ---------------------------------------
+# Существующий бинарник не трогаем (обновление — кнопкой в панели): self-update
+# панели крутит этот скрипт с --from-update и не должен качать 3.5МБ и трогать
+# прокси — README обещает его непрерывную работу при обновлении панели.
+
+NAIVE_PATH=""
+for cand in /opt/bin/naive /opt/bin/naiveproxy /opt/naiveproxy/bin/naiveproxy; do
+    [ -x "$cand" ] && NAIVE_PATH="$cand" && break
+done
+[ -z "$NAIVE_PATH" ] && command -v naive >/dev/null 2>&1 && NAIVE_PATH="$(command -v naive)"
+
+if [ "$FROM_UPDATE" = 1 ]; then
+    :  # см. комментарий выше — бинарник обновляется панелью отдельно
+elif [ "$SKIP_NAIVE" = 1 ]; then
+    info "naive: install skipped (--skip-naive)"
+elif [ -n "$NAIVE_PATH" ] && [ "$NAIVE_FORCE" != 1 ]; then
+    nver=$("$NAIVE_PATH" --version 2>/dev/null | head -n 1)
+    info "naive: found $NAIVE_PATH${nver:+ ($nver)}"
+    if [ "$NAIVE_PATH" != "/opt/bin/naive" ]; then
+        warn "S99naiveproxy expects /opt/bin/naive"
+        echo "  Fix with: ln -sf '$NAIVE_PATH' /opt/bin/naive"
+    fi
+else
+    [ "$NAIVE_FORCE" = 1 ] && [ -n "$NAIVE_PATH" ] \
+        && info "naive: --naive-force — replacing $NAIVE_PATH"
+    install_naive || true
+fi
+
 # --- config ----------------------------------------------------------------
 
 # panel.conf создаём один раз, существующий НИКОГДА не перезаписываем
@@ -376,6 +578,12 @@ if [ ! -f "$PANEL_CONF" ]; then
 #NAIVEPROXY_INIT="/opt/etc/init.d/S99naiveproxy"
 #NAIVEPROXY_LOG="/opt/var/log/naiveproxy.log"
 #NAIVEPROXY_PID="/opt/var/run/naiveproxy.pid"
+
+# Advanced: the naive binary itself (install.sh puts it at /opt/bin/naive;
+# the panel checks/updates it — mirrors and tests override the source)
+#NAIVEPROXY_BIN="/opt/bin/naive"
+#NAIVEPROXY_SRC_REPO="klzgrad/naiveproxy"
+#NAIVEPROXY_SRC_API="https://api.github.com"
 
 # Log trimming: a background thread in the panel checks known logs hourly
 # and trims files over NAIVEPANEL_LOG_MAX bytes down to the last

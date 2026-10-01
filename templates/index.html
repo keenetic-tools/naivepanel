@@ -222,6 +222,14 @@
               title="Загрузить пресеты из ранее экспортированного JSON">Импорт</button>
       <input type="file" id="importFile" accept=".json,application/json" style="display:none" aria-hidden="true" tabindex="-1">
     </div>
+    <h2 class="sect">Бинарник naive</h2>
+    <div id="nvInfo" style="font-size:12px;color:var(--mut);margin-top:10px">бинарник: проверка…</div>
+    <div class="actions" style="margin-top:8px">
+      <button class="ghost" data-action="naiveCheck" id="btnNvCheck"
+              title="Сверить версию бинарника с последним релизом klzgrad/naiveproxy">Проверить</button>
+      <button data-action="naiveUpdate" id="btnNvUpd" hidden>Обновить</button>
+    </div>
+
     <h2 class="sect">Панель</h2>
     <div class="actions" style="margin-top:10px">
       <button class="ghost wide" data-action="panelRestart" title="Перезапуск веб-панели (после обновления файлов)">Перезапуск</button>
@@ -330,7 +338,7 @@
 <dialog id="updDlg" aria-labelledby="updMsg">
   <p id="updMsg" style="margin:0 0 10px"></p>
   <pre class="log" id="updLog" style="max-height:180px"></pre>
-  <p style="margin:10px 0 4px;font-size:12px;color:var(--mut)">Лог панели (naivepanel.log)</p>
+  <p id="updPanelLogTitle" style="margin:10px 0 4px;font-size:12px;color:var(--mut)">Лог панели (naivepanel.log)</p>
   <pre class="log" id="updPanelLog" style="max-height:140px"></pre>
   <form method="dialog" class="dlg-actions">
     <button class="ghost" value="close" title="Обновление продолжит идти в фоне">Свернуть</button>
@@ -773,6 +781,10 @@ async function applyUpdate() {
   $('updMsg').textContent = 'Обновление до v'+want+'…';
   $('updLog').textContent = '';
   $('updPanelLog').textContent = '';
+  // диалог переиспользуется обновлением бинарника naive, которое прячет хвост
+  // лога панели — возвращаем перед апдейтом самой панели
+  $('updPanelLogTitle').style.display = '';
+  $('updPanelLog').style.display = '';
   $('updDlg').showModal();
   flash('Обновление до v'+want+' запущено', true);
   // Детект завершения — на клиенте (state на сервере не переживает рестарт):
@@ -812,6 +824,111 @@ function renderUpdLog(d) {
   const ptxt = d.panel || '(пока пусто)';
   if (pp.textContent !== ptxt) pp.textContent = ptxt;
   pp.scrollTop = pp.scrollHeight;
+}
+
+// --- Бинарник naive: версия и обновление из UI -------------------------------
+let nv = null; // ответ /api/naive/check: {version, tag, latest, available, target…}
+
+async function checkNaive(manual) {
+  const btn = $('btnNvCheck');
+  btn.disabled = true;
+  try {
+    nv = await jget('/api/naive/check' + (manual ? '?force=1' : ''));
+    renderNaive();
+    if (manual && !nv.error && !nv.available)
+      flash('Бинарник актуален: ' + (nv.tag || nv.version || '?'), true);
+  } catch (e) {
+    nv = null;
+    renderNaive(e.message);
+    if (manual) flash('Не удалось проверить бинарник: ' + e.message, false);
+  } finally { btn.disabled = false; }
+}
+
+function renderNaive(err) {
+  const info = $('nvInfo'), btn = $('btnNvUpd');
+  btn.hidden = true;
+  if (!nv) {
+    info.textContent = 'бинарник: не проверен' + (err ? ' — ' + err : '');
+    return;
+  }
+  if (nv.error) { // GitHub недоступен — тихая строка, как у обновлений панели
+    info.textContent = 'бинарник: не удалось проверить (' + escapeHtml(nv.error) + ')';
+    return;
+  }
+  const tgt = nv.target ? ' · ' + escapeHtml(nv.target) : '';
+  const cur = nv.tag || nv.version;
+  if (!cur) { // бинарника нет — та же кнопка его устанавливает
+    info.innerHTML = 'не установлен · доступен <b style="color:var(--acc)">'
+      + escapeHtml(nv.latest || '?') + '</b>' + tgt;
+    btn.hidden = false;
+    btn.textContent = 'Установить';
+    return;
+  }
+  if (nv.available) {
+    info.innerHTML = escapeHtml(cur) + ' → доступен <b style="color:var(--acc)">'
+      + escapeHtml(nv.latest) + '</b>' + tgt;
+    btn.hidden = false;
+    btn.textContent = 'Обновить';
+  } else {
+    info.textContent = 'бинарник: ' + cur + ' — актуален' + tgt;
+  }
+}
+
+async function updateNaive() {
+  if (!nv || !nv.latest) return;
+  const missing = !nv.tag && !nv.version;
+  const ok = await askConfirm(missing
+    ? 'Установить бинарник naive ' + nv.latest + '?\nПрокси, если запущен, будет перезапущен.'
+    : 'Обновить бинарник naive до ' + nv.latest + '?\nПрокси перезапустится — соединения оборвутся на секунду.',
+    {ok: missing ? 'Установить' : 'Обновить'});
+  if (!ok) return;
+  const btn = $('btnNvUpd');
+  btn.disabled = true;
+  let d;
+  try { d = await jpost('/api/naive/update', null); }
+  catch (e) { flash('Обновление бинарника не запущено: ' + e.message, false); btn.disabled = false; return; }
+  // тот же диалог, что у обновления панели; хвост лога панели не нужен
+  $('updPanelLogTitle').style.display = 'none';
+  $('updPanelLog').style.display = 'none';
+  $('updMsg').textContent = 'Бинарник naive → ' + d.target + '…';
+  $('updLog').textContent = '';
+  $('updDlg').showModal();
+  flash('Обновление бинарника до ' + d.target + ' запущено', true);
+  // Панель при этом живёт: завершение видно в state, падений сервера ждать не надо
+  const deadline = Date.now() + 600000; // 3.5МБ на медленном линке
+  for (;;) {
+    await new Promise(res => setTimeout(res, 2000));
+    let st = null;
+    try { st = await jget('/api/naive/status?lines=40'); } catch (e) { /* сеть мигнула */ }
+    if (st) {
+      const txt = st.content || '(лог пока пуст)';
+      if ($('updLog').textContent !== txt) $('updLog').textContent = txt;
+      $('updLog').scrollTop = $('updLog').scrollHeight;
+      const phase = st.state && st.state.phase;
+      if (phase === 'done') {
+        $('updMsg').textContent = 'Бинарник обновлён: ' + (st.state.version || st.state.target || '');
+        flash('Бинарник naive обновлён' + (st.state.restarted ? ' — сервис перезапущен' : ''), true);
+        $('updDlg').close();
+        await checkNaive(true);
+        await refreshAll();
+        btn.disabled = false;
+        return;
+      }
+      if (phase === 'failed') {
+        $('updMsg').textContent = 'Ошибка: ' + (st.state.error || 'см. лог ниже');
+        flash('Обновление бинарника не удалось — см. лог', false);
+        btn.disabled = false;
+        return;
+      }
+    }
+    if (Date.now() > deadline) {
+      $('updMsg').textContent = 'Не завершилось за 10 мин — лог ниже; подробности в '
+        + String(d.log || '/opt/var/log/naivepanel-naive.log');
+      flash('Обновление бинарника не завершилось вовремя', false);
+      btn.disabled = false;
+      return;
+    }
+  }
 }
 
 let lastLog = null;   // кэш — не трогаем DOM, если контент не изменился
@@ -982,6 +1099,8 @@ const ACTIONS = {
   updateCheck: () => checkUpdate(true),
   updateApply: () => applyUpdate(),
   updateNotes: () => showNotes(),
+  naiveCheck: () => checkNaive(true),
+  naiveUpdate: () => updateNaive(),
   select: (arg) => selectPreset(arg),
   activate: (arg) => activate(arg),
   duplicate: (arg) => dupPreset(arg),
@@ -1009,6 +1128,8 @@ refreshAll();
 // Тихий авто-check после первичной загрузки: если есть обновление — бейдж,
 // нет или сеть недоступна — тихая строка в секции «Панель», без тостов.
 setTimeout(() => checkUpdate(false), 1500);
+// Бинарник naive проверяем следом — тем же паттерном, без тостов
+setTimeout(() => checkNaive(false), 2500);
 const hashMatch = location.hash.match(/^#preset=(.+)$/);
 if (hashMatch) selectPreset(decodeURIComponent(hashMatch[1]));
 </script>

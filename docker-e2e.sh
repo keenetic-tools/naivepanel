@@ -133,6 +133,39 @@ echo "scheme reject=\$bad (expect 400)"
 # сервер: waitress, если установился, иначе Werkzeug — оба допустимы
 echo "server: \$(curl -sI http://127.0.0.1:8089/api/status | tr -d '\r' | sed -n 's/^[Ss]erver: //p')"
 
+echo "==> naive binary: auto-install via install.sh (real GitHub API + asset)"
+# контейнер aarch64 (Apple/ARM хост), cpuinfo не от Cortex → aarch64_generic;
+# musl-static сборка запускается в Debian — проверяем реальным --version
+test -x /opt/bin/naive || { echo "FAIL: /opt/bin/naive not installed"; exit 1; }
+echo "naive: \$(/opt/bin/naive --version 2>&1 | head -n 1)"
+echo "marker version: \$(cat /opt/etc/naive/proxy/naive-version)"
+echo "marker build:   \$(cat /opt/etc/naive/proxy/naive-build)"
+
+echo "==> naive: check + update via panel API"
+# имитируем устаревший маркер — панель должна увидеть доступное обновление
+echo "v113.0.5672.3-1" > /opt/etc/naive/proxy/naive-version
+chk=\$(curl -s 'http://127.0.0.1:8089/api/naive/check?force=1')
+echo "check: \$chk"
+echo "\$chk" | grep -q '"available": *true' || { echo "FAIL: stale naive not detected"; exit 1; }
+code=\$(curl -s -o /tmp/nupd.json -w '%{http_code}' \$H -X POST http://127.0.0.1:8089/api/naive/update)
+echo "update=\$code (expect 202)"
+[ "\$code" = "202" ] || { cat /tmp/nupd.json; exit 1; }
+phase=""
+for i in \$(seq 1 120); do
+  phase=\$(curl -s http://127.0.0.1:8089/api/naive/status \
+    | grep -o '"phase": *"[a-z]*"' | head -n1 | sed 's/.*"\([a-z]*\)"\$/\1/')
+  { [ "\$phase" = "done" ] || [ "\$phase" = "failed" ]; } && break
+  sleep 2
+done
+[ "\$phase" = "done" ] || {
+  echo "FAIL: naive update did not finish (phase=\$phase)"; curl -s http://127.0.0.1:8089/api/naive/status; exit 1
+}
+echo "naive after update: \$(/opt/bin/naive --version 2>&1 | head -n 1)"
+echo "marker version: \$(cat /opt/etc/naive/proxy/naive-version)"
+# после обновления тот же чек обязан говорить «актуально»
+curl -s 'http://127.0.0.1:8089/api/naive/check?force=1' \
+  | grep -q '"available": *false' || { echo "FAIL: still available after update"; exit 1; }
+
 echo "==> upgrade: rc.conf migration + --bind upsert + stale S99naiveproxy"
 mkdir -p /opt/etc/init.d
 # имитируем протухший S99naiveproxy (как после апгрейда v0.4.0 с pre-0.2.0):
@@ -152,6 +185,9 @@ if grep -q '/opt/etc/naive/proxy/config.json' /opt/etc/init.d/S99naiveproxy \
 else
   echo "FAIL: stale S99naiveproxy not replaced"; head -5 /opt/etc/init.d/S99naiveproxy; exit 1
 fi
+# повторный прогон установщика не трогает уже установленный бинарник
+test -x /opt/bin/naive || { echo "FAIL: naive lost after upgrade rerun"; exit 1; }
+echo "naive survived upgrade rerun: \$(/opt/bin/naive --version 2>&1 | head -n 1)"
 echo "==> E2E DONE"
 EOF
 

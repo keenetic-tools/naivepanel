@@ -113,6 +113,10 @@ curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/v0.10.0/i
 | `--bind HOST:PORT` | пишет `NAIVEPANEL_BIND` в `/opt/etc/naive/panel/panel.conf` |
 | `--hosts LIST` | пишет `NAIVEPANEL_HOSTS` в `panel.conf` |
 | `--ref TAG` | устанавливает конкретный тег (по умолчанию `v0.10.0`) |
+| `--naive-target TGT` | openwrt-таргет бинарника naive, поверх авто-детекта |
+| `--naive-ref TAG` | конкретный тег klzgrad/naiveproxy вместо последнего |
+| `--naive-force` | переустановить бинарник naive, даже если он уже есть |
+| `--skip-naive` | не трогать бинарник naive (только предупреждение) |
 | `--no-naive-init` | не ставить `S99naiveproxy` (если свой init-скрипт уже есть) |
 | `--yes` | неинтерактивный режим (без подтверждения) |
 | `--uninstall` | остановить сервисы и удалить файлы |
@@ -130,8 +134,15 @@ curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/v0.10.0/i
 Зависимости ставятся через `opkg`, а не pip: `python3` (если его ещё нет в
 `/opt`), `python3-flask`, при `--with-auth` — `python3-bcrypt`. На фидах без
 `python3-flask` (например `aarch64-k3.10`) установщик ставит `python3-pip`
-и flask через `pip3`. Отсутствие бинарника `naive` не блокирует установку —
-только предупреждение.
+и flask через `pip3`.
+
+Бинарник `naive` установщик ставит сам, если его нет: определяет openwrt-таргет
+по железу (`uname -m` + `/proc/cpuinfo`, энддиан MIPS — по ELF-заголовку),
+скачивает подходящий prebuilt с [klzgrad/naiveproxy][np] (приоритет — `-static`
+сборки) и проверяет его запуском `--version` до установки. Существующий
+бинарник не трогается — обновляется отдельно, кнопкой из панели (ниже).
+Не удалось (экзотическое железо, нет хода в GitHub) — установка панели
+продолжается, выводится подсказка для ручной установки.
 
 Пример с LAN-доступом:
 
@@ -174,6 +185,37 @@ curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/v0.10.0/i
   `install.sh` тоже читает `NAIVEPANEL_REPO`. Лог установщика —
   `/opt/var/log/naivepanel-update.log` (`NAIVEPANEL_UPDATE_LOG`).
 
+### Обновление бинарника naive из UI
+
+В секции «Бинарник naive» панель показывает установленную версию, таргет
+сборки и доступный релиз [klzgrad/naiveproxy][np] (тихий авто-check при
+загрузке, кэш 6ч). Кнопка «Обновить» (или «Установить», если бинарника нет):
+
+1. подтверждение — прокси перезапустится, соединения оборвутся на секунду;
+   сама панель продолжает работать;
+2. фоновый поток панели скачивает asset под сохранённый таргет (приоритет —
+   `-static` сборки), распаковывает и **проверяет запуском `--version`**;
+3. только после проверки бинарник заменяется (rename — работающий naive
+   доживает на старом образе), прежний остаётся
+   `/opt/etc/naive/proxy/backup/naive.previous`, и перезапускается
+   `S99naiveproxy`, если он работал.
+
+Тег и таргет последней установки хранятся маркерами `naive-version` /
+`naive-build` в `/opt/etc/naive/proxy/` (их пишет и `install.sh`): по точному
+тегу считается «есть ли обновление» — вывод `naive --version` теряет суффикс
+пересборки `-N`. Бинарник, поставленный вручную, работает тоже: маркеров нет —
+версия спрашивается у самого бинарника.
+
+Детали и страховки:
+
+- Сбой скачивания/распаковки/проверки **не трогает рабочий бинарник** —
+  состояние с ошибкой видно в диалоге обновления, retry доступен сразу.
+  Гейт доступа тот же, что у обновления панели: пароль либо loopback-bind.
+- Источник переопределяется: `NAIVEPROXY_SRC_REPO`, `NAIVEPROXY_SRC_API`,
+  `NAIVEPROXY_BIN` (env или panel.conf); лог —
+  `/opt/var/log/naivepanel-naive.log` (`NAIVEPROXY_UPDATE_LOG`), он же
+  попадает в ежечасную обрезку логов.
+
 ### Настройки панели (panel.conf)
 
 Все настройки панели живут в **`/opt/etc/naive/panel/panel.conf`** — этот файл
@@ -191,6 +233,10 @@ NAIVEPANEL_HOSTS="192.168.1.1:8089,router.local:8089"
 #NAIVEPROXY_INIT="/opt/etc/init.d/S99naiveproxy"
 #NAIVEPROXY_LOG="/opt/var/log/naiveproxy.log"
 #NAIVEPROXY_PID="/opt/var/run/naiveproxy.pid"
+# Бинарник naive и источник его обновлений (зеркала и тесты)
+#NAIVEPROXY_BIN="/opt/bin/naive"
+#NAIVEPROXY_SRC_REPO="klzgrad/naiveproxy"
+#NAIVEPROXY_SRC_API="https://api.github.com"
 #NAIVEPANEL_THREADS="4"
 # Логи: фоновый поток панели раз в час обрезает файлы больше NAIVEPANEL_LOG_MAX
 # до последних NAIVEPANEL_LOG_KEEP байт (0 в NAIVEPANEL_LOG_MAX отключает обрезку)
@@ -215,8 +261,8 @@ NAIVEPANEL_HOSTS="192.168.1.1:8089,router.local:8089"
 entware на роутере маленький — разросшийся `/opt/var/log/naiveproxy.log`
 умеет заполнить его целиком (после чего ни naive, ни панель не стартуют).
 Поэтому панель фоновым потоком раз в час проверяет все известные логи:
-`naiveproxy.log`, `naivepanel.log`, `naivepanel-update.log` и log-файл из
-ключа `log` активного пресета. Файлы больше `NAIVEPANEL_LOG_MAX` (по умолчанию
+`naiveproxy.log`, `naivepanel.log`, `naivepanel-update.log`,
+`naivepanel-naive.log` и log-файл из ключа `log` активного пресета. Файлы больше `NAIVEPANEL_LOG_MAX` (по умолчанию
 5 МБ, как в init-скриптах) обрезаются до последних `NAIVEPANEL_LOG_KEEP` байт
 (512 КБ). Инод файла сохраняется — работающий naive продолжает писать в тот же
 файл, место освобождается сразу. Init-скрипты дополнительно обнуляют слишком
@@ -225,32 +271,43 @@ entware на роутере маленький — разросшийся `/opt/
 
 ### Установка бинарника naive
 
-Панель управляет клиентом `naive`, но сам бинарник не ставит. Если его нет,
-скачай готовую сборку с [klzgrad/naiveproxy releases](https://github.com/klzgrad/naiveproxy/releases):
+Первичную установку делает `install.sh` сам: определяет openwrt-таргет по
+железу и скачивает prebuilt-сборку с [klzgrad/naiveproxy releases][np]
+(приоритет — `-static`, musl, без зависимостей от библиотек в `/opt/lib`),
+проверяет её запуском `--version` и кладёт в `/opt/bin/naive` — путь, которого
+ждёт `S99naiveproxy`. Обновляется бинарник кнопкой из панели (см. выше
+«Обновление бинарника naive из UI»).
 
-1. Определи архитектуру роутера:
+Таблица детекта (по `uname -m` + `/proc/cpuinfo`):
 
-   ```bash
-   uname -m          # mips / armv7l / aarch64 / x86_64
-   cat /proc/cpuinfo # уточни модель ядра (mips 24kc, cortex-a7/a53/a72…)
-   ```
+| uname -m | уточнение | таргет |
+|---|---|---|
+| `aarch64` | `CPU part`: `0xd03`/`0xd08`/`0xd0e` → a53/a72/a76, прочее → generic | `aarch64_cortex-a53` … `aarch64_generic` |
+| `armv7l` | `CPU part` + `Features` (neon/vfpv4 → суффиксы) | `arm_cortex-a7[_neon-vfpv4|_vfpv4]`, `arm_cortex-a9[_neon]` и др. |
+| `armv6l` / `armv5l` | — | `arm_arm1176jzf-s_vfp` / `arm_arm926ej-s` |
+| `mips` | энддиан по ELF-заголовку `/bin/sh`; `cpu model` 24Kc/1004Kc → 24kc | `mipsel_24kc`, `mipsel_mips32` (big-endian — сборок нет) |
+| `x86_64` / `i686` | — | `x86_64` / `x86` |
 
-2. Выбери `openwrt-*`-asset под свой CPU. Для Entware предпочтительны
-   **`-static`** сборки — они musl-static и не зависят от библиотек в `/opt/lib`.
+Авто-детект промахнулся или хочется конкретную версию — флаги:
 
-3. Распакуй и положи бинарник как `/opt/bin/naive` (имя, которое ждёт
-   `S99naiveproxy`):
+```bash
+install.sh --yes --naive-target aarch64_cortex-a53   # поверх детекта
+install.sh --yes --naive-ref v150.0.7871.63-1        # конкретный тег
+install.sh --yes --naive-force                       # переустановить имеющийся
+```
 
-   ```bash
-   tar -xJf naiveproxy-v*-openwrt-*.tar.xz
-   cp naiveproxy-v*/naive /opt/bin/naive && chmod +x /opt/bin/naive
-   ```
+Ручная установка (например, сеть без хода в GitHub) — как раньше:
 
-   Если бинарник уже лежит в другом месте — достаточно symlink:
+```bash
+tar -xJf naiveproxy-v*-openwrt-*.tar.xz
+cp naiveproxy-v*/naive /opt/bin/naive && chmod +x /opt/bin/naive
+```
 
-   ```bash
-   ln -sf /opt/naiveproxy/bin/naiveproxy /opt/bin/naive
-   ```
+Если бинарник уже лежит в другом месте — достаточно symlink:
+
+```bash
+ln -sf /opt/naiveproxy/bin/naiveproxy /opt/bin/naive
+```
 
 ## Ручной деплой на Keenetic (Entware)
 
@@ -520,3 +577,5 @@ curl -s http://127.0.0.1:8089/api/status
 
 [MIT](LICENSE). Бинарник `naive` из [klzgrad/naiveproxy](https://github.com/klzgrad/naiveproxy)
 распространяется под своей лицензией (BSD-3-Clause).
+
+[np]: https://github.com/klzgrad/naiveproxy/releases

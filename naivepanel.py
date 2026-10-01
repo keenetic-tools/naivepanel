@@ -16,6 +16,7 @@ import hashlib
 import ipaddress
 import json
 import os
+import platform
 import re
 import secrets
 import shutil
@@ -46,6 +47,8 @@ PANEL_CONF = Path(os.environ.get("NAIVEPANEL_CONF", "/opt/etc/naive/panel/panel.
 CONF_KEYS = frozenset({
     "NAIVEPANEL_BIND", "NAIVEPANEL_HOSTS", "NAIVEPANEL_PASS",
     "NAIVEPROXY_DIR", "NAIVEPROXY_INIT", "NAIVEPROXY_LOG", "NAIVEPROXY_PID",
+    "NAIVEPROXY_BIN", "NAIVEPROXY_SRC_REPO", "NAIVEPROXY_SRC_API",
+    "NAIVEPROXY_UPDATE_LOG",
     "NAIVEPANEL_INIT", "NAIVEPANEL_THREADS",
     "NAIVEPANEL_LOG", "NAIVEPANEL_LOG_MAX", "NAIVEPANEL_LOG_KEEP",
 })
@@ -88,6 +91,26 @@ ACTIVE_POINTER = NAIVEPROXY_DIR / ".active"  # имя текущего акти�
 INIT_SCRIPT = Path(os.environ.get("NAIVEPROXY_INIT", "/opt/etc/init.d/S99naiveproxy"))
 LOG_FILE = Path(os.environ.get("NAIVEPROXY_LOG", "/opt/var/log/naiveproxy.log"))
 PID_FILE = Path(os.environ.get("NAIVEPROXY_PID", "/opt/var/run/naiveproxy.pid"))
+
+# --- Бинарник naive: источник и маркеры --------------------------------------
+# Первичную установку делает install.sh (когда бинарника нет); панель лишь
+# проверяет/обновляет его с релизов klzgrad/naiveproxy. Тег последней
+# установки и openwrt-таргет хранятся маркерами рядом с конфигами — их пишут
+# и установщик, и панель, поэтому available считается по точному тегу
+# (вывод `naive --version` теряет суффикс пересборки -N).
+
+NAIVE_BIN = Path(os.environ.get("NAIVEPROXY_BIN", "/opt/bin/naive"))
+NAIVE_BUILD = NAIVEPROXY_DIR / "naive-build"    # напр. aarch64_cortex-a53-static
+NAIVE_TAG = NAIVEPROXY_DIR / "naive-version"    # напр. v154.0.8037.49-2
+NAIVE_SRC_REPO = os.environ.get("NAIVEPROXY_SRC_REPO", "klzgrad/naiveproxy")
+NAIVE_SRC_API = os.environ.get("NAIVEPROXY_SRC_API", "https://api.github.com").rstrip("/")
+NAIVE_UPDATE_LOG = Path(os.environ.get("NAIVEPROXY_UPDATE_LOG",
+                                       "/opt/var/log/naivepanel-naive.log"))
+NAIVE_UPDATE_STATE = NAIVEPROXY_DIR / "naive-update.state"
+_NAIVE_CHECK_TTL = 6 * 3600.0    # как у панели: авто-check не должен расходовать
+_NAIVE_ERR_TTL = 10 * 60.0       # лимит GitHub API; недоступный GitHub не долбим
+_NAIVE_STALE_S = 15 * 60         # чаще раза в 10 минут (запись без прогресса)
+
 PANEL_ADMIN_PASS = Path(os.environ.get("NAIVEPANEL_PASS", "/opt/etc/naive/panel/admin.pass"))
 PANEL_BIND = os.environ.get("NAIVEPANEL_BIND", "127.0.0.1:8089")
 # Allowlist Host-заголовков (через запятую, с портом). Пусто — проверка выкл.
@@ -1090,6 +1113,26 @@ def _http_get(url: str, timeout: float = 6.0) -> str:
     raise RuntimeError(f"GET {url} failed ({last or 'curl and wget not found'})")
 
 
+def _http_download(url: str, dst: Path, timeout: float = 300.0) -> None:
+    """Скачивание бинарного файла через curl/wget — как _http_get, но в файл.
+
+    Архив бинарника (~3.5МБ) не проходит через stdout-подстановку; таймаут
+    щедрый — на медленном линке роутера качается заметно дольше JSON.
+    """
+    for cmd in (["curl", "-fsSL", "--max-time", str(int(timeout)),
+                 "-o", str(dst), url],
+                ["wget", "-q", "-T", "60", "-t", "2", "-O", str(dst), url]):
+        try:
+            # cmd — фиксированный шаблон, url передаётся argv-элементом
+            r = subprocess.run(cmd, capture_output=True, text=True,
+                               timeout=timeout + 30)  # nosec B603
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            continue
+        if r.returncode == 0 and dst.exists() and dst.stat().st_size > 0:
+            return
+    raise RuntimeError(f"download {url} failed")
+
+
 def _ver_key(v: str) -> tuple[int, ...]:
     """Версия → числовой кортеж для сравнения: 0.10.0 > 0.9.0 (строкой — нет)."""
     parts: list[int] = []
@@ -1344,6 +1387,362 @@ def api_update_log():
     return resp
 
 
+# --- Бинарник naive: проверка версии и обновление из UI ----------------------
+
+def _naive_bin_version() -> str | None:
+    """Версия из самого бинарника: `naive --version` → «naive 154.0.8037.49».
+
+    Бинарника нет или он не запускается (битая ручная установка) → None.
+    """
+    if not NAIVE_BIN.exists():
+        return None
+    try:
+        r = subprocess.run([str(NAIVE_BIN), "--version"], capture_output=True,
+                           text=True, timeout=15)  # nosec B603
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    out = (r.stdout or "").strip()
+    if r.returncode != 0 or not out:
+        return None
+    line = out.splitlines()[0].strip()
+    if line.lower().startswith("naive "):
+        line = line[len("naive "):].strip()
+    return line or None
+
+
+def _naive_ver_key(tag_or_ver: str) -> tuple[int, ...]:
+    """«v154.0.8037.49-2» → (154, 0, 8037, 49, 2) — для сравнения версий.
+
+    Суффикс пересборки (-N) учитывается: v154...-2 новее v154...-1, а вывод
+    `naive --version` без суффикса даёт (... ,0) — старше любого -N.
+    """
+    s = (tag_or_ver or "").strip().lower().lstrip("v")
+    build = 0
+    head, sep, tail = s.rpartition("-")
+    if sep and tail.isdigit():
+        s, build = head, int(tail)
+    parts: list[int] = []
+    for p in s.split("."):
+        m = re.match(r"\d+", p)
+        parts.append(int(m.group()) if m else 0)
+    return (*parts, build)
+
+
+def _naive_read(path: Path) -> str | None:
+    try:
+        v = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return v or None
+
+
+def _naive_detect_target() -> str | None:
+    """openwrt-таргет по железу — зеркало detect_naive_target из install.sh.
+
+    NAIVEPROXY_UNAME_M / NAIVEPROXY_CPUINFO / NAIVEPROXY_ELF переопределяют
+    источники (тесты); в проде — platform.machine(), /proc/cpuinfo и
+    ELF-заголовок /bin/sh (энддиан MIPS: байт 5, 1=LE 2=BE). None — prebuilt
+    под такое железо не существует (big-endian MIPS, экзотическая arch).
+    """
+    machine = (os.environ.get("NAIVEPROXY_UNAME_M") or platform.machine()).lower()
+    try:
+        info = Path(os.environ.get("NAIVEPROXY_CPUINFO", "/proc/cpuinfo")) \
+            .read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        info = ""
+
+    def field(name: str) -> str:
+        for line in info.splitlines():
+            key, sep, value = line.partition(":")
+            if sep and key.strip() == name:
+                return value.strip()
+        return ""
+
+    part = field("CPU part").lower()
+    if machine in ("x86_64", "amd64"):
+        return "x86_64"
+    if re.fullmatch(r"i[3-6]86", machine):
+        return "x86"
+    if machine in ("aarch64", "arm64"):
+        return {"0xd03": "aarch64_cortex-a53",
+                "0xd08": "aarch64_cortex-a72",
+                "0xd0e": "aarch64_cortex-a76"}.get(part, "aarch64_generic")
+    if machine.startswith("armv7"):
+        feats = set(field("Features").split())
+        neon, vfp4 = "neon" in feats, "vfpv4" in feats
+        if part == "0xc05":
+            return "arm_cortex-a5_vfpv4"
+        if part == "0xc08":
+            return "arm_cortex-a8_vfpv3"
+        if part == "0xc09":
+            return "arm_cortex-a9_neon" if neon else "arm_cortex-a9"
+        if part == "0xc0f":
+            return "arm_cortex-a15_neon-vfpv4"
+        if neon and vfp4:
+            return "arm_cortex-a7_neon-vfpv4"
+        if vfp4:
+            return "arm_cortex-a7_vfpv4"
+        return "arm_cortex-a7"
+    if machine.startswith("armv6"):
+        return "arm_arm1176jzf-s_vfp"
+    if machine.startswith("armv5"):
+        return "arm_arm926ej-s"
+    if machine == "mips":
+        try:
+            data = Path(os.environ.get("NAIVEPROXY_ELF", "/bin/sh")).read_bytes()
+        except OSError:
+            data = b""
+        if data[5:6] == b"\x02":
+            return None  # big-endian: prebuilt-сборок нет
+        model = field("cpu model")
+        if any(k in model for k in ("24Kc", "24KEc", "34Kc", "1004Kc", "mips32r2")):
+            return "mipsel_24kc"
+        return "mipsel_mips32"
+    return None
+
+
+def _naive_pick_asset(assets: list[tuple[str, str]],
+                      target: str | None) -> tuple[str, str] | None:
+    """Лучший (имя, url) ассета под таргет: точный → arch-фолбэк,
+    в каждом сначала -static (musl, без зависимостей от библиотек /opt/lib).
+    """
+    if not target:
+        return None
+    fallback = ""
+    if target.startswith("aarch64_"):
+        fallback = "aarch64_generic"
+    elif target.startswith("arm_"):
+        fallback = "arm_cortex-a7"
+    elif target.startswith("mipsel_"):
+        fallback = "mipsel_mips32"
+    for cand in (target, fallback):
+        if not cand:
+            continue
+        for flavor in (f"{cand}-static", cand):
+            for name, url in assets:
+                if name.endswith(f"-openwrt-{flavor}.tar.xz"):
+                    return name, url
+    return None
+
+
+def _naive_release() -> dict[str, Any]:
+    """Последний релиз klzgrad/naiveproxy: тег + ассеты (+ заметка)."""
+    data = json.loads(_http_get(f"{NAIVE_SRC_API}/repos/{NAIVE_SRC_REPO}/releases/latest"))
+    tag = data.get("tag_name") or ""
+    assets = [(a.get("name") or "", a.get("browser_download_url") or "")
+              for a in data.get("assets") or [] if isinstance(a, dict)]
+    if not tag or not assets:
+        raise RuntimeError(f"unexpected release payload from {NAIVE_SRC_REPO}")
+    return {"tag": tag, "notes": (data.get("body") or "").strip()[:4000],
+            "url": data.get("html_url") or "", "assets": assets}
+
+
+def _naive_state_read() -> dict[str, Any]:
+    try:
+        st = json.loads(NAIVE_UPDATE_STATE.read_text(encoding="utf-8"))
+        return st if isinstance(st, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _naive_state_write(st: dict[str, Any]) -> None:
+    try:
+        NAIVEPROXY_DIR.mkdir(parents=True, exist_ok=True)
+        NAIVE_UPDATE_STATE.write_text(json.dumps(st) + "\n", encoding="utf-8")
+    except OSError as exc:  # state не критичен: обновление переживёт и без него
+        app.logger.warning("cannot write %s: %s", NAIVE_UPDATE_STATE, exc)
+
+
+def _naive_state() -> dict[str, Any]:
+    """State обновления бинарника; «running» без прогресса → stale.
+
+    Воркер живёт потоком внутри панели: её рестарт убивает поток, pid для
+    проверки взять неоткуда — потому только тайм-аут (скачивание ~3.5МБ
+    укладывается в него с запасом, а реальный прогресс виден в логе).
+    """
+    st = _naive_state_read()
+    if st.get("phase") == "running":
+        if time.time() - float(st.get("started") or 0) > _NAIVE_STALE_S:
+            st["stale"] = True
+    return st
+
+
+def _naive_log(msg: str) -> None:
+    try:
+        with NAIVE_UPDATE_LOG.open("a", encoding="utf-8") as fh:
+            fh.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
+    except OSError:
+        pass  # лог не критичен
+
+
+def _naive_update_worker() -> None:
+    """Фоновое обновление /opt/bin/naive (запускается потоком из apply).
+
+    Порядок страховит: скачали → распаковали → ПРОВЕРИЛИ `--version` →
+    только тогда заменили (rename: работающий naive продолжает старый инод)
+    и перезапустили сервис, если он работал. Любой сбой до rename не трогает
+    рабочий бинарник; прежний образ остаётся бэкапом naive.previous.
+    """
+    try:
+        rel = _naive_release()
+        tag = rel["tag"]
+        build = _naive_read(NAIVE_BUILD) or ""
+        target = build.removesuffix("-static") or _naive_detect_target()
+        picked = _naive_pick_asset(rel["assets"], target)
+        if not picked:
+            raise RuntimeError(f"release {tag} has no openwrt asset for "
+                               f"target {target!r}")
+        name, url = picked
+        _naive_log(f"{tag}: asset {name} ({target})")
+        stage = NAIVEPROXY_DIR / ".naive-update"
+        shutil.rmtree(stage, ignore_errors=True)
+        stage.mkdir(parents=True, exist_ok=True)
+        tgz = stage / "naive.tar.xz"
+        _naive_log(f"downloading {url}")
+        _http_download(url, tgz)
+        r = subprocess.run(["tar", "-xJf", str(tgz), "-C", str(stage)],
+                           capture_output=True, text=True, timeout=120)  # nosec B603
+        if r.returncode != 0:
+            raise RuntimeError("tar -xJf failed (xz missing? opkg install xz): "
+                               + (r.stderr.strip() or f"rc={r.returncode}"))
+        bins = sorted(stage.glob("naiveproxy-*/naive"))
+        if not bins:
+            raise RuntimeError("tarball contains no naiveproxy-*/naive")
+        new_bin = bins[0]
+        new_bin.chmod(0o755)
+        rv = subprocess.run([str(new_bin), "--version"], capture_output=True,
+                            text=True, timeout=15)  # nosec B603
+        if rv.returncode != 0:
+            raise RuntimeError("downloaded binary failed --version check "
+                               "(wrong target?) — keeping the current one")
+        new_ver = (rv.stdout or "").strip().splitlines()[0].strip()
+        _naive_log(f"check ok: {new_ver}")
+        was_active = _status()["active"]
+        if NAIVE_BIN.exists():
+            backup = NAIVEPROXY_DIR / "backup" / "naive.previous"
+            backup.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(NAIVE_BIN, backup)
+        # cp в тот же каталог + os.replace = rename внутри ФС: открытый
+        # для записи работающий бинарник дал бы ETXTBSY, а rename оставляет
+        # старый образ выполняющемуся процессу
+        placed = NAIVE_BIN.with_name(NAIVE_BIN.name + ".new")
+        shutil.copy2(new_bin, placed)
+        placed.chmod(0o755)
+        os.replace(placed, NAIVE_BIN)
+        NAIVE_TAG.write_text(tag + "\n", encoding="utf-8")
+        NAIVE_BUILD.write_text(
+            name.rsplit(".tar.xz", 1)[0].rsplit("-openwrt-", 1)[-1] + "\n",
+            encoding="utf-8")
+        shutil.rmtree(stage, ignore_errors=True)
+        _naive_log(f"installed {tag} -> {NAIVE_BIN}")
+        restarted = False
+        if was_active and INIT_SCRIPT.exists():
+            restarted = True
+            rst = _service("restart")
+            _naive_log(f"service restart rc={rst['rc']}")
+        _naive_state_write({"phase": "done", "target": tag,
+                            "finished": time.time(), "version": new_ver,
+                            "restarted": restarted})
+        app.logger.info("naive binary updated to %s (%s)", tag, name)
+    except Exception as exc:  # любая ошибка воркера — в state и лог, не в панель
+        _naive_log(f"failed: {exc}")
+        app.logger.warning("naive update failed", exc_info=True)
+        _naive_state_write({"phase": "failed", "error": str(exc)[:500],
+                            "finished": time.time()})
+
+
+_naive_check_cache: dict[str, Any] = {}
+
+
+@app.route("/api/naive/check")
+def api_naive_check():
+    """Версия бинарника naive против последнего релиза klzgrad/naiveproxy.
+
+    Текущая версия — из маркера (точный тег) с фолбэком на `naive --version`
+    (бинарник, поставленный руками, маркера не имеет). Сеть/GitHub недоступны
+    — 200 с error и available=False, как у /api/update/check.
+    """
+    force = request.args.get("force") in ("1", "true")
+    now = time.monotonic()
+    if not force and _naive_check_cache:
+        if now - _naive_check_cache["at"] < _naive_check_cache.get("ttl", _NAIVE_CHECK_TTL):
+            out = dict(_naive_check_cache["data"])
+            out["cached"] = True
+            return jsonify(out)
+    checked = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    version = _naive_bin_version()
+    tag = _naive_read(NAIVE_TAG)
+    out: dict[str, Any] = {
+        "version": version,
+        "tag": tag,
+        "path": str(NAIVE_BIN) if NAIVE_BIN.exists() else None,
+        "target": _naive_read(NAIVE_BUILD) or _naive_detect_target(),
+        "checked_at": checked,
+    }
+    try:
+        rel = _naive_release()
+    except (RuntimeError, ValueError) as exc:
+        out.update({"latest": None, "available": False, "error": str(exc)})
+        _naive_check_cache.update({"at": now, "ttl": _NAIVE_ERR_TTL, "data": out})
+        return jsonify(out)
+    latest = rel["tag"]
+    cur = _naive_ver_key(tag) if tag else (_naive_ver_key(version) if version else None)
+    out.update({"latest": latest,
+                "available": cur is None or _naive_ver_key(latest) > cur,
+                "notes": rel["notes"], "url": rel["url"]})
+    _naive_check_cache.update({"at": now, "ttl": _NAIVE_CHECK_TTL, "data": out})
+    return jsonify(out)
+
+
+@app.route("/api/naive/update", methods=["POST"])
+def api_naive_update():
+    """Обновление (или первичная установка) бинарника naive фоновым потоком.
+
+    Панель сама не перезапускается — воркер меняет только /opt/bin/naive и
+    перезапускает прокси, если тот работал. Отсюда гейт как у /api/update/
+    apply: замена root-исполняемого файла в LAN без auth недопустима.
+    """
+    if not PANEL_ADMIN_PASS.exists() and not _bind_is_loopback():
+        abort(403, description="panel is exposed without a password — set one "
+                               "(install.sh --with-auth) before updating")
+    st = _naive_state()
+    if st.get("phase") == "running" and not st.get("stale"):
+        abort(409, description=f"naive update to {st.get('target')} already in "
+                               f"progress — log: {NAIVE_UPDATE_LOG}")
+    try:
+        rel = _naive_release()
+    except (RuntimeError, ValueError) as exc:
+        abort(502, description=str(exc))
+    tag = rel["tag"]
+    try:
+        NAIVE_UPDATE_LOG.parent.mkdir(parents=True, exist_ok=True)
+        NAIVE_UPDATE_LOG.write_text(
+            f"== naive binary update -> {tag}, "
+            f"{time.strftime('%Y-%m-%d %H:%M:%S')}\n", encoding="utf-8")
+    except OSError:
+        pass  # лог не критичен
+    _naive_state_write({"phase": "running", "target": tag, "started": time.time()})
+    threading.Thread(target=_naive_update_worker, name="naive-update",
+                     daemon=True).start()
+    app.logger.warning("naive binary update to %s triggered by %s",
+                       tag, request.remote_addr)
+    return jsonify({"started": True, "target": tag, "log": str(NAIVE_UPDATE_LOG)}), 202
+
+
+@app.route("/api/naive/status")
+def api_naive_status():
+    """State обновления бинарника + хвост лога (UI поллит из диалога)."""
+    try:
+        lines = int(request.args.get("lines", "40"))
+    except ValueError:
+        lines = 40
+    resp = jsonify({"lines": lines,
+                    "content": _tail_path(NAIVE_UPDATE_LOG, lines),
+                    "state": _naive_state()})
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
 # Лог какого хвоста показывать: по умолчанию — naive, src=panel — сама панель
 LOG_SOURCES: dict[str, Path] = {"proxy": LOG_FILE, "panel": PANEL_LOG}
 
@@ -1417,7 +1816,7 @@ def _trim_logs_once() -> list[tuple[Path, int, int]]:
     """Один проход по всем известным логам; возвращает обрезанные (путь, было, стало)."""
     if LOG_TRIM_MAX <= 0:
         return []
-    targets: set[Path] = {LOG_FILE, PANEL_LOG, UPDATE_LOG}
+    targets: set[Path] = {LOG_FILE, PANEL_LOG, UPDATE_LOG, NAIVE_UPDATE_LOG}
     extra = _active_extra_log()
     if extra:
         targets.add(extra)
