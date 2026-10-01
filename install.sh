@@ -3,7 +3,7 @@
 # firmware with Entware). Runs ON the router.
 #
 # Bootstrap (pin to a release tag, not `main`):
-#   curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/v0.10.0/install.sh | sh -s -- --with-auth
+#   curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/v0.11.0/install.sh | sh -s -- --with-auth
 #
 # Safe to pipe into `sh`: the confirmation and password prompts read the
 # terminal (/dev/tty), never the piped stdin. Add --yes to skip confirmation.
@@ -21,7 +21,7 @@
 #   --with-auth          create /opt/etc/naive/panel/admin.pass (interactive)
 #   --bind HOST:PORT     write NAIVEPANEL_BIND to /opt/etc/naive/panel/panel.conf
 #   --hosts LIST         write NAIVEPANEL_HOSTS to /opt/etc/naive/panel/panel.conf
-#   --ref TAG            git tag/ref to install (default: v0.10.0)
+#   --ref TAG            git tag/ref to install (default: v0.11.0)
 #   --naive-target TGT   openwrt target for the naive binary, overrides
 #                        hardware detection (e.g. aarch64_cortex-a53)
 #   --naive-ref TAG      klzgrad/naiveproxy tag to install (default: latest)
@@ -41,7 +41,7 @@ set -u
 # NAIVEPANEL_REPO: переопределение репозитория (зеркала, e2e-тесты с локальным
 # сервером). Панель при self-update передаёт его в окружение потомку.
 REPO="${NAIVEPANEL_REPO:-keenetic-tools/naivepanel}"
-REF="v0.10.0"
+REF="v0.11.0"
 # Источник prebuilt-бинарников naive (зеркала, e2e с локальным сервером).
 NAIVE_SRC_REPO="${NAIVEPROXY_SRC_REPO:-klzgrad/naiveproxy}"
 NAIVE_SRC_API="${NAIVEPROXY_SRC_API:-https://api.github.com}"
@@ -89,7 +89,7 @@ Usage: install.sh [flags]
   --with-auth          create /opt/etc/naive/panel/admin.pass (interactive)
   --bind HOST:PORT     write NAIVEPANEL_BIND to /opt/etc/naive/panel/panel.conf
   --hosts LIST         write NAIVEPANEL_HOSTS to /opt/etc/naive/panel/panel.conf
-  --ref TAG            git tag/ref to install (default: v0.10.0)
+  --ref TAG            git tag/ref to install (default: v0.11.0)
   --naive-target TGT   openwrt target for naive binary (override detection)
   --naive-ref TAG      klzgrad/naiveproxy tag (default: latest release)
   --naive-force        (re)install naive binary even if one exists
