@@ -84,28 +84,30 @@
                         color:var(--mut); font-size:13px; font-weight:400; padding:2px 7px;
                         border-radius:6px; cursor:pointer; }
   #editorTitle .close:hover { background:var(--hov); color:var(--fg); filter:none; box-shadow:none; }
-  .svcinfo { display:grid; gap:4px; margin-bottom:14px; font-size:13px; }
+  .svcinfo { display:grid; grid-template-columns:1fr 1fr; gap:2px 14px; margin-bottom:14px; font-size:13px; }
   .svcinfo .kv { display:flex; justify-content:space-between; gap:10px; min-width:0;
-                 padding:3px 8px; margin:0 -8px; border-radius:6px; }
-  .svcinfo .kv:nth-child(odd) { background:var(--sel-bg); }
-  .svcinfo .kv span { color:var(--mut); }
+                 padding:2px 6px; margin:0 -6px; border-radius:6px; }
+  /* «состояние» (точка + слово) не влезает в полуколонку без обрезки */
+  .svcinfo .kv.wide { grid-column:1 / -1; }
+  .svcinfo .kv span { color:var(--mut); white-space:nowrap; }
   .svcinfo .kv b { font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
                    font-variant-numeric:tabular-nums; }
   ul.presets { list-style:none; padding:0; margin:0; }
   #search { margin-bottom:10px; }
-  ul.presets li { border:1px solid var(--border); border-radius:10px; margin-bottom:8px;
-                  display:flex; flex-wrap:wrap; align-items:center; background:var(--input-bg);
+  ul.presets li { border:1px solid var(--border); border-radius:10px; margin-bottom:6px;
+                  display:flex; align-items:center; background:var(--input-bg);
                   transition:border-color .14s ease, transform .14s ease, box-shadow .14s ease; }
   ul.presets li:hover { border-color:var(--acc); transform:translateY(-1px); box-shadow:var(--shadow-1); }
   ul.presets li.selected { border-color:var(--border-sel); background:var(--sel-bg); }
   /* active (запущенный) важнее selected — его зелёная рамка переопределяет */
   ul.presets li.active { border-color:var(--acc); background:var(--acc-tint); }
-  ul.presets .sel { flex:1 1 auto; min-width:0; display:flex; align-items:center; gap:6px 8px;
-                    padding:9px 4px 9px 12px; background:none; border:none; color:inherit;
+  ul.presets .sel { flex:1 1 auto; min-width:0; display:flex; align-items:center; gap:8px;
+                    padding:7px 4px 7px 11px; background:none; border:none; color:inherit;
                     font:inherit; text-align:left; cursor:pointer; border-radius:9px; }
   ul.presets .sel:hover { background:var(--hov); }
-  ul.presets .name { font-weight:600; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  ul.presets .proxy { flex-basis:100%; color:var(--mut); font-size:12px; padding:0 12px 9px;
+  ul.presets .name { font-weight:600; flex:0 1 auto; max-width:55%;
+                     overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  ul.presets .proxy { flex:1 1 0; min-width:0; color:var(--mut); font-size:12px;
                       overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   ul.presets .badge { font-size:11px; font-weight:600; padding:2px 7px; border-radius:999px;
                       background:var(--badge-bg); color:var(--acc); white-space:nowrap; }
@@ -121,7 +123,7 @@
            border:1px dashed var(--border); border-radius:10px; }
   .empty .ico { display:block; font-size:22px; opacity:.55; margin-bottom:6px; }
   .empty .hint { display:block; font-size:12px; opacity:.75; margin-top:4px; }
-  .skel { list-style:none; height:46px; border-radius:10px; margin-bottom:8px;
+  .skel { list-style:none; height:38px; border-radius:10px; margin-bottom:6px;
           border:1px solid var(--border); background:var(--sel-bg); }
   @media (prefers-reduced-motion: no-preference) {
     .skel { animation:skel 1.4s ease-in-out infinite; }
@@ -482,8 +484,8 @@ function renderStatus(st) {
     ['pid', st.active && st.pid != null ? String(st.pid) : '—'],
     ['панель', 'v'+escapeHtml(st.version || '?')],
   ];
-  $('svcinfo').innerHTML = rows.map(([k, v]) =>
-    '<div class="kv"><span>'+k+'</span><b>'+v+'</b></div>').join('');
+  $('svcinfo').innerHTML = rows.map(([k, v], i) =>
+    '<div class="kv'+(i === 0 ? ' wide' : '')+'"><span>'+k+'</span><b>'+v+'</b></div>').join('');
   $('svcinfo').title = 'обновлено ' + new Date().toLocaleTimeString();
 }
 
@@ -515,18 +517,21 @@ function renderPresets(presets) {
   for (const p of shown) {
     const li = document.createElement('li');
     li.className = (p.active ? 'active' : '') + (p.name === current ? ' selected' : '');
+    // односторочная строка: имя + бейджи + замаскированный proxy с ellipsis;
+    // полный URI — в title (proxy уже без пароля, маска только для UI)
+    const masked = p.proxy.replace(/:\/\/[^@]+@/, '://***@');
     li.innerHTML = '<button class="sel" '+(p.name === current ? 'aria-current="true" ' : '')
       + 'data-action="select" data-arg="'+escapeHtml(p.name)+'">'
-      + '<span class="name">'+escapeHtml(p.name)+'</span>'
+      + '<span class="name" title="'+escapeHtml(p.name)+'">'+escapeHtml(p.name)+'</span>'
       + (p.active ? '<span class="badge">активен</span>' : '')
       + (p.listen_count > 1 ? '<span class="badge listen" title="слушает '+p.listen_count+' адреса(ов)">×'+p.listen_count+'</span>' : '')
+      + '<span class="proxy" title="'+escapeHtml(masked)+'">'+escapeHtml(masked)+'</span>'
       + '</button>'
       + '<span class="acts">'
       + (!p.active ? '<button class="act" aria-label="Активировать '+escapeHtml(p.name)+'" title="Активировать" data-action="activate" data-arg="'+escapeHtml(p.name)+'">→</button>' : '')
       + '<button class="act" aria-label="Дублировать '+escapeHtml(p.name)+'" title="Дублировать (пароль переносится)" data-action="duplicate" data-arg="'+escapeHtml(p.name)+'">⧉</button>'
       + '<button class="del" aria-label="Удалить '+escapeHtml(p.name)+'" title="Удалить" data-action="del" data-arg="'+escapeHtml(p.name)+'">✕</button>'
-      + '</span>'
-      + '<span class="proxy">'+escapeHtml(p.proxy.replace(/:\/\/[^@]+@/,'://***@'))+'</span>';
+      + '</span>';
     ul.appendChild(li);
   }
 }
