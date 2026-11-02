@@ -70,8 +70,16 @@
     0%, 100% { transform:scale(1); opacity:1; }
     50% { transform:scale(1.35); opacity:.55; }
   }
-  main { display:grid; grid-template-columns: 288px 1fr; gap:20px; padding:20px max(20px, calc((100% - 1180px)/2)); }
-  @media (max-width:800px) { main { grid-template-columns: 1fr; padding:14px; } }
+  main { display:grid; grid-template-columns: 288px minmax(0,1fr) 320px;
+         grid-template-areas: "aside main ops"; gap:20px;
+         padding:20px max(20px, calc((100% - 1340px)/2)); }
+  /* средние экраны: как раньше 2 колонки, «Обслуживание» — под левой */
+  @media (max-width:1239px) and (min-width:801px) {
+    main { grid-template-columns: 288px 1fr; grid-template-areas: "aside main" "ops main"; }
+  }
+  @media (max-width:800px) { /* телефон: одна колонка, сверху главное */
+    main { grid-template-columns: 1fr; grid-template-areas: "aside" "main" "ops"; padding:14px; }
+  }
   .card { background:var(--card); border:1px solid var(--border); border-radius:12px;
           padding:16px; box-shadow:var(--shadow-1); }
   .card h2 { margin:0 0 12px; font-size:12px; font-weight:600; text-transform:uppercase;
@@ -203,7 +211,7 @@
   <span id="status" aria-live="polite">…</span>
 </header>
 <main>
-  <section class="card">
+  <section class="card" style="grid-area:aside">
     <h2>Сервис</h2>
     <div class="svcinfo" id="svcinfo"></div>
     <div class="actions">
@@ -227,38 +235,9 @@
               title="Загрузить пресеты из ранее экспортированного JSON">Импорт</button>
       <input type="file" id="importFile" accept=".json,application/json" style="display:none" aria-hidden="true" tabindex="-1">
     </div>
-    <h2 class="sect">Фейловер</h2>
-    <div id="foInfo" style="font-size:12px;color:var(--mut);margin-top:10px">фейловер: проверка…</div>
-    <div class="actions" style="margin-top:8px">
-      <input id="foChain" placeholder="home, backup" aria-label="Цепочка фейловера"
-             autocomplete="off" spellcheck="false" style="flex:1;min-width:140px"
-             title="Пресеты через запятую: основной → запасные. После порога неудачных E2E-проверок подряд панель переключает на следующий. Назад, на основной — только вручную">
-      <button class="ghost" data-action="foSave" id="btnFoSave"
-              title="Сохранить цепочку и включить автофейловер">Включить</button>
-      <button class="ghost" data-action="foOff" id="btnFoOff" hidden
-              title="Выключить автофейловер (цепочка удалится)">Выключить</button>
-    </div>
-    <h2 class="sect">Бинарник naive</h2>
-    <div id="nvInfo" style="font-size:12px;color:var(--mut);margin-top:10px">бинарник: проверка…</div>
-    <div class="actions" style="margin-top:8px">
-      <button class="ghost" data-action="naiveCheck" id="btnNvCheck"
-              title="Сверить версию бинарника с последним релизом klzgrad/naiveproxy">Проверить</button>
-      <button data-action="naiveUpdate" id="btnNvUpd" hidden>Обновить</button>
-    </div>
-
-    <h2 class="sect">Панель</h2>
-    <div class="actions" style="margin-top:10px">
-      <button class="ghost wide" data-action="panelRestart" title="Перезапуск веб-панели (после обновления файлов)">Перезапуск</button>
-    </div>
-    <div id="updInfo" style="font-size:12px;color:var(--mut);margin-top:12px">обновления: проверка…</div>
-    <div class="actions" style="margin-top:8px">
-      <button class="ghost" data-action="updateCheck" title="Сверить версию панели с последним релизом GitHub">Проверить обновления</button>
-      <button data-action="updateApply" id="btnUpdApply" hidden>Обновить</button>
-      <button class="ghost" data-action="updateNotes" id="btnUpdNotes" hidden title="Описание грядущего релиза">Что нового</button>
-    </div>
   </section>
 
-  <section class="card">
+  <section class="card" style="grid-area:main">
     <h2 id="editorTitle"><span id="editorTitleText">Редактор</span><button type="button"
         class="close" id="btnCloseEditor" data-action="closeEditor" hidden
         aria-label="Закрыть редактор" title="Закрыть (Esc)">✕</button></h2>
@@ -333,6 +312,37 @@
       <button class="ghost" id="btnLogFilter" data-action="logFilter" aria-pressed="false">Только ошибки</button>
       <button class="ghost" data-action="logDownload">Скачать</button>
       <button class="ghost" data-action="logCopy">Копировать</button>
+    </div>
+  </section>
+
+  <section class="card" style="grid-area:ops">
+    <h2>Обслуживание</h2>
+    <div id="foInfo" style="font-size:12px;color:var(--mut)">фейловер: проверка…</div>
+    <div class="actions" style="margin-top:8px">
+      <input id="foChain" placeholder="home, backup" aria-label="Цепочка фейловера"
+             autocomplete="off" spellcheck="false" style="flex:1;min-width:140px"
+             title="Пресеты через запятую: основной → запасные. После порога неудачных E2E-проверок подряд панель переключает на следующий. Назад, на основной — только вручную">
+      <button class="ghost" data-action="foSave" id="btnFoSave"
+              title="Сохранить цепочку и включить автофейловер">Включить</button>
+      <button class="ghost" data-action="foOff" id="btnFoOff" hidden
+              title="Выключить автофейловер (цепочка удалится)">Выключить</button>
+    </div>
+    <h2 class="sect">Бинарник naive</h2>
+    <div id="nvInfo" style="font-size:12px;color:var(--mut);margin-top:10px">бинарник: проверка…</div>
+    <div class="actions" style="margin-top:8px">
+      <button class="ghost" data-action="naiveCheck" id="btnNvCheck"
+              title="Сверить версию бинарника с последним релизом klzgrad/naiveproxy">Проверить</button>
+      <button data-action="naiveUpdate" id="btnNvUpd" hidden>Обновить</button>
+    </div>
+    <h2 class="sect">Панель</h2>
+    <div class="actions" style="margin-top:10px">
+      <button class="ghost wide" data-action="panelRestart" title="Перезапуск веб-панели (после обновления файлов)">Перезапуск</button>
+    </div>
+    <div id="updInfo" style="font-size:12px;color:var(--mut);margin-top:12px">обновления: проверка…</div>
+    <div class="actions" style="margin-top:8px">
+      <button class="ghost" data-action="updateCheck" title="Сверить версию панели с последним релизом GitHub">Проверить обновления</button>
+      <button data-action="updateApply" id="btnUpdApply" hidden>Обновить</button>
+      <button class="ghost" data-action="updateNotes" id="btnUpdNotes" hidden title="Описание грядущего релиза">Что нового</button>
     </div>
   </section>
 </main>
