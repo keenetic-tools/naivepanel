@@ -21,13 +21,14 @@ import re
 import secrets
 import shutil
 import socket
+import ssl  # E2E-проверка: TLS через туннель прокси, только системные CA
 # subprocess вызывается только с фиксированными argv-списками (shell=False)
 import subprocess  # nosec B404
 import threading
 import time
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, unquote
+from urllib.parse import quote, unquote, urlsplit
 
 from flask import Flask, Response, abort, g, jsonify, make_response, render_template, request
 from werkzeug.exceptions import HTTPException
@@ -51,6 +52,10 @@ CONF_KEYS = frozenset({
     "NAIVEPROXY_UPDATE_LOG",
     "NAIVEPANEL_INIT", "NAIVEPANEL_THREADS",
     "NAIVEPANEL_LOG", "NAIVEPANEL_LOG_MAX", "NAIVEPANEL_LOG_KEEP",
+    "NAIVEPANEL_WATCHDOG", "NAIVEPANEL_WATCHDOG_INTERVAL",
+    "NAIVEPANEL_E2E_URL",
+    "NAIVEPANEL_FAILOVER", "NAIVEPANEL_FAILOVER_INTERVAL",
+    "NAIVEPANEL_FAILOVER_THRESHOLD",
 })
 
 _CONF_SKIPPED: list[str] = []
@@ -91,6 +96,10 @@ ACTIVE_POINTER = NAIVEPROXY_DIR / ".active"  # имя текущего акти�
 INIT_SCRIPT = Path(os.environ.get("NAIVEPROXY_INIT", "/opt/etc/init.d/S99naiveproxy"))
 LOG_FILE = Path(os.environ.get("NAIVEPROXY_LOG", "/opt/var/log/naiveproxy.log"))
 PID_FILE = Path(os.environ.get("NAIVEPROXY_PID", "/opt/var/run/naiveproxy.pid"))
+# Маркер «остановлен руками» — пишет init-скрипт S99naiveproxy в stop(),
+# снимает в start(). Watchdog не поднимает прокси, пока маркер на месте:
+# иначе он бы конфликтовал с сознательным stop (в т.ч. через SSH).
+STOP_MARKER = NAIVEPROXY_DIR / ".stopped"
 
 # --- Бинарник naive: источник и маркеры --------------------------------------
 # Первичную установку делает install.sh (когда бинарника нет); панель лишь
@@ -152,6 +161,50 @@ def _int_or_default(raw: str, default: int) -> tuple[int, bool]:
 # 5 МБ — тот же порог, что у truncate_log в init-скриптах; хвост 512 КБ
 LOG_TRIM_MAX, _LOG_MAX_INVALID = _int_or_default(_LOG_MAX_RAW, 5242880)
 LOG_TRIM_KEEP, _LOG_KEEP_INVALID = _int_or_default(_LOG_KEEP_RAW, 524288)
+
+# --- Watchdog: авто-рестарт упавшего naive ----------------------------------
+# Поток в панели следит за переходом running→down: единственное событие, где
+# рестарт однозначно нужен (после рестарта панели «изначально лежит» —
+# не трогаем: неизвестно, остановили ли руками до нас). Штатный stop виден
+# по маркеру STOP_MARKER (его пишет init-скрипт). Падающего в loop процесса
+# не дёргаем бесконечно: после 3 рестартов за 10 минут watchdog отключается
+# до перезапуска панели. NAIVEPANEL_WATCHDOG=0 в panel.conf выключает поток.
+_WATCHDOG_RAW = os.environ.get("NAIVEPANEL_WATCHDOG", "1") or "1"
+WATCHDOG_ENABLED = _WATCHDOG_RAW.strip().lower() not in {"0", "no", "off", "false"}
+_WATCHDOG_INTERVAL_RAW = os.environ.get("NAIVEPANEL_WATCHDOG_INTERVAL", "15") or "15"
+WATCHDOG_INTERVAL, _WATCHDOG_INTERVAL_INVALID = _int_or_default(_WATCHDOG_INTERVAL_RAW, 15)
+WATCHDOG_INTERVAL = max(5, WATCHDOG_INTERVAL)
+WATCHDOG_FLAP_MAX = 3          # рестартов за окно до отключения
+WATCHDOG_FLAP_WINDOW = 600.0   # окно флаппинга, секунды
+WATCHDOG_RECHECK_S = 3.0       # пауза до перепроверки up→down (гонка с stop/restart)
+
+# --- E2E-проверка «прокси реально проксирует» --------------------------------
+# В отличие от /api/probe (голый TCP до upstream), здесь запрос идёт ЧЕРЕЗ
+# listen-порт naive как через настоящий прокси: CONNECT/SOCKS-туннель до
+# echo-хоста + HTTPS GET. Проверяет всю цепочку: listen-сокет, креды к
+# upstream, форвардинг, remote-DNS. Ответ показывает exit-IP. Хост можно
+# поменять на свой (http:// тоже поддержан — для тестов без TLS).
+E2E_URL = os.environ.get("NAIVEPANEL_E2E_URL", "https://api.ipify.org/")
+E2E_TIMEOUT = 10.0
+
+# --- Автофейловер пресетов ---------------------------------------------------
+# Цепочка «основной → запасной» в /opt/etc/naive/proxy/failover.json: фоновый
+# поток раз в NAIVEPANEL_FAILOVER_INTERVAL секунд делает E2E-проверку активного
+# пресета; NAIVEPANEL_FAILOVER_THRESHOLD неудач подряд (гистерезис против
+# флаппинга) — переключение на следующий пресет цепочки тем же кодом, что и
+# ручной activate. Работает только пока активен пресет из цепочки; назад, на
+# основной, панель не возвращается сама — только вперёд (возврат ручной).
+# Штатный stop (маркер) и активный-вне-цепочки монитор не трогают.
+FAILOVER_CONF = NAIVEPROXY_DIR / "failover.json"
+_FAILOVER_RAW = os.environ.get("NAIVEPANEL_FAILOVER", "1") or "1"
+FAILOVER_ENABLED = _FAILOVER_RAW.strip().lower() not in {"0", "no", "off", "false"}
+_FAILOVER_INTERVAL_RAW = os.environ.get("NAIVEPANEL_FAILOVER_INTERVAL", "60") or "60"
+FAILOVER_INTERVAL, _FAILOVER_INTERVAL_INVALID = _int_or_default(_FAILOVER_INTERVAL_RAW, 60)
+FAILOVER_INTERVAL = max(15, FAILOVER_INTERVAL)  # чаще 15с echo-хост не опрашиваем
+_FAILOVER_THRESHOLD_RAW = os.environ.get("NAIVEPANEL_FAILOVER_THRESHOLD", "3") or "3"
+FAILOVER_THRESHOLD, _FAILOVER_THRESHOLD_INVALID = _int_or_default(_FAILOVER_THRESHOLD_RAW, 3)
+FAILOVER_THRESHOLD = min(10, max(1, FAILOVER_THRESHOLD))
+FAILOVER_CHAIN_MAX = 8
 
 # --- Self-update: репозиторий и пути ---------------------------------------
 # Обновление из UI повторяет ручной флоу `install.sh --yes`: панель лишь
@@ -482,6 +535,245 @@ def _upstream_endpoint(upstream: str) -> tuple[str, int] | None:
     return tail, 443  # rpartition без sep: head пуст, исходная строка в tail
 
 
+# --- E2E-проверка: реальный запрос ЧЕРЕЗ прокси -----------------------------
+# /api/probe отвечает «до upstream есть TCP» — но не «прокси проксирует».
+# Здесь открываем listen-порт активного пресета как клиент и строим туннель
+# до echo-хоста (E2E_URL): HTTP CONNECT для http-listen, SOCKS5 — для socks.
+# Поднявшийся туннель доказывает всю цепочку: listen жив, креды upstream
+# приняты, форвардинг работает, DNS резолвится на стороне прокси. Поверх
+# туннеля — GET за exit-IP (при недоступности echo-хоста туннель всё равно
+# считаем успехом: прокси свою часть выполнил).
+
+
+def _listen_endpoint(listen: str) -> tuple[str, str, int] | None:
+    """listen-URI пресета → (схема, host, port).
+
+    `socks://127.0.0.1:1080` → ("socks", …); `http://127.0.0.1:8080` →
+    ("http", …). Без схемы — socks (то же умолчание, что в _normalize_listen).
+    Порт по умолчанию: 1080 для socks, 8080 для http.
+    """
+    raw = (listen or "").strip()
+    scheme = "socks"
+    if "://" in raw:
+        prefix, _, raw = raw.partition("://")
+        if prefix.lower() in ("socks", "socks5"):
+            scheme = "socks"
+        elif prefix.lower() == "http":
+            scheme = "http"
+        else:
+            return None
+    ep = _upstream_endpoint(raw or " ")
+    if not ep:
+        return None
+    host, port = ep
+    if not re.search(r":\d+$", raw):  # порт не указан — умолчания listen
+        port = 1080 if scheme == "socks" else 8080
+    return scheme, host, port
+
+
+def _recv_until(sock: socket.socket, marker: bytes, limit: int = 8192) -> bytes:
+    """Читает из сокета до marker (включительно) или лимита буфера."""
+    buf = b""
+    while marker not in buf and len(buf) < limit:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        buf += chunk
+    return buf
+
+
+def _recv_exact(sock: socket.socket, count: int) -> bytes:
+    """Ровно count байт; короткое чтение — что успели."""
+    buf = b""
+    while len(buf) < count:
+        chunk = sock.recv(count - len(buf))
+        if not chunk:
+            break
+        buf += chunk
+    return buf
+
+
+def _http_connect_via_proxy(sock: socket.socket, host: str, port: int,
+                            timeout: float) -> str | None:
+    """HTTP-прокси: CONNECT host:port; None = туннель поднят."""
+    sock.settimeout(timeout)
+    sock.sendall((f"CONNECT {host}:{port} HTTP/1.1\r\n"
+                  f"Host: {host}:{port}\r\n"
+                  "User-Agent: naivepanel-e2e\r\n\r\n").encode())
+    head = _recv_until(sock, b"\r\n\r\n")
+    if b"\r\n\r\n" not in head:
+        return "прокси не ответил на CONNECT"
+    status = head.split(b"\r\n", 1)[0]
+    try:
+        code = int(status.split()[1])
+    except (IndexError, ValueError):
+        return f"нечитаемый ответ на CONNECT: {status[:60]!r}"
+    if code != 200:
+        # 407/502 — например, upstream отверг креды из активного пресета
+        return f"CONNECT отклонён прокси: HTTP {code}"
+    return None
+
+
+def _socks5_connect_via_proxy(sock: socket.socket, host: str, port: int,
+                              timeout: float) -> str | None:
+    """SOCKS5-прокси: greeting + CONNECT (без auth); None = туннель поднят."""
+    sock.settimeout(timeout)
+    sock.sendall(b"\x05\x01\x00")  # VER5, 1 метод, NO-AUTH
+    hello = _recv_exact(sock, 2)
+    if len(hello) < 2:
+        return "прокси оборвал SOCKS-приветствие"
+    if hello[0] != 5:
+        return "listen-порт отвечает не по SOCKS5"
+    if hello[1] != 0x00:
+        return "SOCKS-прокси требует аутентификацию (проверка её не поддерживает)"
+    # CONNECT с именем хоста (ATYP=домен): DNS резолвится на стороне прокси
+    sock.sendall(b"\x05\x01\x00\x03" + bytes([len(host)]) + host.encode()
+                 + port.to_bytes(2, "big"))
+    head = _recv_exact(sock, 4)
+    if len(head) < 4 or head[0] != 5:
+        return "прокси оборвал/испортил SOCKS-ответ"
+    if head[1] != 0:
+        return f"SOCKS CONNECT отклонён прокси (rep={head[1]})"
+    # остаток ответа (BND.ADDR/BND.PORT) вычитываем целиком — иначе он
+    # попадёт в начало HTTP-ответа echo-сервера
+    atyp = head[3]
+    if atyp == 1:
+        rest = _recv_exact(sock, 4 + 2)
+    elif atyp == 3:
+        ln = _recv_exact(sock, 1)
+        if not ln:
+            return "прокси оборвал SOCKS-ответ (ATYP=домен)"
+        rest = _recv_exact(sock, ln[0] + 2)
+    elif atyp == 4:
+        rest = _recv_exact(sock, 16 + 2)
+    else:
+        return f"SOCKS-ответ с неизвестным ATYP={atyp}"
+    if not rest:
+        return "прокси оборвал SOCKS-ответ"
+    return None
+
+
+def _get_via_tunnel(sock: socket.socket, host: str, path: str,
+                    use_tls: bool, timeout: float) -> tuple[str | None, str | None]:
+    """GET через установленный туннель; (body, error) — ровно один не None.
+
+    HTTP/1.0 + Connection: close: ответ без chunked, читаем до EOF.
+    """
+    if use_tls:
+        try:
+            sock = ssl.create_default_context().wrap_socket(sock, server_hostname=host)
+        except (ssl.SSLError, OSError) as exc:
+            return None, f"TLS через туннель не поднялся: {exc}"
+    sock.settimeout(timeout)
+    sock.sendall((f"GET {path} HTTP/1.0\r\n"
+                  f"Host: {host}\r\n"
+                  "User-Agent: naivepanel-e2e\r\nAccept: */*\r\n"
+                  "Connection: close\r\n\r\n").encode())
+    buf = b""
+    while len(buf) < 16384:
+        try:
+            chunk = sock.recv(4096)
+        except (ssl.SSLEOFError, ssl.SSLError, OSError):
+            break
+        if not chunk:
+            break
+        buf += chunk
+    head, sep, body = buf.partition(b"\r\n\r\n")
+    if not sep:
+        return None, "echo-сервер не вернул HTTP-ответ"
+    code = head.split(b"\r\n", 1)[0].split()
+    if len(code) < 2 or code[1] != b"200":
+        got = code[1].decode("latin-1", "replace") if len(code) >= 2 else "?"
+        return None, f"echo-сервер ответил HTTP {got}"
+    return body.decode("utf-8", "replace").strip() or None, None
+
+
+_IPV4_RE = re.compile(r"\b(\d{1,3}(?:\.\d{1,3}){3})\b")
+_IPV6_RE = re.compile(r"(?<![0-9a-fA-F:.])(?:[0-9a-fA-F]{0,4}:){3,7}[0-9a-fA-F]{0,4}(?![0-9a-fA-F:.])")
+
+
+def _extract_exit_ip(text: str) -> str | None:
+    """IPv4/IPv6 из ответа echo-сервера (plain или JSON)."""
+    m = _IPV4_RE.search(text)
+    if m:
+        return m.group(1)
+    try:
+        data = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        data = None
+    if isinstance(data, dict) and isinstance(data.get("ip"), str):
+        return data["ip"]
+    m6 = _IPV6_RE.search(text)
+    return m6.group(0) if m6 else None
+
+
+def _proxy_e2e_check(listen_uri: str, timeout: float = E2E_TIMEOUT) -> dict[str, Any]:
+    """Прогоняет один реальный запрос через listen naive (см. E2E_URL).
+
+    ok=True означает «туннель через прокси поднялся»; exit_ip может быть
+    None с note, если echo-хост недоступен или не распознан ответ.
+    """
+    t0 = time.monotonic()
+
+    def _ms() -> int:
+        return int((time.monotonic() - t0) * 1000)
+
+    ep = _listen_endpoint(listen_uri)
+    if not ep:
+        return {"ok": False, "ms": _ms(), "error": f"listen не распознан: {listen_uri!r}"}
+    scheme, lhost, lport = ep
+
+    parts = urlsplit(E2E_URL)
+    echo_host = parts.hostname
+    if not echo_host:
+        return {"ok": False, "ms": _ms(), "error": f"NAIVEPANEL_E2E_URL некорректен: {E2E_URL!r}"}
+    echo_port = parts.port or (443 if parts.scheme == "https" else 80)
+    echo_path = parts.path or "/"
+    use_tls = parts.scheme == "https"
+
+    sock: socket.socket | None = None
+    try:
+        sock = socket.create_connection((lhost, lport), timeout=min(5.0, timeout))
+        tunnel = (_http_connect_via_proxy if scheme == "http"
+                  else _socks5_connect_via_proxy)
+        err = tunnel(sock, echo_host, echo_port, timeout)
+        if err:
+            return {"ok": False, "ms": _ms(), "error": err}
+        body, err = _get_via_tunnel(sock, echo_host, echo_path, use_tls, timeout)
+        if body is None:
+            # туннель поднят — прокси свою часть выполнил; не вышло только
+            # общение с echo-хостом. Это успех проверки прокси, но с оговоркой
+            return {"ok": True, "ms": _ms(), "exit_ip": None, "note": err}
+        ip = _extract_exit_ip(body)
+        return {"ok": True, "ms": _ms(), "exit_ip": ip,
+                "note": None if ip else "ответ echo-сервера получен, exit-IP не распознан"}
+    except ConnectionRefusedError:
+        return {"ok": False, "ms": _ms(),
+                "error": f"{lhost}:{lport} не принимает соединения — прокси остановлен?"}
+    except (socket.timeout, ssl.SSLError, OSError) as exc:
+        return {"ok": False, "ms": _ms(), "error": f"{type(exc).__name__}: {exc}"}
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+
+def _active_listen() -> str | None:
+    """listen активного пресета из config.json (первый адрес, если массив)."""
+    try:
+        cfg = json.loads(ACTIVE_CONFIG.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    raw = cfg.get("listen")
+    if isinstance(raw, list):
+        raw = raw[0] if raw else None
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    return None
+
+
 # --- Service control ------------------------------------------------------
 
 def _run(cmd: list[str], timeout: int = 10) -> dict[str, Any]:
@@ -520,9 +812,11 @@ def _pid_is_naive(pid: int) -> bool:
     return name in {"naive", "naiveproxy"}
 
 
-def _status() -> dict[str, Any]:
-    active_name = _active_name()
-    has_init = INIT_SCRIPT.exists()
+def _proxy_running() -> tuple[bool, int | None, int | None]:
+    """(running, pid, uptime_s) по pid-файлу — для /api/status и watchdog.
+
+    Проверяем, что процесс реально жив — pid-файл может пережить crash.
+    """
     pid: int | None = None
     uptime: int | None = None
     running = False
@@ -532,7 +826,6 @@ def _status() -> dict[str, Any]:
         except (ValueError, OSError):
             pid = None
         if pid is not None:
-            # Проверяем, что процесс реально жив — pid-файл может пережить crash
             try:
                 os.kill(pid, 0)
                 running = True
@@ -546,6 +839,13 @@ def _status() -> dict[str, Any]:
                 running = False
             if running:
                 uptime = max(0, int(time.time() - PID_FILE.stat().st_mtime))
+    return running, pid, uptime
+
+
+def _status() -> dict[str, Any]:
+    active_name = _active_name()
+    has_init = INIT_SCRIPT.exists()
+    running, pid, uptime = _proxy_running()
     return {
         "version": APP_VERSION,
         "active": running,
@@ -554,7 +854,263 @@ def _status() -> dict[str, Any]:
         "current": active_name,
         "init_script": str(INIT_SCRIPT),
         "init_present": has_init,
+        "watchdog": _watchdog.snapshot(),
+        "failover": _failover.snapshot(),
     }
+
+
+# --- Watchdog: авто-рестарт упавшего naive ----------------------------------
+
+
+class _Watchdog:
+    """Следит за переходом naive running→down и поднимает его обратно.
+
+    Реагирует ТОЛЬКО на переход вниз, observed при живой панели: после
+    старта панели «прокси не работает» — не сигнал (неизвестно, остановили
+    ли его руками до нас; автозапуск делает init-скрипт). Штатный stop
+    init-скрипт маркирует файлом STOP_MARKER — тогда панель не вмешивается.
+    Флаппинг (падает сразу после старта) гасим: WATCHDOG_FLAP_MAX рестартов
+    за WATCHDOG_FLAP_WINDOW — и watchdog отключается до рестарта панели.
+    """
+
+    def __init__(self, flap_max: int = WATCHDOG_FLAP_MAX,
+                 flap_window: float = WATCHDOG_FLAP_WINDOW) -> None:
+        self._prev_running: bool | None = None
+        self._restarts: list[float] = []
+        self._flap_max = flap_max
+        self._flap_window = flap_window
+        self.tripped = False   # отключился из-за флаппинга
+        self.count = 0         # рестартов за жизнь панели
+
+    def snapshot(self) -> dict[str, Any]:
+        return {"enabled": WATCHDOG_ENABLED, "restarts": self.count,
+                "tripped": self.tripped}
+
+    def _flapped(self, now: float) -> bool:
+        self._restarts = [t for t in self._restarts if now - t < self._flap_window]
+        return len(self._restarts) >= self._flap_max
+
+    def observe(self, recheck_delay: float = WATCHDOG_RECHECK_S) -> dict[str, Any] | None:
+        """Один тик; возвращает событие (см. тесты) или None, если всё тихо."""
+        running, _, _ = _proxy_running()
+        prev, self._prev_running = self._prev_running, running
+        if prev is None or prev == running:
+            return None
+        if running:  # down→up: поднялся (руками или сам) — просто фиксируем
+            return None
+        # up→down: crash или чей-то stop/restart. Пауза закрывает гонку с
+        # init-скриптом: stop() пишет маркер ДО kill, а restart() между
+        # stop и start пару секунд держит сервис вниз — за паузу маркер
+        # появится (штатный stop) или сервис вернётся (рестарт).
+        if recheck_delay > 0:
+            time.sleep(recheck_delay)
+            running, _, _ = _proxy_running()
+            if running:
+                return None
+        if STOP_MARKER.exists():
+            return {"event": "stopped"}   # штатный stop — не вмешиваемся
+        if not INIT_SCRIPT.exists():
+            return {"event": "no-init"}
+        if self.tripped:
+            return {"event": "down-tripped"}
+        now = time.time()
+        if self._flapped(now):
+            self.tripped = True
+            return {"event": "tripped"}
+        self._restarts.append(now)
+        self.count += 1
+        res = _service("start")
+        return {"event": "restarted", "rc": res.get("rc"),
+                "stderr": res.get("stderr")}
+
+
+_watchdog = _Watchdog()
+
+
+def _watchdog_loop() -> None:
+    # daemon-поток, как log-trim: каждая итерация под try, чтобы неожиданная
+    # ошибка не убила цикл целиком
+    while True:
+        try:
+            ev = _watchdog.observe()
+            if ev is not None:
+                if ev["event"] == "restarted":
+                    if ev.get("rc") == 0:
+                        app.logger.warning(
+                            "watchdog: naive упал — перезапущен (рестартов: %d)",
+                            _watchdog.count)
+                    else:
+                        app.logger.error(
+                            "watchdog: naive упал, перезапуск НЕ удался: rc=%s %s",
+                            ev.get("rc"), ev.get("stderr") or "")
+                elif ev["event"] == "tripped":
+                    app.logger.error(
+                        "watchdog: naive падает %d раз за %dс — авто-рестарт "
+                        "отключён до перезапуска панели; проверьте лог прокси",
+                        WATCHDOG_FLAP_MAX, int(WATCHDOG_FLAP_WINDOW))
+                elif ev["event"] == "down-tripped":
+                    app.logger.error("watchdog: naive снова вниз — стоим (отключён)")
+                elif ev["event"] == "stopped":
+                    app.logger.info("watchdog: штатный stop (маркер) — не вмешиваюсь")
+        except Exception:  # один сбойный тик не должен останавливать поток
+            app.logger.warning("watchdog cycle failed", exc_info=True)
+        time.sleep(WATCHDOG_INTERVAL)
+
+
+# --- Автофейловер: монитор цепочки пресетов ----------------------------------
+
+
+def _load_failover_conf() -> dict[str, Any]:
+    """failover.json → {"enabled": bool, "chain": [имена]}; без файла — выкл.
+
+    Битый файл трактуем как «выключен»: монитор не должен падать из-за
+    руки, поправившей JSON мимо панели.
+    """
+    try:
+        data = json.loads(FAILOVER_CONF.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"enabled": False, "chain": []}
+    if not isinstance(data, dict):
+        return {"enabled": False, "chain": []}
+    chain = data.get("chain")
+    if not isinstance(chain, list) or not all(isinstance(n, str) for n in chain):
+        chain = []
+    return {"enabled": bool(data.get("enabled")) and bool(chain), "chain": chain}
+
+
+class _Failover:
+    """Периодическая E2E-проверка активного пресета, переключение по цепочке.
+
+    Только вперёд, на следующий пресет цепочки; назад (на основной) —
+    вручную: авто-возврат — источник флаппинга. Гистерезис — THRESHOLD
+    неудач подряд (одна осечка — не повод переключать). Проверка честная:
+    недоступный echo-хост — это ok:true с note (прокси работает), фейловер
+    не триггерит; триггерят только отказы самой цепочки прокси→upstream.
+    """
+
+    def __init__(self, threshold: int = FAILOVER_THRESHOLD) -> None:
+        self._threshold = threshold
+        self._fails = 0
+        self._last_check: float | None = None
+        self._last_ok: bool | None = None
+        self._last_error: str | None = None
+        self._last_ms: int | None = None
+        self._last_switch: float | None = None
+        self.switches = 0
+        self._exhausted_announced = False
+        self.idle_reason: str | None = None
+
+    def snapshot(self) -> dict[str, Any]:
+        conf = _load_failover_conf()
+        active = _active_name()
+        idx = conf["chain"].index(active) if active in conf["chain"] else None
+        return {
+            "enabled": FAILOVER_ENABLED and conf["enabled"],
+            "chain": conf["chain"],
+            "active_index": idx,
+            "threshold": self._threshold,
+            "interval": FAILOVER_INTERVAL,
+            "fails": self._fails,
+            "last_check": self._last_check,
+            "last_ok": self._last_ok,
+            "last_error": self._last_error,
+            "last_ms": self._last_ms,
+            "switches": self.switches,
+            "last_switch": self._last_switch,
+            "idle": self.idle_reason,
+        }
+
+    def _idle(self, reason: str) -> None:
+        self.idle_reason = reason
+        self._fails = 0
+
+    def cycle(self) -> dict[str, Any] | None:
+        """Один тик монитора; возвращает событие для лога или None."""
+        conf = _load_failover_conf()
+        if not (FAILOVER_ENABLED and conf["enabled"]):
+            self._idle("выключен")
+            return None
+        if STOP_MARKER.exists():
+            self._idle("прокси остановлен вручную")
+            return None
+        active = _active_name()
+        if active is None or active not in conf["chain"]:
+            self._idle("активный пресет вне цепочки")
+            return None
+        self.idle_reason = None
+        listen = _active_listen()
+        if not listen:
+            self._idle("нет listen у активного пресета")
+            return None
+
+        result = _proxy_e2e_check(listen)
+        self._last_check = time.time()
+        self._last_ok = bool(result.get("ok"))
+        self._last_error = result.get("error") or result.get("note")
+        self._last_ms = result.get("ms")
+        if result.get("ok"):
+            self._fails = 0
+            self._exhausted_announced = False
+            return None
+        self._fails += 1
+        if self._fails < self._threshold:
+            return {"event": "failing", "fails": self._fails}
+
+        self._fails = 0
+        chain = conf["chain"]
+        idx = chain.index(active)
+        for candidate in chain[idx + 1:]:
+            if not (CONF_D / f"{candidate}.json").exists():
+                continue  # пресет удалили — цепочка просто короче
+            try:
+                res = _activate_preset(candidate)
+            except HTTPException:
+                # битый пресет (руками отредактирован) — валидация в
+                # _activate_preset его отвергла; пробуем следующий
+                continue
+            self.switches += 1
+            self._last_switch = time.time()
+            return {"event": "switched", "from": active, "to": candidate,
+                    "restart": res.get("restart")}
+        if self._exhausted_announced:
+            return None  # уже кричали; следующая волна — только после ok
+        self._exhausted_announced = True
+        return {"event": "exhausted", "active": active}
+
+
+_failover = _Failover()
+
+
+def _failover_loop() -> None:
+    # как watchdog: daemon-поток, сбойный тик не убивает цикл. Пустая цепочка
+    # — честный idle, поэтому поток стартует всегда: цепочку можно задать из
+    # UI без перезапуска панели.
+    while True:
+        try:
+            ev = _failover.cycle()
+            if ev is not None:
+                if ev["event"] == "switched":
+                    rst = ev.get("restart") or {}
+                    rc = rst.get("rc") if isinstance(rst, dict) else None
+                    if isinstance(rc, int) and rc != 0:
+                        app.logger.error(
+                            "фейловер: %s не прошёл E2E-проверки — переключение"
+                            " на %s, но рестарт НЕ удался: rc=%s %s",
+                            ev["from"], ev["to"], rc, rst.get("stderr") or "")
+                    else:
+                        app.logger.warning(
+                            "фейловер: %s не прошёл %d E2E-проверок подряд — "
+                            "переключение на %s",
+                            ev["from"], FAILOVER_THRESHOLD, ev["to"])
+                elif ev["event"] == "exhausted":
+                    app.logger.error(
+                        "фейловер: цепочка исчерпана — %s не работает и "
+                        "запасных больше нет; проверка продолжается, возврат "
+                        "на основной — вручную", ev["active"])
+                # failing не логируем: до порога это нормальный шум сети
+        except Exception:  # один сбойный тик не должен останавливать поток
+            app.logger.warning("failover cycle failed", exc_info=True)
+        time.sleep(FAILOVER_INTERVAL)
 
 
 _CRED_RE = re.compile(r"([a-zA-Z][a-zA-Z0-9+.\-]*://[^:/@\s]+):([^@\s]+)@")
@@ -925,8 +1481,19 @@ def api_configs_delete(name: str):
     return jsonify({"name": name, "deleted": True})
 
 
-@app.route("/api/configs/<name>/activate", methods=["POST"])
-def api_configs_activate(name: str):
+# Активация из двух мест: API (ручной клик) и фейловер-монитор (авто).
+# Лок страхует от гонки «пользователь активирует A в тот момент, когда
+# монитор переключает на B»: два параллельных stop/start init-скрипта
+# на медленном роутере могли бы перехлёстнуться.
+_ACTIVATE_LOCK = threading.Lock()
+
+
+def _activate_preset(name: str) -> dict[str, Any]:
+    """Валидация + запись config.json/.active + рестарт сервиса.
+
+    Используется ручным activate из UI и автофейловером — одна и та же
+    семантика: битый конфиг не роняет рабочий прокси (валидация до записи).
+    """
     if not NAME_RE.match(name):
         abort(400, description="invalid name")
     src = CONF_D / f"{name}.json"
@@ -934,9 +1501,15 @@ def api_configs_activate(name: str):
         abort(404, description=f"preset {name!r} not found")
     cfg = _load_json(src)
     _validate_cfg(cfg, name)  # битый конфиг не должен ронять рабочий прокси
-    _write_active(name, cfg)
-    restart = _service("restart") if INIT_SCRIPT.exists() else {"rc": None, "note": "no init script"}
-    return jsonify({"name": name, "active": True, "restart": restart})
+    with _ACTIVATE_LOCK:
+        _write_active(name, cfg)
+        restart = _service("restart") if INIT_SCRIPT.exists() else {"rc": None, "note": "no init script"}
+    return {"name": name, "active": True, "restart": restart}
+
+
+@app.route("/api/configs/<name>/activate", methods=["POST"])
+def api_configs_activate(name: str):
+    return jsonify(_activate_preset(name))
 
 
 @app.route("/api/configs/<name>/duplicate", methods=["POST"])
@@ -1060,6 +1633,74 @@ def api_service(action: str):
     if action not in {"start", "stop", "restart"}:
         abort(400, description="action must be start|stop|restart")
     return jsonify(_service(action))
+
+
+@app.route("/api/e2e", methods=["POST"])
+def api_e2e():
+    """E2E-проверка прокси: реальный запрос через listen-порт активного пресета.
+
+    Тело может задать {"listen": "..."} явно; без него берётся listen из
+    config.json (первый адрес, если их несколько). Недоступность прокси —
+    нормальный ответ 200 с ok:false и error (как у /api/probe).
+    """
+    data = request.get_json(silent=True) or {}
+    listen = (data.get("listen") or "").strip()
+    if not listen:
+        listen = _active_listen()
+        if not listen:
+            abort(400, description="no active preset with listen: activate a preset first")
+    resp = jsonify(_proxy_e2e_check(listen))
+    resp.headers["Cache-Control"] = "no-store"  # результат живой, не кешируем
+    return resp
+
+
+@app.route("/api/failover")
+def api_failover_get():
+    resp = jsonify(_failover.snapshot())
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@app.route("/api/failover", methods=["PUT"])
+def api_failover_put():
+    """Задать цепочку: {"enabled": true, "chain": ["home", "backup"]}.
+
+    Имена валидируются как у пресетов и проверяются на существование —
+    опечатка не должна остаться в цепочке до первого сбоя.
+    """
+    data = request.get_json(silent=True) or {}
+    enabled = bool(data.get("enabled"))
+    chain_raw = data.get("chain")
+    if enabled:
+        if not isinstance(chain_raw, list) or not chain_raw:
+            abort(400, description="chain required (non-empty list) when enabled")
+        if len(chain_raw) > FAILOVER_CHAIN_MAX:
+            abort(400, description=f"chain too long (max {FAILOVER_CHAIN_MAX})")
+        seen: set[str] = set()
+        for name in chain_raw:
+            if not isinstance(name, str) or not NAME_RE.match(name):
+                abort(400, description=f"invalid preset name: {name!r}")
+            if name in seen:
+                abort(400, description=f"duplicate preset in chain: {name!r}")
+            seen.add(name)
+            if not (CONF_D / f"{name}.json").exists():
+                abort(404, description=f"preset {name!r} not found")
+    else:
+        chain_raw = []
+    _ensure_dirs()
+    _save_json(FAILOVER_CONF, {"enabled": enabled, "chain": chain_raw})
+    return jsonify(_failover.snapshot())
+
+
+@app.route("/api/failover", methods=["DELETE"])
+def api_failover_delete():
+    try:
+        FAILOVER_CONF.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        abort(500, description=f"cannot remove failover.json: {exc}")
+    return jsonify(_failover.snapshot())
 
 
 @app.route("/api/panel/restart", methods=["POST"])
@@ -1878,6 +2519,40 @@ if __name__ == "__main__":
         threading.Thread(
             target=_log_trim_loop, name="log-trim", daemon=True
         ).start()
+    if _WATCHDOG_INTERVAL_INVALID:
+        app.logger.warning(
+            "NAIVEPANEL_WATCHDOG_INTERVAL=%r is not a number — using %d",
+            _WATCHDOG_INTERVAL_RAW, WATCHDOG_INTERVAL,
+        )
+    if WATCHDOG_ENABLED:
+        app.logger.info(
+            "watchdog enabled: interval=%ds flap=%d/%ds (штатный stop по маркеру %s)",
+            WATCHDOG_INTERVAL, WATCHDOG_FLAP_MAX, int(WATCHDOG_FLAP_WINDOW),
+            STOP_MARKER,
+        )
+        threading.Thread(
+            target=_watchdog_loop, name="naive-watchdog", daemon=True
+        ).start()
+    else:
+        app.logger.info("watchdog disabled by NAIVEPANEL_WATCHDOG=0")
+    if _FAILOVER_INTERVAL_INVALID:
+        app.logger.warning(
+            "NAIVEPANEL_FAILOVER_INTERVAL=%r is not a number — using %d",
+            _FAILOVER_INTERVAL_RAW, FAILOVER_INTERVAL,
+        )
+    if _FAILOVER_THRESHOLD_INVALID:
+        app.logger.warning(
+            "NAIVEPANEL_FAILOVER_THRESHOLD=%r is not a number — using %d",
+            _FAILOVER_THRESHOLD_RAW, FAILOVER_THRESHOLD,
+        )
+    if FAILOVER_ENABLED:
+        # поток живёт всегда (пустая цепочка = idle): цепочку задают из UI
+        # без перезапуска панели
+        threading.Thread(
+            target=_failover_loop, name="naive-failover", daemon=True
+        ).start()
+    else:
+        app.logger.info("failover disabled by NAIVEPANEL_FAILOVER=0")
     host, port = _parse_bind(PANEL_BIND)
     # host берётся из env/panel.conf: предупреждаем только для unspecified
     # адресов (0.0.0.0 / ::) — фактического bind здесь нет.

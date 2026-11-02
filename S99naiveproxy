@@ -16,6 +16,11 @@ DAEMON=/opt/bin/$PROG
 DAEMON_OPTS=/opt/etc/naive/proxy/config.json
 PIDFILE=/opt/var/run/naiveproxy.pid
 LOGFILE=/opt/var/log/naiveproxy.log
+# Маркер сознательного stop: его видит watchdog NaivePanel и не поднимает
+# прокси обратно. start() снимает маркер. Пишем ДО kill: между kill и
+# записью процесс уже мёртв, а маркера ещё нет — там watchdog не должен
+# среагировать ложным «упал».
+STOPMARK=/opt/etc/naive/proxy/.stopped
 
 [ -f /opt/etc/naive/proxy/config.json ] || DAEMON_OPTS=
 
@@ -45,6 +50,7 @@ running() {
 start() {
     if running; then
         log "already running (pid=$(cat "$PIDFILE"))"
+        rm -f "$STOPMARK"
         return 0
     fi
     if [ ! -f "$DAEMON" ]; then
@@ -70,6 +76,7 @@ start() {
     sleep 1
     if running; then
         log "started (pid=$(cat "$PIDFILE"))"
+        rm -f "$STOPMARK"
         return 0
     else
         log "failed to start; see $LOGFILE"
@@ -79,6 +86,9 @@ start() {
 }
 
 stop() {
+    # маркер ДО kill (см. комментарий у STOPMARK)
+    mkdir -p "$(dirname "$STOPMARK")" 2>/dev/null
+    : > "$STOPMARK" 2>/dev/null
     if ! running; then
         log "not running"
         rm -f "$PIDFILE"

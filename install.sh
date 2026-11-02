@@ -592,6 +592,23 @@ if [ ! -f "$PANEL_CONF" ]; then
 #NAIVEPANEL_LOG="/opt/var/log/naivepanel.log"
 #NAIVEPANEL_LOG_MAX="5242880"
 #NAIVEPANEL_LOG_KEEP="524288"
+
+# Watchdog: a background thread restarts naive if it crashes (a deliberate
+# "stop" via the init script is respected via a marker file). 0 disables.
+#NAIVEPANEL_WATCHDOG="1"
+#NAIVEPANEL_WATCHDOG_INTERVAL="15"
+
+# Echo host for the "check proxy" E2E button (exit-IP through the tunnel);
+# http:// is also accepted - handy for tests and offline setups.
+#NAIVEPANEL_E2E_URL="https://api.ipify.org/"
+
+# Failover tuning (the preset chain itself is configured in the UI and lives
+# in /opt/etc/naive/proxy/failover.json). THRESHOLD consecutive failed E2E
+# checks switch to the next preset in the chain. 0 in NAIVEPANEL_FAILOVER
+# disables the monitor entirely.
+#NAIVEPANEL_FAILOVER="1"
+#NAIVEPANEL_FAILOVER_INTERVAL="60"
+#NAIVEPANEL_FAILOVER_THRESHOLD="3"
 EOF
     chmod 0644 "$PANEL_CONF"
     info "created $PANEL_CONF (settings template — uncomment what you need)"

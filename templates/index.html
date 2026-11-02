@@ -210,7 +210,10 @@
       <button data-action="svc" data-arg="start">Запуск</button>
       <button class="ghost" data-action="svc" data-arg="stop">Стоп</button>
       <button class="ghost" data-action="svc" data-arg="restart">Рестарт</button>
+      <button class="ghost" data-action="e2e" id="btnE2e"
+              title="Реальный запрос через listen-порт активного пресета: туннель до echo-сервера и exit-IP. TCP-пинг upstream есть в редакторе">Проверить прокси</button>
     </div>
+    <div id="e2eInfo" style="font-size:12px;color:var(--mut);margin-top:8px">проверка: ещё не выполнялась</div>
     <h2 class="sect">Пресеты</h2>
     <input id="search" placeholder="Поиск пресета — /" aria-label="Поиск пресета"
            autocomplete="off" spellcheck="false">
@@ -223,6 +226,17 @@
       <button class="ghost" data-action="import"
               title="Загрузить пресеты из ранее экспортированного JSON">Импорт</button>
       <input type="file" id="importFile" accept=".json,application/json" style="display:none" aria-hidden="true" tabindex="-1">
+    </div>
+    <h2 class="sect">Фейловер</h2>
+    <div id="foInfo" style="font-size:12px;color:var(--mut);margin-top:10px">фейловер: проверка…</div>
+    <div class="actions" style="margin-top:8px">
+      <input id="foChain" placeholder="home, backup" aria-label="Цепочка фейловера"
+             autocomplete="off" spellcheck="false" style="flex:1;min-width:140px"
+             title="Пресеты через запятую: основной → запасные. После порога неудачных E2E-проверок подряд панель переключает на следующий. Назад, на основной — только вручную">
+      <button class="ghost" data-action="foSave" id="btnFoSave"
+              title="Сохранить цепочку и включить автофейловер">Включить</button>
+      <button class="ghost" data-action="foOff" id="btnFoOff" hidden
+              title="Выключить автофейловер (цепочка удалится)">Выключить</button>
     </div>
     <h2 class="sect">Бинарник naive</h2>
     <div id="nvInfo" style="font-size:12px;color:var(--mut);margin-top:10px">бинарник: проверка…</div>
@@ -457,6 +471,7 @@ async function refreshAll() {
     const [st, ps] = await Promise.all([jget('/api/status'), jget('/api/configs')]);
     renderStatus(st);
     renderPresets(ps);
+    loadFailover();
     loadLog();
   } catch (e) { flash(e.message, false); }
 }
@@ -482,6 +497,11 @@ function renderStatus(st) {
     ['пресет', st.current ? escapeHtml(st.current) : '—'],
     ['uptime', st.active ? fmtUptime(st.uptime) : '—'],
     ['pid', st.active && st.pid != null ? String(st.pid) : '—'],
+    ['watchdog', st.watchdog
+      ? (st.watchdog.tripped ? 'выкл (флаппинг)'
+         : st.watchdog.enabled ? 'вкл' + (st.watchdog.restarts ? ' · ↻'+st.watchdog.restarts : '')
+         : 'выкл')
+      : '—'],
     ['панель', 'v'+escapeHtml(st.version || '?')],
   ];
   $('svcinfo').innerHTML = rows.map(([k, v], i) =>
@@ -624,6 +644,71 @@ async function probeUpstream() {
       : 'upstream НЕ доступен: '+(d.error || '?'), d.ms != null);
   } catch (e) { flash(e.message, false); }
   finally { b.disabled = false; b.textContent = 'пинг'; }
+}
+
+// E2E-проверка: реальный запрос ЧЕРЕЗ listen активного пресета (туннель до
+// echo-сервера + exit-IP). probe выше — «до upstream есть TCP», это —
+// «прокси действительно проксирует»: креды, форвардинг, remote-DNS.
+async function checkProxy() {
+  const b = $('btnE2e'), info = $('e2eInfo');
+  b.disabled = true; b.textContent = 'Проверяю…';
+  info.textContent = 'проверка: запрос через прокси…';
+  try {
+    const d = await jpost('/api/e2e', {});
+    const short = d.ok
+      ? 'через прокси' + (d.exit_ip ? ' · exit '+d.exit_ip : '') + ' · '+d.ms+'мс'
+        + (d.note ? ' · '+d.note : '')
+      : 'НЕ работает — '+(d.error || '?');
+    info.textContent = 'проверка: '+short;
+    flash(d.ok ? 'Прокси работает: '+short : 'Прокси '+short, !!d.ok);
+  } catch (e) { info.textContent = 'проверка: '+e.message; flash(e.message, false); }
+  finally { b.disabled = false; b.textContent = 'Проверить прокси'; }
+}
+
+// Фейловер: цепочка «основной → запасные». Фоновый монитор панели делает
+// E2E-проверку активного пресета и после порога неудач подряд переключает
+// на следующий; назад, на основной — только вручную (активация как обычно).
+async function loadFailover() {
+  try { renderFailover(await jget('/api/failover')); }
+  catch (e) { /* тихо: секция некритична, ошибка всплывёт в статусе */ }
+}
+function renderFailover(d) {
+  const info = $('foInfo');
+  if (d.chain && d.chain.length) $('foChain').value = d.chain.join(', ');
+  $('btnFoOff').hidden = !d.enabled;
+  $('btnFoSave').textContent = d.enabled ? 'Сохранить' : 'Включить';
+  if (!d.enabled) {
+    info.textContent = 'фейловер: выкл';
+    return;
+  }
+  let t = 'цепочка: '+d.chain.join(' → ');
+  if (d.active_index != null) t += ' · актив '+(d.active_index+1)+'/'+d.chain.length;
+  if (d.idle) t += ' · пауза: '+d.idle;
+  else if (d.last_ok != null) {
+    t += d.last_ok ? ' · ok' : ' · НЕ проходит ('+d.fails+'/'+d.threshold+')';
+  }
+  if (d.switches) t += ' · переключений: '+d.switches;
+  info.textContent = 'фейловер: '+t;
+  info.title = d.last_error ? String(d.last_error) : '';
+}
+async function saveFailover() {
+  const btn = $('btnFoSave');
+  const chain = $('foChain').value.split(',').map(s => s.trim()).filter(Boolean);
+  btn.disabled = true;
+  try {
+    renderFailover(await jput('/api/failover', {enabled: true, chain}));
+    flash('Фейловер включён: '+chain.join(' → '), true);
+  } catch (e) { flash(e.message, false); }
+  finally { btn.disabled = false; }
+}
+async function offFailover() {
+  if (!(await askConfirm('Выключить автофейловер? Цепочка будет удалена.',
+                         {ok:'Выключить', danger:true}))) return;
+  try {
+    renderFailover(await jdel('/api/failover'));
+    $('foChain').value = '';
+    flash('Фейловер выключен', true);
+  } catch (e) { flash(e.message, false); }
 }
 
 // Правдивые сообщения о применении: restart.rc отдаёт PUT активного пресета
@@ -1100,6 +1185,8 @@ const ACTIONS = {
   newPreset: () => newPreset(),
   closeEditor: () => closeEditor(),
   import: () => $('importFile').click(),
+  foSave: () => saveFailover(),
+  foOff: () => offFailover(),
   panelRestart: () => panelRestart(),
   updateCheck: () => checkUpdate(true),
   updateApply: () => applyUpdate(),
@@ -1111,6 +1198,7 @@ const ACTIONS = {
   duplicate: (arg) => dupPreset(arg),
   del: (arg) => del(arg),
   probe: () => probeUpstream(),
+  e2e: () => checkProxy(),
   togglePw: () => togglePw(),
   loadLog: () => loadLog(),
   logFilter: () => toggleLogFilter(),

@@ -1642,3 +1642,518 @@ def test_ui_has_naive_binary_controls(app):
                    'id="nvInfo"', 'id="btnNvUpd"', 'id="btnNvCheck"',
                    '/api/naive/check', '/api/naive/update', '/api/naive/status'):
         assert marker in html, marker
+
+
+# --- E2E-проверка: реальный запрос через listen-прокси --------------------------
+
+import socket
+import threading
+
+
+class _StubServer:
+    """Одноразовый локальный сервер: на каждое соединение зовёт handler(conn).
+
+    Живые сокеты на 127.0.0.1, без сети наружу: клиентская сторона панели
+    ходит сюда как к «прокси», серверная часть скрипта играет роль и прокси,
+    и echo-хоста за туннелем (для клиента они неразличимы).
+    """
+
+    def __init__(self, handler):
+        self.sock = socket.socket()
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(4)
+        self.port = self.sock.getsockname()[1]
+        self.handler = handler
+        self.errors = []
+        threading.Thread(target=self._accept_loop, daemon=True).start()
+
+    def _accept_loop(self):
+        try:
+            while True:
+                conn, _ = self.sock.accept()
+                threading.Thread(target=self._serve, args=(conn,), daemon=True).start()
+        except OSError:
+            pass
+
+    def _serve(self, conn):
+        try:
+            self.handler(conn)
+        except Exception as exc:  # диагностика стаба — не роняем тестовый поток
+            self.errors.append(repr(exc))
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+    def close(self):
+        self.sock.close()
+
+
+def _http_proxy_ok(conn):
+    req = conn.recv(4096)
+    assert req.startswith(b"CONNECT "), req[:40]
+    conn.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+    get = conn.recv(4096)
+    assert get.startswith(b"GET "), get[:40]
+    conn.sendall(b"HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n\r\n203.0.113.7")
+
+
+def _socks5_proxy_ok(conn):
+    greeting = conn.recv(3)
+    assert greeting == b"\x05\x01\x00", greeting
+    conn.sendall(b"\x05\x00")  # выбран NO-AUTH
+    req = conn.recv(4096)
+    assert req[:4] == b"\x05\x01\x00\x03", req[:10]
+    conn.sendall(b"\x05\x00\x00\x01" + socket.inet_aton("0.0.0.0")
+                 + (80).to_bytes(2, "big"))
+    get = conn.recv(4096)
+    assert get.startswith(b"GET "), get[:40]
+    conn.sendall(b"HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n\r\n198.51.100.99")
+
+
+def test_listen_endpoint_parsing(app):
+    f = app._listen_endpoint
+    assert f("socks://127.0.0.1:1080") == ("socks", "127.0.0.1", 1080)
+    assert f("socks5://0.0.0.0:1080") == ("socks", "0.0.0.0", 1080)
+    assert f("http://192.168.1.1:8080") == ("http", "192.168.1.1", 8080)
+    assert f("127.0.0.1:1080") == ("socks", "127.0.0.1", 1080)  # без схемы — socks
+    assert f("socks://127.0.0.1") == ("socks", "127.0.0.1", 1080)   # умолч. порт
+    assert f("http://127.0.0.1") == ("http", "127.0.0.1", 8080)
+    assert f("http://[::1]:8080") == ("http", "::1", 8080)
+    assert f("quic://x:1") is None       # listen не бывает quic
+    assert f("") is None
+    assert f("host:port") is None
+
+
+def test_extract_exit_ip(app):
+    f = app._extract_exit_ip
+    assert f("203.0.113.7") == "203.0.113.7"
+    assert f('{"ip":"198.51.100.99"}') == "198.51.100.99"
+    assert f("2001:db8::1") == "2001:db8::1"
+    assert f("hello") is None
+
+
+def test_e2e_http_listen_full_path(app, monkeypatch):
+    # http-listen: CONNECT → 200 → GET → ответ с IP (echo-хост http, без TLS)
+    stub = _StubServer(_http_proxy_ok)
+    monkeypatch.setattr(app, "E2E_URL", "http://e2e.example/")
+    try:
+        d = app._proxy_e2e_check(f"http://127.0.0.1:{stub.port}")
+        assert d["ok"] is True, d
+        assert d["exit_ip"] == "203.0.113.7"
+        assert d["ms"] >= 0
+    finally:
+        stub.close()
+    assert not stub.errors, stub.errors
+
+
+def test_e2e_socks_listen_full_path(app, monkeypatch):
+    stub = _StubServer(_socks5_proxy_ok)
+    monkeypatch.setattr(app, "E2E_URL", "http://e2e.example/")
+    try:
+        d = app._proxy_e2e_check(f"socks://127.0.0.1:{stub.port}")
+        assert d["ok"] is True, d
+        assert d["exit_ip"] == "198.51.100.99"
+    finally:
+        stub.close()
+    assert not stub.errors, stub.errors
+
+
+def test_e2e_refused_port(app):
+    # порт точно закрыт: bind(0) → close, но без listen
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    d = app._proxy_e2e_check(f"socks://127.0.0.1:{port}")
+    assert d["ok"] is False
+    assert "не принимает" in d["error"]
+
+
+def test_e2e_connect_rejected(app, monkeypatch):
+    def handler(conn):
+        conn.recv(4096)
+        conn.sendall(b"HTTP/1.1 407 Proxy Authentication Required\r\n\r\n")
+    stub = _StubServer(handler)
+    try:
+        d = app._proxy_e2e_check(f"http://127.0.0.1:{stub.port}")
+        assert d["ok"] is False
+        assert "407" in d["error"]
+    finally:
+        stub.close()
+
+
+def test_e2e_tunnel_ok_but_echo_silent(app, monkeypatch):
+    # туннель поднялся (200 на CONNECT), но echo-хост замолчал: прокси свою
+    # часть выполнил → ok=True c note, без exit_ip
+    def handler(conn):
+        conn.recv(4096)
+        conn.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+        time.sleep(0.3)  # клиент успеет отправить GET и упереться в закрытие
+    stub = _StubServer(handler)
+    monkeypatch.setattr(app, "E2E_URL", "http://e2e.example/")
+    try:
+        d = app._proxy_e2e_check(f"http://127.0.0.1:{stub.port}", timeout=3.0)
+        assert d["ok"] is True, d
+        assert d["exit_ip"] is None
+        assert d["note"]
+    finally:
+        stub.close()
+
+
+def test_e2e_endpoint_uses_active_config(client, app, monkeypatch):
+    # активного пресета нет → 400
+    r = client.post("/api/e2e", json={}, headers=CSRF)
+    assert r.status_code == 400
+    # есть config.json с listen → проверка идёт по нему (порт закрыт → ok:false)
+    app._save_json(app.ACTIVE_CONFIG,
+                   {"listen": "socks://127.0.0.1:1", "proxy": "https://u:p@h"})
+    r = client.post("/api/e2e", json={}, headers=CSRF)
+    assert r.status_code == 200
+    assert r.get_json()["ok"] is False
+    # явный listen в теле перекрывает активный конфиг
+    stub = _StubServer(_socks5_proxy_ok)
+    monkeypatch.setattr(app, "E2E_URL", "http://e2e.example/")
+    try:
+        r = client.post("/api/e2e", json={"listen": f"socks://127.0.0.1:{stub.port}"},
+                        headers=CSRF)
+        d = r.get_json()
+        assert r.status_code == 200 and d["ok"] is True, d
+    finally:
+        stub.close()
+
+
+def test_e2e_requires_csrf_header(client):
+    assert client.post("/api/e2e", json={}).status_code == 403
+
+
+# --- Watchdog: авто-рестарт упавшего naive --------------------------------------
+
+def _wd_seq(values):
+    """_proxy_running → серия результатов; после исчерпания — «лежит»."""
+    it = iter(values)
+
+    def fake():
+        return next(it, (False, None, None))
+    return fake
+
+
+def _wd_service(calls):
+    def fake(action):
+        calls.append(action)
+        return {"rc": 0, "stdout": "", "stderr": ""}
+    return fake
+
+
+def _wd_arm(app):
+    """Создаёт пустой init-скрипт: фикстура env указывает на отсутствующий,
+    а без него watchdog честно отвечает no-init и не рестартит."""
+    app.INIT_SCRIPT.parent.mkdir(parents=True, exist_ok=True)
+    app.INIT_SCRIPT.write_text("#!/bin/sh\n")
+
+
+def test_watchdog_silent_until_first_observation(app, monkeypatch):
+    # первый тик только фиксирует состояние: «изначально лежит» — не сигнал
+    wd = app._Watchdog()
+    monkeypatch.setattr(app, "_proxy_running", _wd_seq([(True, 11, 5)]))
+    assert wd.observe(recheck_delay=0.01) is None
+
+
+def test_watchdog_restarts_on_crash(app, monkeypatch):
+    wd = app._Watchdog()
+    calls = []
+    _wd_arm(app)
+    monkeypatch.setattr(app, "_proxy_running",
+                        _wd_seq([(True, 11, 5), (False, None, None), (False, None, None)]))
+    monkeypatch.setattr(app, "_service", _wd_service(calls))
+    assert wd.observe(recheck_delay=0.01) is None       # фиксируем running
+    ev = wd.observe(recheck_delay=0.01)
+    assert ev == {"event": "restarted", "rc": 0, "stderr": ""}
+    assert calls == ["start"]
+    assert wd.count == 1
+    assert wd.snapshot() == {"enabled": True, "restarts": 1, "tripped": False}
+
+
+def test_watchdog_respects_stop_marker(app, monkeypatch):
+    wd = app._Watchdog()
+    calls = []
+    monkeypatch.setattr(app, "_proxy_running",
+                        _wd_seq([(True, 11, 5), (False, None, None), (False, None, None)]))
+    monkeypatch.setattr(app, "_service", _wd_service(calls))
+    app.STOP_MARKER.parent.mkdir(parents=True, exist_ok=True)
+    app.STOP_MARKER.write_text("")
+    assert wd.observe(recheck_delay=0.01) is None
+    ev = wd.observe(recheck_delay=0.01)
+    assert ev == {"event": "stopped"}                    # штатный stop — стоим
+    assert calls == []
+    app.STOP_MARKER.unlink()
+
+
+def test_watchdog_recheck_recovers_from_restart_race(app, monkeypatch):
+    # up→down увиден посреди restart init-скрипта: перепроверка через паузу
+    # видит, что сервис уже поднялся — рестартить не надо
+    wd = app._Watchdog()
+    calls = []
+    monkeypatch.setattr(app, "_proxy_running",
+                        _wd_seq([(True, 11, 5), (False, None, None), (True, 12, 0)]))
+    monkeypatch.setattr(app, "_service", _wd_service(calls))
+    assert wd.observe(recheck_delay=0.01) is None
+    assert wd.observe(recheck_delay=0.01) is None
+    assert calls == []
+
+
+def test_watchdog_down_to_up_is_not_an_event(app, monkeypatch):
+    wd = app._Watchdog()
+    monkeypatch.setattr(app, "_proxy_running", _wd_seq([(False, None, None), (True, 9, 0)]))
+    wd.observe(recheck_delay=0.01)
+    assert wd.observe(recheck_delay=0.01) is None
+
+
+def test_watchdog_flap_trips(app, monkeypatch):
+    # 3 рестарта за окно → watchdog отключается; следующий crash уже не лечит
+    wd = app._Watchdog()
+    calls = []
+    _wd_arm(app)
+    monkeypatch.setattr(app, "_service", _wd_service(calls))
+
+    def crash_cycle():
+        monkeypatch.setattr(app, "_proxy_running",
+                            _wd_seq([(True, 11, 5), (False, None, None),
+                                     (False, None, None)]))
+        wd.observe(recheck_delay=0.01)  # фиксируем running
+        return wd.observe(recheck_delay=0.01)
+
+    for _ in range(3):
+        assert crash_cycle()["event"] == "restarted"
+    assert wd.count == 3
+
+    ev = crash_cycle()
+    assert ev == {"event": "tripped"}
+    assert wd.tripped is True
+    assert len(calls) == 3            # четвёртый start не состоялся
+
+    ev = crash_cycle()
+    assert ev == {"event": "down-tripped"}
+    assert len(calls) == 3
+
+
+def test_watchdog_requires_init_script(app, monkeypatch):
+    # init-скрипта нет (env-фикстура указывает на отсутствующий) — не падаем
+    wd = app._Watchdog()
+    calls = []
+    monkeypatch.setattr(app, "_proxy_running",
+                        _wd_seq([(True, 11, 5), (False, None, None), (False, None, None)]))
+    monkeypatch.setattr(app, "_service", _wd_service(calls))
+    wd.observe(recheck_delay=0.01)
+    assert wd.observe(recheck_delay=0.01) == {"event": "no-init"}
+    assert calls == []
+
+
+def test_status_reports_watchdog(client):
+    r = client.get("/api/status")
+    d = r.get_json()
+    assert r.status_code == 200
+    assert d["watchdog"] == {"enabled": True, "restarts": 0, "tripped": False}
+
+
+def test_watchdog_disabled_by_conf(conf_env):
+    conf_env.write_text('NAIVEPANEL_WATCHDOG="0"\n')
+    m = _reload()
+    assert m.WATCHDOG_ENABLED is False
+    c = m.app.test_client()
+    assert c.get("/api/status").get_json()["watchdog"]["enabled"] is False
+
+
+def test_watchdog_conf_interval_parsed(conf_env):
+    conf_env.write_text('NAIVEPANEL_WATCHDOG_INTERVAL="30"\n')
+    m = _reload()
+    assert m.WATCHDOG_INTERVAL == 30
+
+
+# --- UI: E2E и watchdog ---------------------------------------------------------
+
+def test_ui_has_e2e_and_watchdog_controls(app):
+    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    for marker in ('data-action="e2e"', 'id="btnE2e"', 'id="e2eInfo"',
+                   "/api/e2e", "checkProxy", "watchdog"):
+        assert marker in html, marker
+
+
+# --- Автофейловер: цепочка пресетов ---------------------------------------------
+
+def _fo_setup(client, app, presets=("home", "backup"), chain=None, activate="home"):
+    """Два живых пресета + активный home + цепочка (по умолчанию все пресеты)."""
+    for name in presets:
+        _create(client, name=name)
+    if activate:
+        assert client.post(f"/api/configs/{activate}/activate",
+                           headers=CSRF).status_code == 200
+    app._save_json(app.FAILOVER_CONF,
+                   {"enabled": True, "chain": list(chain if chain is not None else presets)})
+    return app._Failover(threshold=2)
+
+
+def _fo_e2e(monkeypatch, app, ok, error=None):
+    """Подмена E2E-проверки; возвращает список вызовов (listen-аргументы)."""
+    calls = []
+    result = {"ok": ok, "ms": 5}
+    if error:
+        result["error"] = error
+    monkeypatch.setattr(app, "_proxy_e2e_check",
+                        lambda listen: (calls.append(listen), result)[1])
+    return calls
+
+
+def test_failover_default_disabled(client):
+    d = client.get("/api/failover").get_json()
+    assert d["enabled"] is False and d["chain"] == []
+
+
+def test_failover_put_validates_chain(client):
+    _create(client, name="home")
+    _create(client, name="backup")
+    r = client.put("/api/failover", headers=CSRF,
+                   json={"enabled": True, "chain": ["home", "backup"]})
+    assert r.status_code == 200
+    d = r.get_json()
+    assert d["enabled"] is True and d["chain"] == ["home", "backup"]
+    # несуществующий пресет — 404, битое имя — 400, дубль — 400
+    assert client.put("/api/failover", headers=CSRF,
+                      json={"enabled": True, "chain": ["home", "nope"]}).status_code == 404
+    assert client.put("/api/failover", headers=CSRF,
+                      json={"enabled": True, "chain": ["home", "BAD!"]}).status_code == 400
+    assert client.put("/api/failover", headers=CSRF,
+                      json={"enabled": True, "chain": ["home", "home"]}).status_code == 400
+    assert client.put("/api/failover", headers=CSRF,
+                      json={"enabled": True, "chain": []}).status_code == 400
+    # выключенным можно сохранить пустую цепочку
+    r = client.put("/api/failover", headers=CSRF, json={"enabled": False, "chain": []})
+    assert r.status_code == 200 and r.get_json()["enabled"] is False
+
+
+def test_failover_delete_disables(client, app):
+    _create(client, name="home")
+    client.put("/api/failover", headers=CSRF,
+               json={"enabled": True, "chain": ["home"]})
+    assert app.FAILOVER_CONF.exists()
+    assert client.delete("/api/failover", headers=CSRF).status_code == 200
+    assert not app.FAILOVER_CONF.exists()
+    assert client.get("/api/failover").get_json()["enabled"] is False
+
+
+def test_failover_requires_csrf(client):
+    assert client.put("/api/failover", json={"enabled": True, "chain": ["x"]}).status_code == 403
+    assert client.delete("/api/failover").status_code == 403
+
+
+def test_status_includes_failover(client):
+    d = client.get("/api/status").get_json()
+    assert "failover" in d and d["failover"]["enabled"] is False
+
+
+def test_failover_cycle_idles_without_chain(app):
+    fo = app._Failover(threshold=2)
+    assert fo.cycle() is None
+    assert fo.idle_reason == "выключен"
+
+
+def test_failover_cycle_respects_stop_marker(client, app, monkeypatch):
+    fo = _fo_setup(client, app)
+    app.STOP_MARKER.parent.mkdir(parents=True, exist_ok=True)
+    app.STOP_MARKER.write_text("")
+    calls = _fo_e2e(monkeypatch, app, ok=False, error="down")
+    assert fo.cycle() is None
+    assert calls == []                               # даже не проверяем
+    assert fo.idle_reason == "прокси остановлен вручную"
+    app.STOP_MARKER.unlink()
+
+
+def test_failover_cycle_idles_when_active_outside_chain(client, app, monkeypatch):
+    fo = _fo_setup(client, app, presets=("home", "backup"), chain=("home", "backup"),
+                   activate="home")
+    # пользователь активировал пресет вне цепочки — монитор не вмешивается
+    _create(client, name="other")
+    assert client.post("/api/configs/other/activate", headers=CSRF).status_code == 200
+    calls = _fo_e2e(monkeypatch, app, ok=False, error="down")
+    assert fo.cycle() is None
+    assert calls == []
+    assert fo.idle_reason == "активный пресет вне цепочки"
+
+
+def test_failover_hysteresis_then_switch(client, app, monkeypatch):
+    # порог 2: первая неудача — только счётчик, вторая — переключение
+    fo = _fo_setup(client, app, presets=("home", "backup"))
+    _fo_e2e(monkeypatch, app, ok=False, error="upstream down")
+    assert fo.cycle() == {"event": "failing", "fails": 1}
+    assert app._active_name() == "home"
+
+    ev = fo.cycle()
+    assert ev["event"] == "switched" and ev["to"] == "backup"
+    assert app._active_name() == "backup"            # config.json/.active переписаны
+    active = json.loads(app.ACTIVE_CONFIG.read_text())
+    assert active["proxy"].startswith("https://")
+    assert fo.switches == 1 and fo.snapshot()["active_index"] == 1
+
+
+def test_failover_recovery_resets_counter(client, app, monkeypatch):
+    fo = _fo_setup(client, app)
+    _fo_e2e(monkeypatch, app, ok=False, error="x")
+    assert fo.cycle() == {"event": "failing", "fails": 1}
+    _fo_e2e(monkeypatch, app, ok=True)
+    assert fo.cycle() is None
+    _fo_e2e(monkeypatch, app, ok=False, error="x")
+    assert fo.cycle() == {"event": "failing", "fails": 1}   # счётчик с нуля
+    assert app._active_name() == "home"                     # переключения не было
+
+
+def test_failover_exhausted_announced_once(client, app, monkeypatch):
+    # цепочка из одного пресета: переключаться некуда — exhausted один раз
+    fo = _fo_setup(client, app, presets=("home",), chain=("home",))
+    _fo_e2e(monkeypatch, app, ok=False, error="x")
+    assert fo.cycle() == {"event": "failing", "fails": 1}
+    assert fo.cycle() == {"event": "exhausted", "active": "home"}
+    # следующая волна: счётчик копится, но exhausted уже не анонсируется
+    assert fo.cycle() == {"event": "failing", "fails": 1}
+    assert fo.cycle() is None
+    # восстановление снимает «уже кричали» — следующий провал снова анонсирует
+    _fo_e2e(monkeypatch, app, ok=True)
+    fo.cycle()
+    _fo_e2e(monkeypatch, app, ok=False, error="x")
+    fo.cycle()
+    assert fo.cycle() == {"event": "exhausted", "active": "home"}
+
+
+def test_failover_skips_missing_preset_in_chain(client, app, monkeypatch):
+    # пресет удалили из conf.d — цепочка просто короче: home → backup
+    fo = _fo_setup(client, app, presets=("home", "backup"),
+                   chain=("home", "deleted", "backup"))
+    (app.CONF_D / "deleted.json").unlink(missing_ok=True)
+    _fo_e2e(monkeypatch, app, ok=False, error="x")
+    fo.cycle()
+    ev = fo.cycle()
+    assert ev["event"] == "switched" and ev["to"] == "backup"
+
+
+def test_failover_switch_restarts_service(client, app, monkeypatch, env):
+    # полноценный switch: активация идёт тем же кодом, что ручной activate,
+    # включая рестарт init-скрипта (здесь — заглушка с записью вызовов)
+    stub = env / "stub-init"
+    stub.write_text("#!/bin/sh\n")
+    stub.chmod(0o755)
+    app.INIT_SCRIPT = stub
+    fo = _fo_setup(client, app)
+    _fo_e2e(monkeypatch, app, ok=False, error="x")
+    fo.cycle()
+    ev = fo.cycle()
+    assert ev["event"] == "switched"
+    assert isinstance(ev["restart"]["rc"], int)
+
+
+# --- UI: фейловер ---------------------------------------------------------------
+
+def test_ui_has_failover_controls(app):
+    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    for marker in ('data-action="foSave"', 'data-action="foOff"', 'id="foChain"',
+                   'id="foInfo"', "/api/failover", "renderFailover"):
+        assert marker in html, marker
