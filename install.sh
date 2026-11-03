@@ -603,12 +603,20 @@ if [ ! -f "$PANEL_CONF" ]; then
 #NAIVEPANEL_E2E_URL="https://api.ipify.org/"
 
 # Failover tuning (the preset chain itself is configured in the UI and lives
-# in /opt/etc/naive/proxy/failover.json). THRESHOLD consecutive failed E2E
-# checks switch to the next preset in the chain. 0 in NAIVEPANEL_FAILOVER
-# disables the monitor entirely.
+# in /opt/etc/naive/proxy/failover.json). Two-speed monitor: healthy - check
+# every INTERVAL; after a failure - every FAST until the THRESHOLD of
+# consecutive failures switches to the next preset (~20-40s total) or the
+# proxy recovers. 0 in NAIVEPANEL_FAILOVER disables the monitor entirely -
+# both switching and the E2E history.
 #NAIVEPANEL_FAILOVER="1"
-#NAIVEPANEL_FAILOVER_INTERVAL="60"
+#NAIVEPANEL_FAILOVER_INTERVAL="30"
+#NAIVEPANEL_FAILOVER_FAST="5"
 #NAIVEPANEL_FAILOVER_THRESHOLD="3"
+
+# E2E check history for the status-card sparkline (ring buffer, survives
+# panel restarts; default keeps a day of 30s-interval checks).
+#NAIVEPANEL_E2E_HISTORY="/opt/etc/naive/proxy/e2e-history.jsonl"
+#NAIVEPANEL_E2E_KEEP="2880"
 EOF
     chmod 0644 "$PANEL_CONF"
     info "created $PANEL_CONF (settings template — uncomment what you need)"

@@ -1784,9 +1784,10 @@ def test_e2e_connect_rejected(app, monkeypatch):
         stub.close()
 
 
-def test_e2e_tunnel_ok_but_echo_silent(app, monkeypatch):
-    # туннель поднялся (200 на CONNECT), но echo-хост замолчал: прокси свою
-    # часть выполнил → ok=True c note, без exit_ip
+def test_e2e_tunnel_ack_but_no_data_fails(app, monkeypatch):
+    # туннель подтверждён (200 на CONNECT), но данные не пошли. Успех —
+    # только полный ответ echo-хоста: это ok:False (инцидент v0.12.2 —
+    # naive ACK-ает SOCKS/CONNECT при лежащем upstream, затем обрыв)
     def handler(conn):
         conn.recv(4096)
         conn.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
@@ -1795,9 +1796,31 @@ def test_e2e_tunnel_ok_but_echo_silent(app, monkeypatch):
     monkeypatch.setattr(app, "E2E_URL", "http://e2e.example/")
     try:
         d = app._proxy_e2e_check(f"http://127.0.0.1:{stub.port}", timeout=3.0)
-        assert d["ok"] is True, d
-        assert d["exit_ip"] is None
-        assert d["note"]
+        assert d["ok"] is False, d
+        assert d["error"]                       # причина в error, не в note
+    finally:
+        stub.close()
+
+
+def test_e2e_socks_ack_then_close_is_failure(app):
+    # точный кейс с реального роутера (v0.12.2): caddy на сервере отключили,
+    # naive принимает SOCKS CONNECT и отвечает 0x00, затем TLS через
+    # туннель получает EOF. До фикса это считалось успехом с note и
+    # фейловер не срабатывал; теперь — неудача с текстом TLS-ошибки
+    def handler(conn):
+        greeting = conn.recv(3)
+        assert greeting == b"\x05\x01\x00", greeting
+        conn.sendall(b"\x05\x00")               # naive ACK-ает туннель…
+        conn.recv(4096)                          # CONNECT-запрос
+        conn.sendall(b"\x05\x00\x00\x01" + socket.inet_aton("0.0.0.0")
+                     + (80).to_bytes(2, "big"))
+        conn.recv(4096)                          # ClientHello уходит в никуда
+        conn.close()                             # …и рвёт соединение
+    stub = _StubServer(handler)
+    try:
+        d = app._proxy_e2e_check(f"socks://127.0.0.1:{stub.port}", timeout=5.0)
+        assert d["ok"] is False, d
+        assert "TLS" in d["error"] or "echo" in d["error"], d
     finally:
         stub.close()
 
@@ -2052,10 +2075,13 @@ def test_status_includes_failover(client):
     assert "failover" in d and d["failover"]["enabled"] is False
 
 
-def test_failover_cycle_idles_without_chain(app):
+def test_failover_cycle_idles_without_chain(app, monkeypatch):
+    # нет цепочки И нет активного пресета — проверять нечего
+    calls = _fo_e2e(monkeypatch, app, ok=False, error="down")
     fo = app._Failover(threshold=2)
     assert fo.cycle() is None
-    assert fo.idle_reason == "выключен"
+    assert calls == []
+    assert fo.idle_reason == "нет активного пресета с listen"
 
 
 def test_failover_cycle_respects_stop_marker(client, app, monkeypatch):
@@ -2069,16 +2095,32 @@ def test_failover_cycle_respects_stop_marker(client, app, monkeypatch):
     app.STOP_MARKER.unlink()
 
 
-def test_failover_cycle_idles_when_active_outside_chain(client, app, monkeypatch):
+def test_failover_cycle_checks_but_never_switches_when_active_outside_chain(client, app, monkeypatch):
     fo = _fo_setup(client, app, presets=("home", "backup"), chain=("home", "backup"),
                    activate="home")
-    # пользователь активировал пресет вне цепочки — монитор не вмешивается
+    # активный вне цепочки: монитор продолжает проверять (история для
+    # спарклайна) и НЕ переключает даже после порога неудач
     _create(client, name="other")
     assert client.post("/api/configs/other/activate", headers=CSRF).status_code == 200
     calls = _fo_e2e(monkeypatch, app, ok=False, error="down")
     assert fo.cycle() is None
-    assert calls == []
-    assert fo.idle_reason == "активный пресет вне цепочки"
+    assert fo.cycle() is None                       # порог даже не копится
+    assert len(calls) == 2
+    assert app._active_name() == "other"
+    assert fo.idle_reason is None                   # проверки идут — не пауза
+    assert fo.snapshot()["active_index"] is None
+
+
+def test_monitor_records_history_when_failover_disabled(client, app, monkeypatch):
+    # цепочка не задана, но активный пресет есть: монитор всё равно
+    # проверяет и пишет историю — спарклайн живёт без фейловера
+    fo = _fo_setup(client, app, presets=("home",), chain=None, activate="home")
+    app.FAILOVER_CONF.unlink()
+    _fo_e2e(monkeypatch, app, ok=False, error="down")
+    assert fo.cycle() is None
+    assert fo.idle_reason is None
+    hist = app._e2e_history_load(10)
+    assert len(hist) == 1 and hist[0]["ok"] is False and hist[0]["ms"] == 5
 
 
 def test_failover_hysteresis_then_switch(client, app, monkeypatch):
@@ -2163,3 +2205,127 @@ def test_ui_has_failover_controls(app):
         assert marker in html, marker
     # поле ручного ввода имён убрано: выбор пресетов — только чипами/select
     assert 'id="foChain"' not in html
+
+
+# --- История E2E-проверок: буфер, API, спарклайн -----------------------------
+
+def test_e2e_history_append_load_and_trim(app, monkeypatch):
+    # обрезка ленивая (раз в _E2E_TRIM_EVERY аппендов) — здесь на каждом
+    monkeypatch.setattr(app, "E2E_KEEP", 10)
+    monkeypatch.setattr(app, "_E2E_TRIM_EVERY", 1)
+    for i in range(12):
+        app._e2e_history_append(i % 3 != 0, i)
+    entries = app._e2e_history_load(100)
+    assert len(entries) == 10                     # обрезка до E2E_KEEP
+    assert entries[0]["ms"] == 2 and entries[-1]["ms"] == 11
+    assert all(set(e) == {"t", "ok", "ms"} for e in entries)
+
+
+def test_e2e_history_load_skips_broken_lines(app):
+    app.E2E_HISTORY.parent.mkdir(parents=True, exist_ok=True)
+    app.E2E_HISTORY.write_text(
+        '{"t": 1, "ok": true, "ms": 10}\n'
+        'обрыв записи без переноса\n'
+        '{"t": 2, "ok": false}\n'                   # нет ok-bool — невалидно? ok есть; ms нет → 0
+        'not json at all\n'
+        '{"t": 3, "ok": true, "ms": 30}\n',
+        encoding="utf-8",
+    )
+    entries = app._e2e_history_load(10)
+    assert [e["t"] for e in entries] == [1, 2, 3]
+    assert entries[1]["ms"] == 0                   # отсутствие ms не роняет загрузку
+
+
+def test_e2e_history_api_empty_and_stats(client, app):
+    r = client.get("/api/e2e/history")
+    assert r.status_code == 200
+    d = r.get_json()
+    assert d["entries"] == [] and d["stats"]["availability"] is None
+    for i, ok in enumerate([True, True, True, False]):
+        app._e2e_history_append(ok, 100 + i)
+    d = client.get("/api/e2e/history?last=4").get_json()
+    assert len(d["entries"]) == 4
+    assert d["stats"]["ok"] == 3 and d["stats"]["fail"] == 1
+    assert d["stats"]["availability"] == 75.0
+    assert d["stats"]["avg_ms"] == round((100 + 101 + 102 + 103) / 4)  # 102
+    assert d["stats"]["window_s"] == d["entries"][3]["t"] - d["entries"][0]["t"]
+    # last ограничен и снизу и сверху
+    assert len(client.get("/api/e2e/history?last=1").get_json()["entries"]) == 1
+
+
+def test_e2e_history_cycle_writes_entries(client, app, monkeypatch):
+    # полный цикл: ok-проверка и fail-проверка пишутся в буфер как есть
+    fo = _fo_setup(client, app, presets=("home",), chain=("home",))
+    results = [{"ok": True, "ms": 30}, {"ok": False, "ms": 0, "error": "x"}]
+    monkeypatch.setattr(app, "_proxy_e2e_check", lambda listen: results.pop(0))
+    fo.cycle()
+    fo.cycle()
+    hist = app._e2e_history_load(10)
+    assert [(e["ok"], e["ms"]) for e in hist] == [(True, 30), (False, 0)]
+
+
+def test_ui_has_e2e_history_sparkline(app):
+    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    for marker in ('id="e2eSpark"', "/api/e2e/history", "drawSpark", "loadSpark",
+                   'class="spark"'):
+        assert marker in html, marker
+
+
+# --- Двухскоростной монитор: частые проверки при сбое --------------------------
+
+def test_failover_hot_flag_escalates_and_cools(client, app, monkeypatch):
+    # неудача при вооружённом фейловере → hot=True (монитор спит FAST);
+    # восстановление → hot=False. Без цепочки hot не включается
+    fo = _fo_setup(client, app, presets=("home", "backup"))
+    _fo_e2e(monkeypatch, app, ok=False, error="x")
+    fo.cycle()
+    assert fo.hot is True
+    _fo_e2e(monkeypatch, app, ok=True)
+    fo.cycle()
+    assert fo.hot is False and fo._fails == 0
+
+
+def test_failover_hot_off_without_chain(client, app, monkeypatch):
+    # цепочки нет: порог не копится, эскалации нет — редкий ритм экономит echo
+    fo = _fo_setup(client, app, presets=("home",), chain=None, activate="home")
+    app.FAILOVER_CONF.unlink()
+    _fo_e2e(monkeypatch, app, ok=False, error="x")
+    fo.cycle()
+    assert fo.hot is False
+
+
+def test_failover_hot_cleared_by_stop_marker(client, app, monkeypatch):
+    fo = _fo_setup(client, app)
+    _fo_e2e(monkeypatch, app, ok=False, error="x")
+    fo.cycle()
+    assert fo.hot is True
+    app.STOP_MARKER.parent.mkdir(parents=True, exist_ok=True)
+    app.STOP_MARKER.write_text("")
+    fo.cycle()                                   # пауза — частить незачем
+    assert fo.hot is False and fo.idle_reason == "прокси остановлен вручную"
+    app.STOP_MARKER.unlink()
+
+
+def test_failover_fast_min_two_seconds(conf_env):
+    conf_env.write_text('NAIVEPANEL_FAILOVER_INTERVAL="60"\n'
+                        'NAIVEPANEL_FAILOVER_FAST="1"\n')
+    m = _reload()
+    assert m.FAILOVER_INTERVAL == 60
+    assert m.FAILOVER_FAST == 2                  # минимум 2с
+
+
+def test_failover_fast_not_longer_than_interval(conf_env):
+    # отдельный тест: panel.conf применяется через setdefault, в рамках
+    # одного теста второй reload не перезапишет уже установленную переменную
+    conf_env.write_text('NAIVEPANEL_FAILOVER_INTERVAL="20"\n'
+                        'NAIVEPANEL_FAILOVER_FAST="60"\n')
+    m = _reload()
+    assert m.FAILOVER_FAST == 20                 # не длиннее обычного интервала
+
+
+def test_failover_snapshot_reports_probing_fast(client, app, monkeypatch):
+    fo = _fo_setup(client, app)
+    _fo_e2e(monkeypatch, app, ok=False, error="x")
+    fo.cycle()
+    snap = fo.snapshot()
+    assert snap["probing_fast"] is True and snap["fast_interval"] >= 2

@@ -97,6 +97,10 @@
                  padding:2px 6px; margin:0 -6px; border-radius:6px; }
   /* «состояние» (точка + слово) не влезает в полуколонку без обрезки */
   .svcinfo .kv.wide { grid-column:1 / -1; }
+  .spark { display:flex; flex-direction:column; gap:3px; margin-bottom:14px; }
+  .spark svg { display:block; width:100%; height:16px; border-radius:3px; overflow:hidden; }
+  .spark .cap { font-size:11px; color:var(--mut); white-space:nowrap;
+                overflow:hidden; text-overflow:ellipsis; }
   .svcinfo .kv span { color:var(--mut); white-space:nowrap; }
   .svcinfo .kv b { font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
                    font-variant-numeric:tabular-nums; }
@@ -226,6 +230,7 @@
   <section class="card" style="grid-area:aside">
     <h2>Сервис</h2>
     <div class="svcinfo" id="svcinfo"></div>
+    <div id="e2eSpark" class="spark" hidden></div>
     <div class="actions">
       <button data-action="svc" data-arg="start">Запуск</button>
       <button class="ghost" data-action="svc" data-arg="stop">Стоп</button>
@@ -500,6 +505,7 @@ async function refreshAll() {
     renderStatus(st);
     renderPresets(ps);
     loadFailover();
+    loadSpark();
     loadLog();
   } catch (e) { flash(e.message, false); }
 }
@@ -695,6 +701,40 @@ async function checkProxy() {
   finally { b.disabled = false; b.textContent = 'Проверить прокси'; }
 }
 
+// Спарклайн истории E2E: полоска зелёный/красный по проверкам монитора +
+// подпись с доступностью и средней задержкой. Данные меняются раз в
+// интервал монитора — обновляем раз в 30с, не в 3-секундном полле.
+async function loadSpark() {
+  try { drawSpark(await jget('/api/e2e/history?last=120')); }
+  catch (e) { /* тихо: спарклайн некритичен */ }
+}
+function drawSpark(d) {
+  const box = $('e2eSpark');
+  const es = d.entries || [];
+  if (!es.length) { box.hidden = true; return; }
+  box.hidden = false;
+  const n = es.length, w = 100 / n;
+  let bars = '';
+  for (let i = 0; i < n; i++) {
+    const e = es[i];
+    bars += '<rect x="'+(i * w).toFixed(2)+'" y="'+(e.ok ? 4 : 0)
+      +'" width="'+Math.max(w - 0.4, 0.3).toFixed(2)+'" height="'+(e.ok ? 12 : 16)
+      +'" style="fill:'+(e.ok ? 'var(--acc)' : 'var(--err)')+'"/>';
+  }
+  const st = d.stats || {};
+  const win = st.window_s ? fmtSpan(st.window_s) : '';
+  box.innerHTML = '<svg viewBox="0 0 100 16" preserveAspectRatio="none" aria-hidden="true">'+bars+'</svg>'
+    + '<span class="cap">E2E '+(st.availability != null ? st.availability+'%' : '')
+    + (st.avg_ms != null ? ' · в среднем '+st.avg_ms+'мс' : '')
+    + (win ? ' · '+win : '')+'</span>';
+  box.title = 'последние '+n+' проверок монитора: зелёный — прокси работает, красный — сбой (подробности — лог панели)';
+}
+function fmtSpan(s) {
+  const h = Math.floor(s/3600), m = Math.round(s%3600/60);
+  if (h) return m ? h+'ч '+m+'м' : h+'ч';
+  return m ? m+'м' : '<1м';
+}
+
 // Фейловер: цепочка «основной → запасные» собирается чипами (без ввода
 // имён руками: select знает существующие пресеты, дубли исключены). Правки
 // локальные до кнопки «Включить/Сохранить»; монитор панели делает
@@ -753,7 +793,9 @@ function renderFailover(d) {
   if (!d.enabled && !dirty) t = 'выкл';
   if (d.enabled && !dirty && d.active_index != null) t += ' · актив '+(d.active_index+1)+'/'+d.chain.length;
   if (d.enabled && d.idle) t += ' · пауза: '+d.idle;
-  else if (d.enabled && !dirty && d.last_ok != null) t += d.last_ok ? ' · ok' : ' · НЕ проходит ('+d.fails+'/'+d.threshold+')';
+  else if (d.enabled && !dirty && d.last_ok != null)
+    t += d.last_ok ? ' · ok' : ' · НЕ проходит ('+d.fails+'/'+d.threshold+')';
+  if (d.enabled && d.probing_fast && d.last_ok === false) t += ' · частые проверки';
   if (d.enabled && d.switches) t += ' · переключений: '+d.switches;
   if (dirty) t += ' · НЕ СОХРАНЕНО';
   if (d.enabled && activeName && foChainArr.length && !inChain.has(activeName))
@@ -1276,7 +1318,9 @@ $('log').addEventListener('scroll', () => {
 
 // Автообновление лога и статуса: раз в 3с, только на видимой вкладке.
 setInterval(() => { if (!document.hidden) { loadLog(); pollStatus(); } }, 3000);
-document.addEventListener('visibilitychange', () => { if (!document.hidden) { loadLog(); pollStatus(); } });
+document.addEventListener('visibilitychange', () => { if (!document.hidden) { loadLog(); pollStatus(); loadSpark(); } });
+// История E2E меняется раз в интервал монитора — свой медленный таймер
+setInterval(() => { if (!document.hidden) loadSpark(); }, 30000);
 
 // Делегирование кликов: inline-обработчики запрещены nonce-CSP.
 const ACTIONS = {

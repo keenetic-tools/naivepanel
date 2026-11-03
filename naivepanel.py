@@ -55,7 +55,8 @@ CONF_KEYS = frozenset({
     "NAIVEPANEL_WATCHDOG", "NAIVEPANEL_WATCHDOG_INTERVAL",
     "NAIVEPANEL_E2E_URL",
     "NAIVEPANEL_FAILOVER", "NAIVEPANEL_FAILOVER_INTERVAL",
-    "NAIVEPANEL_FAILOVER_THRESHOLD",
+    "NAIVEPANEL_FAILOVER_THRESHOLD", "NAIVEPANEL_FAILOVER_FAST",
+    "NAIVEPANEL_E2E_HISTORY", "NAIVEPANEL_E2E_KEEP",
 })
 
 _CONF_SKIPPED: list[str] = []
@@ -187,6 +188,19 @@ WATCHDOG_RECHECK_S = 3.0       # пауза до перепроверки up→d
 E2E_URL = os.environ.get("NAIVEPANEL_E2E_URL", "https://api.ipify.org/")
 E2E_TIMEOUT = 10.0
 
+# --- История E2E-проверок ----------------------------------------------------
+# Монитор (см. фейловер ниже) проверяет активный пресет не только ради
+# переключений: каждая проверка пишется в кольцевой буфер JSONL и переживает
+# рестарт панели. UI рисует из него спарклайн в статус-карте — момент сбоя
+# и восстановления виден без чтения логов. По умолчанию храним сутки
+# проверок при 30-секундном интервале (2880 записей ≈ 90 КБ).
+E2E_HISTORY = Path(os.environ.get("NAIVEPANEL_E2E_HISTORY",
+                                  str(NAIVEPROXY_DIR / "e2e-history.jsonl")))
+_E2E_KEEP_RAW = os.environ.get("NAIVEPANEL_E2E_KEEP", "2880") or "2880"
+E2E_KEEP, _E2E_KEEP_INVALID = _int_or_default(_E2E_KEEP_RAW, 2880)
+E2E_KEEP = max(60, E2E_KEEP)
+_E2E_TRIM_EVERY = 100  # аппендов между обрезками буфера до E2E_KEEP
+
 # --- Автофейловер пресетов ---------------------------------------------------
 # Цепочка «основной → запасной» в /opt/etc/naive/proxy/failover.json: фоновый
 # поток раз в NAIVEPANEL_FAILOVER_INTERVAL секунд делает E2E-проверку активного
@@ -198,9 +212,15 @@ E2E_TIMEOUT = 10.0
 FAILOVER_CONF = NAIVEPROXY_DIR / "failover.json"
 _FAILOVER_RAW = os.environ.get("NAIVEPANEL_FAILOVER", "1") or "1"
 FAILOVER_ENABLED = _FAILOVER_RAW.strip().lower() not in {"0", "no", "off", "false"}
-_FAILOVER_INTERVAL_RAW = os.environ.get("NAIVEPANEL_FAILOVER_INTERVAL", "60") or "60"
-FAILOVER_INTERVAL, _FAILOVER_INTERVAL_INVALID = _int_or_default(_FAILOVER_INTERVAL_RAW, 60)
-FAILOVER_INTERVAL = max(15, FAILOVER_INTERVAL)  # чаще 15с echo-хост не опрашиваем
+_FAILOVER_INTERVAL_RAW = os.environ.get("NAIVEPANEL_FAILOVER_INTERVAL", "30") or "30"
+FAILOVER_INTERVAL, _FAILOVER_INTERVAL_INVALID = _int_or_default(_FAILOVER_INTERVAL_RAW, 30)
+FAILOVER_INTERVAL = max(10, FAILOVER_INTERVAL)  # чаще 10с в спокойном режиме не нужно
+# Двухскоростной монитор: пока прокси здоров, редкие проверки (30с); после
+# первой неудачи — частые (5с), пока порог не добьётся или прокси не
+# оживёт. Переключение за ~20–40с вместо минут, фоновая нагрузка та же.
+_FAILOVER_FAST_RAW = os.environ.get("NAIVEPANEL_FAILOVER_FAST", "5") or "5"
+FAILOVER_FAST, _FAILOVER_FAST_INVALID = _int_or_default(_FAILOVER_FAST_RAW, 5)
+FAILOVER_FAST = max(2, min(FAILOVER_FAST, FAILOVER_INTERVAL))
 _FAILOVER_THRESHOLD_RAW = os.environ.get("NAIVEPANEL_FAILOVER_THRESHOLD", "3") or "3"
 FAILOVER_THRESHOLD, _FAILOVER_THRESHOLD_INVALID = _int_or_default(_FAILOVER_THRESHOLD_RAW, 3)
 FAILOVER_THRESHOLD = min(10, max(1, FAILOVER_THRESHOLD))
@@ -685,7 +705,8 @@ def _get_via_tunnel(sock: socket.socket, host: str, path: str,
     if len(code) < 2 or code[1] != b"200":
         got = code[1].decode("latin-1", "replace") if len(code) >= 2 else "?"
         return None, f"echo-сервер ответил HTTP {got}"
-    return body.decode("utf-8", "replace").strip() or None, None
+    # пустое тело — валидный ответ: прокси работает, exit-IP просто не распознан
+    return body.decode("utf-8", "replace").strip(), None
 
 
 _IPV4_RE = re.compile(r"\b(\d{1,3}(?:\.\d{1,3}){3})\b")
@@ -710,8 +731,10 @@ def _extract_exit_ip(text: str) -> str | None:
 def _proxy_e2e_check(listen_uri: str, timeout: float = E2E_TIMEOUT) -> dict[str, Any]:
     """Прогоняет один реальный запрос через listen naive (см. E2E_URL).
 
-    ok=True означает «туннель через прокси поднялся»; exit_ip может быть
-    None с note, если echo-хост недоступен или не распознан ответ.
+    ok=True — только полный ответ echo-хоста через туннель (exit_ip может
+    быть None с note, если ответ не распознан). Подтверждённый, но
+    «мёртвый» туннель (ACK, затем обрыв — так ведёт себя naive при лежащем
+    upstream) — это ok:False с причиной.
     """
     t0 = time.monotonic()
 
@@ -740,10 +763,13 @@ def _proxy_e2e_check(listen_uri: str, timeout: float = E2E_TIMEOUT) -> dict[str,
         if err:
             return {"ok": False, "ms": _ms(), "error": err}
         body, err = _get_via_tunnel(sock, echo_host, echo_path, use_tls, timeout)
-        if body is None:
-            # туннель поднят — прокси свою часть выполнил; не вышло только
-            # общение с echo-хостом. Это успех проверки прокси, но с оговоркой
-            return {"ok": True, "ms": _ms(), "exit_ip": None, "note": err}
+        if err is not None:
+            # Туннель мог быть подтверждён формально, а данные не пошли —
+            # так ведёт себя naive при лежащем upstream: ACK на CONNECT,
+            # затем обрыв (TLS EOF). Это НЕУДАЧА проверки: успех — только
+            # полный ответ echo-хоста через туннель. От разовых осечек
+            # самого echo-хоста защищает порог фейловера, не «оговорка».
+            return {"ok": False, "ms": _ms(), "error": err}
         ip = _extract_exit_ip(body)
         return {"ok": True, "ms": _ms(), "exit_ip": ip,
                 "note": None if ip else "ответ echo-сервера получен, exit-IP не распознан"}
@@ -772,6 +798,73 @@ def _active_listen() -> str | None:
     if isinstance(raw, str) and raw.strip():
         return raw.strip()
     return None
+
+
+# --- История E2E-проверок: кольцевой буфер -----------------------------------
+
+_e2e_since_trim = 0
+
+
+def _e2e_history_append(ok: bool, ms: int | None) -> None:
+    """Одна запись {t, ok, ms} в JSONL-буфер; периодически обрезаем хвост.
+
+    Файл маленький (десятки КБ), пишет только поток монитора раз в интервал —
+    простой append с редкой обрезкой дешевле переписывания всего файла.
+    Ошибка записи не должна ронять монитор — предупреждение в лог.
+    """
+    global _e2e_since_trim
+    try:
+        E2E_HISTORY.parent.mkdir(parents=True, exist_ok=True)
+        with E2E_HISTORY.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"t": int(time.time()), "ok": bool(ok),
+                                 "ms": int(ms or 0)}) + "\n")
+        _e2e_since_trim += 1
+        if _e2e_since_trim >= _E2E_TRIM_EVERY:
+            _e2e_since_trim = 0
+            _e2e_history_trim()
+    except OSError as exc:
+        app.logger.warning("e2e history append failed: %s", exc)
+
+
+def _e2e_history_trim() -> None:
+    """Оставляем последние E2E_KEEP записей (атомарная замена файла)."""
+    try:
+        lines = _e2e_history_read_all()
+    except OSError:
+        return
+    if len(lines) <= E2E_KEEP:
+        return
+    tmp = E2E_HISTORY.with_suffix(".jsonl.tmp")
+    try:
+        with tmp.open("w", encoding="utf-8") as fh:
+            # splitlines() срезает \n — восстанавливаем, иначе записи склеятся
+            fh.write("\n".join(lines[-E2E_KEEP:]) + "\n")
+        tmp.replace(E2E_HISTORY)
+    except OSError as exc:
+        app.logger.warning("e2e history trim failed: %s", exc)
+
+
+def _e2e_history_read_all() -> list[str]:
+    """Все строки буфера (сырые); отсутствие файла — пустой список."""
+    try:
+        return E2E_HISTORY.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return []
+
+
+def _e2e_history_load(last: int) -> list[dict[str, Any]]:
+    """Последние `last` записей буфера, старые → новые; битые строки skipped."""
+    out: list[dict[str, Any]] = []
+    for line in _e2e_history_read_all():
+        try:
+            entry = json.loads(line)
+            if (isinstance(entry, dict) and isinstance(entry.get("t"), int)
+                    and isinstance(entry.get("ok"), bool)):
+                out.append({"t": entry["t"], "ok": entry["ok"],
+                            "ms": int(entry.get("ms") or 0)})
+        except (json.JSONDecodeError, ValueError, TypeError):
+            continue  # обрыв записи (панель упала посреди append) — пропускаем
+    return out[-last:]
 
 
 # --- Service control ------------------------------------------------------
@@ -983,9 +1076,10 @@ class _Failover:
 
     Только вперёд, на следующий пресет цепочки; назад (на основной) —
     вручную: авто-возврат — источник флаппинга. Гистерезис — THRESHOLD
-    неудач подряд (одна осечка — не повод переключать). Проверка честная:
-    недоступный echo-хост — это ok:true с note (прокси работает), фейловер
-    не триггерит; триггерят только отказы самой цепочки прокси→upstream.
+    неудач подряд: одна осечка (в т.ч. разовый сбой echo-хоста) — не повод
+    переключать. Неудача — всё, кроме полного ответа echo-хоста, включая
+    «туннель подтверждён, но данные не пошли» (лежащий upstream за живым
+    naive; найдено в бою на v0.12.2, фикс в v0.13).
     """
 
     def __init__(self, threshold: int = FAILOVER_THRESHOLD) -> None:
@@ -997,6 +1091,7 @@ class _Failover:
         self._last_ms: int | None = None
         self._last_switch: float | None = None
         self.switches = 0
+        self.hot = False          # последняя проверка провалена — пробуем часто
         self._exhausted_announced = False
         self.idle_reason: str | None = None
 
@@ -1010,6 +1105,8 @@ class _Failover:
             "active_index": idx,
             "threshold": self._threshold,
             "interval": FAILOVER_INTERVAL,
+            "fast_interval": FAILOVER_FAST,
+            "probing_fast": self.hot,
             "fails": self._fails,
             "last_check": self._last_check,
             "last_ok": self._last_ok,
@@ -1023,34 +1120,46 @@ class _Failover:
     def _idle(self, reason: str) -> None:
         self.idle_reason = reason
         self._fails = 0
+        self.hot = False
 
     def cycle(self) -> dict[str, Any] | None:
-        """Один тик монитора; возвращает событие для лога или None."""
+        """Один тик монитора; возвращает событие для лога или None.
+
+        Монитор всегда проверяет активный пресет и пишет результат в историю
+        (спарклайн в UI); фейловер-переключения — только когда цепочка
+        настроена и активный пресет в ней. idle_reason выставляется только
+        когда проверки НЕ идут (прокси остановлен / нет пресета).
+        """
         conf = _load_failover_conf()
-        if not (FAILOVER_ENABLED and conf["enabled"]):
-            self._idle("выключен")
+        if not FAILOVER_ENABLED:
+            self._idle("монитор выключен")
             return None
         if STOP_MARKER.exists():
             self._idle("прокси остановлен вручную")
             return None
         active = _active_name()
-        if active is None or active not in conf["chain"]:
-            self._idle("активный пресет вне цепочки")
+        listen = _active_listen() if active else None
+        if not listen:
+            self._idle("нет активного пресета с listen")
             return None
         self.idle_reason = None
-        listen = _active_listen()
-        if not listen:
-            self._idle("нет listen у активного пресета")
-            return None
 
         result = _proxy_e2e_check(listen)
         self._last_check = time.time()
         self._last_ok = bool(result.get("ok"))
         self._last_error = result.get("error") or result.get("note")
         self._last_ms = result.get("ms")
+        _e2e_history_append(self._last_ok, self._last_ms)
+
+        # дальше — только логика переключений; история пишется в любом случае
+        armed = conf["enabled"] and active in conf["chain"]
+        self.hot = armed and not result.get("ok")  # неудача → частые проверки
         if result.get("ok"):
             self._fails = 0
             self._exhausted_announced = False
+            return None
+        if not armed:
+            self._fails = 0  # копить порог без включённого фейловера незачем
             return None
         self._fails += 1
         if self._fails < self._threshold:
@@ -1110,7 +1219,8 @@ def _failover_loop() -> None:
                 # failing не логируем: до порога это нормальный шум сети
         except Exception:  # один сбойный тик не должен останавливать поток
             app.logger.warning("failover cycle failed", exc_info=True)
-        time.sleep(FAILOVER_INTERVAL)
+        # двухскоростной ритм: сбой → частые проверки до порога/восстановления
+        time.sleep(FAILOVER_FAST if _failover.hot else FAILOVER_INTERVAL)
 
 
 _CRED_RE = re.compile(r"([a-zA-Z][a-zA-Z0-9+.\-]*://[^:/@\s]+):([^@\s]+)@")
@@ -1651,6 +1761,38 @@ def api_e2e():
             abort(400, description="no active preset with listen: activate a preset first")
     resp = jsonify(_proxy_e2e_check(listen))
     resp.headers["Cache-Control"] = "no-store"  # результат живой, не кешируем
+    return resp
+
+
+@app.route("/api/e2e/history")
+def api_e2e_history():
+    """История периодических E2E-проверок монитора: спарклайн в UI.
+
+    `?last=N` — сколько последних записей отдать (1..E2E_KEEP, дефолт 120
+    ≈ 2 часа при минутном интервале). Битые строки буфера пропускаются.
+    """
+    try:
+        last = int(request.args.get("last", "120"))
+    except ValueError:
+        last = 120
+    last = max(1, min(last, E2E_KEEP))
+    entries = _e2e_history_load(last)
+    ok_n = sum(1 for e in entries if e["ok"])
+    n = len(entries)
+    avg_ms = round(sum(e["ms"] for e in entries) / n) if n else None
+    resp = jsonify({
+        "entries": entries,
+        "keep": E2E_KEEP,
+        "stats": {
+            "total": n,
+            "ok": ok_n,
+            "fail": n - ok_n,
+            "availability": round(100.0 * ok_n / n, 1) if n else None,
+            "avg_ms": avg_ms,
+            "window_s": (entries[-1]["t"] - entries[0]["t"]) if n > 1 else 0,
+        },
+    })
+    resp.headers["Cache-Control"] = "no-store"
     return resp
 
 
@@ -2545,14 +2687,25 @@ if __name__ == "__main__":
             "NAIVEPANEL_FAILOVER_THRESHOLD=%r is not a number — using %d",
             _FAILOVER_THRESHOLD_RAW, FAILOVER_THRESHOLD,
         )
+    if _FAILOVER_FAST_INVALID:
+        app.logger.warning(
+            "NAIVEPANEL_FAILOVER_FAST=%r is not a number — using %d",
+            _FAILOVER_FAST_RAW, FAILOVER_FAST,
+        )
+    if _E2E_KEEP_INVALID:
+        app.logger.warning(
+            "NAIVEPANEL_E2E_KEEP=%r is not a number — using %d",
+            _E2E_KEEP_RAW, E2E_KEEP,
+        )
     if FAILOVER_ENABLED:
-        # поток живёт всегда (пустая цепочка = idle): цепочку задают из UI
-        # без перезапуска панели
+        # монитор живёт всегда: проверяет активный пресет (история E2E для
+        # спарклайна) и переключает по цепочке, если она задана из UI
         threading.Thread(
-            target=_failover_loop, name="naive-failover", daemon=True
+            target=_failover_loop, name="naive-monitor", daemon=True
         ).start()
     else:
-        app.logger.info("failover disabled by NAIVEPANEL_FAILOVER=0")
+        app.logger.info(
+            "monitor (e2e history + failover) disabled by NAIVEPANEL_FAILOVER=0")
     host, port = _parse_bind(PANEL_BIND)
     # host берётся из env/panel.conf: предупреждаем только для unspecified
     # адресов (0.0.0.0 / ::) — фактического bind здесь нет.
