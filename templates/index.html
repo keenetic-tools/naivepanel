@@ -346,10 +346,15 @@
       <button class="ghost" data-action="foAll" id="btnFoAll"
               title="Добавить в цепочку все пресеты в порядке списка — подходящий старт, порядок потом поправьте ↑↓">Собрать из всех</button>
       <button class="ghost" data-action="foSave" id="btnFoSave"
-              title="Сохранить цепочку и включить автофейловер. Первый пресет — основной, при сбоях переключение вперёд; назад — вручную">Включить</button>
+              title="Сохранить цепочку и включить автофейловер. Первый пресет — основной, при сбоях переключение вперёд">Включить</button>
       <button class="ghost" data-action="foOff" id="btnFoOff" hidden
               title="Выключить автофейловер (цепочка удалится)">Выключить</button>
     </div>
+    <label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--mut);margin-top:10px;cursor:pointer">
+      <input type="checkbox" id="foAuto" aria-label="Авто-возврат на основной">
+      возвращать на основной, когда ожил
+      <span class="hint" style="font-size:10px;color:var(--mut)">(TCP N подряд → проба E2E)</span>
+    </label>
     <h2 class="sect">Бинарник naive</h2>
     <div id="nvInfo" style="font-size:12px;color:var(--mut);margin-top:10px">бинарник: проверка…</div>
     <div class="actions" style="margin-top:8px">
@@ -361,6 +366,8 @@
     <div class="actions" style="margin-top:10px">
       <button class="ghost wide" data-action="panelRestart" title="Перезапуск веб-панели (после обновления файлов)">Перезапуск</button>
     </div>
+    <div id="ntInfo" style="font-size:12px;color:var(--mut);margin-top:10px"
+         title="Настройка — panel.conf: NAIVEPANEL_TG_TOKEN + NAIVEPANEL_TG_CHAT (Telegram) или NAIVEPANEL_NOTIFY_URL (webhook). Секреты хранятся только там">уведомления: …</div>
     <div id="updInfo" style="font-size:12px;color:var(--mut);margin-top:12px">обновления: проверка…</div>
     <div class="actions" style="margin-top:8px">
       <button class="ghost" data-action="updateCheck" title="Сверить версию панели с последним релизом GitHub">Проверить обновления</button>
@@ -529,6 +536,11 @@ function renderStatus(st) {
     const line = foInfoLine(st.failover);
     $('foInfo').textContent = line.text;
     $('foInfo').title = line.title;
+  }
+  if (st.notify) {
+    $('ntInfo').textContent = 'уведомления: '+
+      (st.notify.channel ? (st.notify.channel === 'telegram' ? 'Telegram' : 'webhook')
+       : 'выкл (panel.conf)');
   }
   const ver = st.version ? ' · v'+escapeHtml(st.version) : '';
   const dotOn = '<span class="dot on" aria-hidden="true"></span>', dotOff = '<span class="dot off" aria-hidden="true"></span>';
@@ -750,6 +762,8 @@ function fmtSpan(s) {
 // на следующий; назад, на основной — только вручную (активация как обычно).
 let foChainArr = [];    // редактируемая цепочка (сохраняется кнопкой)
 let foSavedChain = [];  // последняя сохранённая на сервере
+let foAutoReturn = false;   // чекбокс «возвращать на основной» (локально до Сохранить)
+let foAutoSaved = false;
 let foLast = null;      // последний ответ /api/failover (для перерисовки)
 let activeName = null;  // активный пресет (из /api/status)
 
@@ -760,9 +774,10 @@ async function loadFailover() {
     const d = await jget('/api/failover');
     foLast = d;
     // цепочка с сервера — истина; локальные правки держим, пока не сохранят
-    const hadEdits = !foEq(foChainArr, foSavedChain);
+    const hadEdits = !foEq(foChainArr, foSavedChain) || foAutoReturn !== foAutoSaved;
     foSavedChain = d.chain;
-    if (!hadEdits) foChainArr = d.chain.slice();
+    foAutoSaved = !!d.auto_return;
+    if (!hadEdits) { foChainArr = d.chain.slice(); foAutoReturn = foAutoSaved; }
     renderFailover(d);
   } catch (e) { /* тихо: секция некритична, ошибка всплывёт в статусе */ }
 }
@@ -775,7 +790,7 @@ function foInfoLine(d) {
   const inChain = new Set(foChainArr);
   let t = d.enabled || foChainArr.length
     ? 'цепочка: '+(foChainArr.length ? foChainArr.join(' → ') : '—') : 'выкл';
-  const dirty = !foEq(foChainArr, foSavedChain);
+  const dirty = !foEq(foChainArr, foSavedChain) || foAutoReturn !== foAutoSaved;
   if (!d.enabled && !dirty) t = 'выкл';
   if (d.enabled && d.idle) t += ' · пауза: '+d.idle;
   else {
@@ -788,6 +803,11 @@ function foInfoLine(d) {
   }
   if (d.enabled && d.probing_fast && d.last_ok === false) t += ' · частые проверки';
   if (d.enabled && d.switches) t += ' · переключений: '+d.switches;
+  if (d.enabled && !dirty && d.auto_return) {
+    if (d.return_watch)
+      t += ' · ждём возврата: '+d.return_watch.name+' '+d.return_watch.streak+'/'+d.return_watch.need;
+    if (d.returns) t += ' · возвратов: '+d.returns;
+  }
   if (dirty) t += ' · НЕ СОХРАНЕНО';
   if (d.enabled && activeName && foChainArr.length && !inChain.has(activeName))
     t += ' · активный вне цепочки — монитор не следит';
@@ -820,6 +840,8 @@ function renderFailover(d) {
   save.textContent = d.enabled ? 'Сохранить' : 'Включить';
   save.disabled = !foChainArr.length;
   $('btnFoOff').hidden = !d.enabled;
+  $('foAuto').checked = foAutoReturn;
+  $('foAuto').disabled = !foChainArr.length;
   const line = foInfoLine(d);
   $('foInfo').textContent = line.text;
   $('foInfo').title = line.title;
@@ -852,12 +874,15 @@ async function saveFailover() {
   const btn = $('btnFoSave');
   btn.disabled = true;
   try {
-    const d = await jput('/api/failover', {enabled: true, chain: foChainArr});
+    const d = await jput('/api/failover',
+                         {enabled: true, chain: foChainArr, auto_return: foAutoReturn});
     foLast = d;
     foSavedChain = d.chain;
+    foAutoSaved = !!d.auto_return;
     foChainArr = d.chain.slice();
+    foAutoReturn = foAutoSaved;
     renderFailover(d);
-    flash('Фейловер: цепочка '+foChainArr.join(' → '), true);
+    flash('Фейловер: цепочка '+foChainArr.join(' → ')+(d.auto_return ? ' + авто-возврат' : ''), true);
   } catch (e) { flash(e.message, false); }
   finally { foRerender(); btn.disabled = !foChainArr.length; }
 }
@@ -869,6 +894,8 @@ async function offFailover() {
     foLast = d;
     foChainArr = [];
     foSavedChain = [];
+    foAutoReturn = false;
+    foAutoSaved = false;
     renderFailover(d);
     flash('Фейловер выключен', true);
   } catch (e) { flash(e.message, false); }
@@ -1385,6 +1412,7 @@ document.addEventListener('click', (e) => {
 });
 
 $('editor').addEventListener('submit', save);
+$('foAuto').addEventListener('change', () => { foAutoReturn = $('foAuto').checked; foRerender(); });
 
 renderLogSrc();
 refreshAll();

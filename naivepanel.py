@@ -18,6 +18,7 @@ import json
 import os
 import platform
 import re
+import queue
 import secrets
 import shutil
 import socket
@@ -56,7 +57,9 @@ CONF_KEYS = frozenset({
     "NAIVEPANEL_E2E_URL",
     "NAIVEPANEL_FAILOVER", "NAIVEPANEL_FAILOVER_INTERVAL",
     "NAIVEPANEL_FAILOVER_THRESHOLD", "NAIVEPANEL_FAILOVER_FAST",
+    "NAIVEPANEL_FAILOVER_RETURN_ALIVE", "NAIVEPANEL_FAILOVER_RETURN_COOLDOWN",
     "NAIVEPANEL_E2E_HISTORY", "NAIVEPANEL_E2E_KEEP",
+    "NAIVEPANEL_TG_TOKEN", "NAIVEPANEL_TG_CHAT", "NAIVEPANEL_NOTIFY_URL",
 })
 
 _CONF_SKIPPED: list[str] = []
@@ -225,6 +228,26 @@ _FAILOVER_THRESHOLD_RAW = os.environ.get("NAIVEPANEL_FAILOVER_THRESHOLD", "3") o
 FAILOVER_THRESHOLD, _FAILOVER_THRESHOLD_INVALID = _int_or_default(_FAILOVER_THRESHOLD_RAW, 3)
 FAILOVER_THRESHOLD = min(10, max(1, FAILOVER_THRESHOLD))
 FAILOVER_CHAIN_MAX = 8
+# Авто-возврат на основной: N TCP-живых подряд у кандидата (раньше текущего
+# в цепочке) → проба живым naive → E2E → активация. Неудачная проба кладёт
+# кандидата в cooldown, чтобы не долбить больной upstream каждые полминуты.
+_FAILOVER_RETURN_ALIVE_RAW = os.environ.get("NAIVEPANEL_FAILOVER_RETURN_ALIVE", "3") or "3"
+FAILOVER_RETURN_ALIVE, _FAILOVER_RETURN_ALIVE_INVALID = _int_or_default(_FAILOVER_RETURN_ALIVE_RAW, 3)
+FAILOVER_RETURN_ALIVE = max(1, FAILOVER_RETURN_ALIVE)
+_FAILOVER_RETURN_COOLDOWN_RAW = os.environ.get("NAIVEPANEL_FAILOVER_RETURN_COOLDOWN", "900") or "900"
+FAILOVER_RETURN_COOLDOWN, _FAILOVER_RETURN_COOLDOWN_INVALID = _int_or_default(_FAILOVER_RETURN_COOLDOWN_RAW, 900)
+FAILOVER_RETURN_COOLDOWN = max(60, FAILOVER_RETURN_COOLDOWN)
+
+# --- Уведомления (Telegram / webhook) ----------------------------------------
+# События монитора (переключение/возврат/рестарт watchdog'ом/исчерпание)
+# уходят ещё и в мессенджер: панель справилась сама — и доложила. Секреты
+# живут ТОЛЬКО в panel.conf/env, в API и UI — лишь статус канала.
+# Отправка напрямую с роутера (свой WAN): лежащий прокси не мешает.
+TG_TOKEN = os.environ.get("NAIVEPANEL_TG_TOKEN", "")
+TG_CHAT = os.environ.get("NAIVEPANEL_TG_CHAT", "")
+NOTIFY_URL = os.environ.get("NAIVEPANEL_NOTIFY_URL", "")
+NOTIFY_CHANNEL = ("telegram" if TG_TOKEN and TG_CHAT
+                  else "webhook" if NOTIFY_URL else None)
 
 # --- Self-update: репозиторий и пути ---------------------------------------
 # Обновление из UI повторяет ручной флоу `install.sh --yes`: панель лишь
@@ -591,6 +614,73 @@ def _listen_endpoint(listen: str) -> tuple[str, str, int] | None:
     return scheme, host, port
 
 
+def _tcp_probe(host: str, port: int, timeout: float = 3.0) -> int | None:
+    """Голый TCP-коннект до host:port; None = недоступен. Время в мс.
+
+    Дешёвая разведка для ручного «пинга» и авто-возврата: без TLS и кредов.
+    """
+    t0 = time.monotonic()
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            pass
+        return round((time.monotonic() - t0) * 1000)
+    except OSError:
+        return None
+
+
+def _free_port() -> int:
+    """Свободный localhost-порт (bind(0)); гонка с системой пренебрежима."""
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _probe_preset(cfg: dict[str, Any], timeout: float = 15.0) -> dict[str, Any]:
+    """Полный E2E пресета-кандидата БЕЗ его активации.
+
+    Поднимаем второй naive прямо из CLI — `--listen socks://127.0.0.1:<порт>
+    --proxy <URI>`, без временных файлов — и гоняем обычную E2E-проверку
+    через этот порт. Так авто-возврат и каскад переключают на проверенно
+    живой пресет, а не на «первый существующий». Креды живут в argv пробного
+    процесса ~15 секунд (однопользовательский роутер — приемлемо); команду
+    в лог не пишем. Схема listen пробы — всегда socks (проверяем upstream).
+    """
+    if not NAIVE_BIN.exists():
+        return {"ok": False, "error": f"бинарник не найден: {NAIVE_BIN}"}
+    proxy_uri = cfg.get("proxy")
+    if not isinstance(proxy_uri, str) or not proxy_uri.strip():
+        return {"ok": False, "error": "у пресета нет proxy"}
+    port = _free_port()
+    # argv-список, shell не используется; команду не логируем (креды)
+    proc = subprocess.Popen(  # nosec B603
+        [str(NAIVE_BIN), f"--listen=socks://127.0.0.1:{port}",
+         f"--proxy={proxy_uri}"],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            if _tcp_probe("127.0.0.1", port, timeout=0.5) is not None:
+                result = _proxy_e2e_check(f"socks://127.0.0.1:{port}",
+                                          timeout=timeout)
+                result["probe"] = True
+                return result
+            if proc.poll() is not None:
+                return {"ok": False, "probe": True,
+                        "error": "пробный naive упал при старте (проверьте proxy-URI)"}
+            time.sleep(0.2)
+        return {"ok": False, "probe": True,
+                "error": "пробный naive не начал слушать за 3с"}
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+
+
 def _recv_until(sock: socket.socket, marker: bytes, limit: int = 8192) -> bytes:
     """Читает из сокета до marker (включительно) или лимита буфера."""
     buf = b""
@@ -949,7 +1039,63 @@ def _status() -> dict[str, Any]:
         "init_present": has_init,
         "watchdog": _watchdog.snapshot(),
         "failover": _failover.snapshot(),
+        "notify": {"enabled": NOTIFY_CHANNEL is not None,
+                   "channel": NOTIFY_CHANNEL},
     }
+
+
+# --- Уведомления: очередь + sender-поток --------------------------------------
+
+_notify_queue: "queue.Queue[tuple[str, str]]" = queue.Queue()
+_notify_last: dict[str, float] = {}  # event → epoch последней постановки (дедуп)
+
+
+def _notify(event: str, text: str, dedupe_s: float = 60.0) -> None:
+    """Поставить событие в очередь уведомлений; вызывается из потоков монитора.
+
+    Дедуп: одинаковое событие не чаще раза в dedupe_s — каскад из трёх
+    переключений не должен заспамить чат. Для «доступно обновление» окно
+    больше (6ч), чтобы не напоминать при каждом открытии страницы.
+    """
+    if NOTIFY_CHANNEL is None:
+        return
+    now = time.time()
+    if now - _notify_last.get(event, 0.0) < dedupe_s:
+        return
+    _notify_last[event] = now
+    _notify_queue.put((event, text))
+
+
+def _notify_send(event: str, text: str) -> None:
+    """Одна отправка: Telegram sendMessage или POST JSON в webhook.
+
+    HTTP — через curl, как все внешние запросы панели (_http_get): curl
+    обязателен при установке, а единый путь наружу проще audit'ить.
+    """
+    if NOTIFY_CHANNEL == "telegram":
+        url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+        body: dict[str, Any] = {"chat_id": TG_CHAT, "text": text,
+                                "disable_web_page_preview": True}
+    else:
+        url, body = NOTIFY_URL, {"event": event, "text": text,
+                                 "ts": int(time.time())}
+    try:
+        # argv-список; команду не логируем (токен Telegram в URL)
+        res = _run(["curl", "-fsS", "--max-time", "10",
+                    "-H", "Content-Type: application/json",
+                    "-d", json.dumps(body), url], timeout=15)
+    except HTTPException as exc:  # curl нет / таймаут — монитор не должен страдать
+        app.logger.warning("notify %s failed: %s", event, exc.description)
+        return
+    if res["rc"] != 0:
+        app.logger.warning("notify %s failed: rc=%s %s", event, res["rc"],
+                           (res["stderr"] or "")[:200])
+
+
+def _notify_loop() -> None:
+    while True:
+        event, text = _notify_queue.get()
+        _notify_send(event, text)
 
 
 # --- Watchdog: авто-рестарт упавшего naive ----------------------------------
@@ -1032,15 +1178,25 @@ def _watchdog_loop() -> None:
                         app.logger.warning(
                             "watchdog: naive упал — перезапущен (рестартов: %d)",
                             _watchdog.count)
+                        _notify("watchdog_restart",
+                                f"NaivePanel: naive упал — watchdog перезапустил "
+                                f"(рестартов: {_watchdog.count})")
                     else:
                         app.logger.error(
                             "watchdog: naive упал, перезапуск НЕ удался: rc=%s %s",
                             ev.get("rc"), ev.get("stderr") or "")
+                        _notify("watchdog_restart_failed",
+                                "NaivePanel: naive упал, перезапуск НЕ удался — "
+                                "загляните в панель")
                 elif ev["event"] == "tripped":
                     app.logger.error(
                         "watchdog: naive падает %d раз за %dс — авто-рестарт "
                         "отключён до перезапуска панели; проверьте лог прокси",
                         WATCHDOG_FLAP_MAX, int(WATCHDOG_FLAP_WINDOW))
+                    _notify("watchdog_tripped",
+                            f"NaivePanel: naive падает {WATCHDOG_FLAP_MAX} раз за "
+                            f"{int(WATCHDOG_FLAP_WINDOW)}с — авто-рестарт отключён, "
+                            f"нужно вмешательство")
                 elif ev["event"] == "down-tripped":
                     app.logger.error("watchdog: naive снова вниз — стоим (отключён)")
                 elif ev["event"] == "stopped":
@@ -1054,21 +1210,34 @@ def _watchdog_loop() -> None:
 
 
 def _load_failover_conf() -> dict[str, Any]:
-    """failover.json → {"enabled": bool, "chain": [имена]}; без файла — выкл.
+    """failover.json → конфиг монитора; без файла — всё выключено.
 
     Битый файл трактуем как «выключен»: монитор не должен падать из-за
-    руки, поправившей JSON мимо панели.
+    руки, поправившей JSON мимо панели. auto_return — opt-in (v0.14).
     """
+    empty = {"enabled": False, "chain": [], "auto_return": False}
     try:
         data = json.loads(FAILOVER_CONF.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return {"enabled": False, "chain": []}
+        return empty
     if not isinstance(data, dict):
-        return {"enabled": False, "chain": []}
+        return empty
     chain = data.get("chain")
     if not isinstance(chain, list) or not all(isinstance(n, str) for n in chain):
         chain = []
-    return {"enabled": bool(data.get("enabled")) and bool(chain), "chain": chain}
+    auto_return = data.get("auto_return")
+    return {"enabled": bool(data.get("enabled")) and bool(chain),
+            "chain": chain,
+            "auto_return": auto_return is True}
+
+
+def _preset_cfg(name: str) -> dict[str, Any] | None:
+    """Конфиг пресета из conf.d для пробы (без HTTP-исключений)."""
+    try:
+        data = json.loads((CONF_D / f"{name}.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
 
 
 class _Failover:
@@ -1091,9 +1260,13 @@ class _Failover:
         self._last_ms: int | None = None
         self._last_switch: float | None = None
         self.switches = 0
+        self.returns = 0          # авто-возвратов на основной
         self.hot = False          # последняя проверка провалена — пробуем часто
         self._exhausted_announced = False
         self.idle_reason: str | None = None
+        self._streaks: dict[str, int] = {}    # TCP-живых подряд (авто-возврат)
+        self._cooldown: dict[str, float] = {} # кандидат → epoch конца cooldown
+        self._return_watch: dict[str, Any] | None = None  # для UI «ждём возврата»
 
     def snapshot(self) -> dict[str, Any]:
         conf = _load_failover_conf()
@@ -1122,6 +1295,9 @@ class _Failover:
             "last_error": self._last_error,
             "last_ms": self._last_ms,
             "switches": self.switches,
+            "returns": self.returns,
+            "auto_return": conf["auto_return"],
+            "return_watch": self._return_watch,
             "last_switch": self._last_switch,
             "idle": idle,
         }
@@ -1166,6 +1342,9 @@ class _Failover:
         if result.get("ok"):
             self._fails = 0
             self._exhausted_announced = False
+            idx = conf["chain"].index(active) if armed else None
+            if armed and conf["auto_return"] and idx and idx > 0:
+                return self._try_return(conf, active, idx)
             return None
         if not armed:
             self._fails = 0  # копить порог без включённого фейловера незачем
@@ -1175,25 +1354,96 @@ class _Failover:
             return {"event": "failing", "fails": self._fails}
 
         self._fails = 0
+        return self._switch_forward(conf, active)
+
+    def _candidates_after(self, chain: list[str], idx: int) -> list[str]:
+        """Пресеты позже idx в цепочке, существующие в conf.d, по порядку."""
+        return [c for c in chain[idx + 1:] if (CONF_D / f"{c}.json").exists()]
+
+    def _switch_forward(self, conf: dict[str, Any], active: str) -> dict[str, Any] | None:
+        """Каскад вперёд: единственный кандидат — сразу (скорость важнее,
+        E2E проверит следующим тиком); нескольких — пробуем каждого живым
+        naive и активируем первого прошедшего («первый живой», не «первый
+        существующий»): без рестартов сервиса на мёртвых запасных."""
         chain = conf["chain"]
         idx = chain.index(active)
-        for candidate in chain[idx + 1:]:
-            if not (CONF_D / f"{candidate}.json").exists():
-                continue  # пресет удалили — цепочка просто короче
-            try:
-                res = _activate_preset(candidate)
-            except HTTPException:
-                # битый пресет (руками отредактирован) — валидация в
-                # _activate_preset его отвергла; пробуем следующий
+        rest = self._candidates_after(chain, idx)
+        if len(rest) == 1:
+            return self._activate_and_count(active, rest[0])
+        for candidate in rest:
+            cfg = _preset_cfg(candidate)
+            if cfg is None:
                 continue
-            self.switches += 1
-            self._last_switch = time.time()
-            return {"event": "switched", "from": active, "to": candidate,
-                    "restart": res.get("restart")}
+            probe = _probe_preset(cfg, timeout=10.0)
+            if not probe.get("ok"):
+                app.logger.info(
+                    "фейловер: кандидат %s не прошёл пробу: %s",
+                    candidate, probe.get("error"))
+                continue
+            return self._activate_and_count(active, candidate)
         if self._exhausted_announced:
             return None  # уже кричали; следующая волна — только после ok
         self._exhausted_announced = True
         return {"event": "exhausted", "active": active}
+
+    def _activate_and_count(self, frm: str, to: str) -> dict[str, Any]:
+        try:
+            res = _activate_preset(to)
+        except HTTPException:
+            # битый пресет — валидация отвергла; каскад пойдёт дальше,
+            # но для простоты single-кандидат пути считаем исчерпанием
+            return {"event": "activate-failed", "to": to}
+        self.switches += 1
+        self._last_switch = time.time()
+        self._streaks.clear()  # активный сменился — копить про прошлого незачем
+        return {"event": "switched", "from": frm, "to": to,
+                "restart": res.get("restart")}
+
+    def _try_return(self, conf: dict[str, Any], active: str,
+                    idx: int) -> dict[str, Any] | None:
+        """Авто-возврат: пресеты РАНЬШЕ текущего. TCP-стрик у каждого;
+        первый набравший RETURN_ALIVE и не в cooldown — проба живым naive,
+        прошёл — активация. Дальше регулярная проверка нового активного
+        подтвердит; не пройдёт — фейловер уведёт вперёд как обычно."""
+        now = time.time()
+        best: tuple[str, int] | None = None
+        for candidate in conf["chain"][:idx]:
+            cfg = _preset_cfg(candidate)
+            ep = _upstream_endpoint(cfg.get("proxy") or "") if cfg else None
+            alive = bool(ep and _tcp_probe(ep[0], ep[1], timeout=3.0) is not None)
+            self._streaks[candidate] = self._streaks.get(candidate, 0) + 1 if alive else 0
+            streak = self._streaks[candidate]
+            if streak and (best is None or streak > best[1]):
+                best = (candidate, streak)
+        self._return_watch = ({"name": best[0], "streak": best[1],
+                               "need": FAILOVER_RETURN_ALIVE}
+                              if best else None)
+        for candidate in conf["chain"][:idx]:
+            if self._streaks.get(candidate, 0) < FAILOVER_RETURN_ALIVE:
+                continue
+            if now < self._cooldown.get(candidate, 0.0):
+                continue  # уже обжигались — ждём конца cooldown
+            cfg = _preset_cfg(candidate)
+            if cfg is None:
+                continue
+            probe = _probe_preset(cfg, timeout=15.0)
+            if probe.get("ok"):
+                try:
+                    res = _activate_preset(candidate)
+                except HTTPException:
+                    self._cooldown[candidate] = now + FAILOVER_RETURN_COOLDOWN
+                    continue
+                self.returns += 1
+                self._streaks.clear()
+                self._return_watch = None
+                return {"event": "returned", "from": active, "to": candidate,
+                        "restart": res.get("restart")}
+            # TCP жив, а прокси нет (креды/TLS/защита) — кандидату cooldown
+            self._cooldown[candidate] = now + FAILOVER_RETURN_COOLDOWN
+            self._streaks[candidate] = 0
+            return {"event": "return_probe_failed", "candidate": candidate,
+                    "error": probe.get("error")}
+        return None
 
 
 _failover = _Failover()
@@ -1220,11 +1470,36 @@ def _failover_loop() -> None:
                             "фейловер: %s не прошёл %d E2E-проверок подряд — "
                             "переключение на %s",
                             ev["from"], FAILOVER_THRESHOLD, ev["to"])
+                    _notify("failover_switch",
+                            f"NaivePanel: {ev['from']} не работает — "
+                            f"переключение на {ev['to']}")
+                elif ev["event"] == "returned":
+                    app.logger.warning(
+                        "авто-возврат: %s жив (TCP %d подряд + проба E2E) — "
+                        "возврат с %s", ev["to"], FAILOVER_RETURN_ALIVE, ev["from"])
+                    _notify("failover_return",
+                            f"NaivePanel: {ev['to']} снова жив — авто-возврат "
+                            f"с {ev['from']}")
+                elif ev["event"] == "return_probe_failed":
+                    app.logger.warning(
+                        "авто-возврат: %s TCP-жив, но проба E2E не прошла (%s) — "
+                        "cooldown %dс", ev["candidate"], ev.get("error"),
+                        FAILOVER_RETURN_COOLDOWN)
+                    _notify("failover_return_probe_failed",
+                            f"NaivePanel: авто-возврат на {ev['candidate']} "
+                            f"отложен — проба не прошла")
+                elif ev["event"] == "activate-failed":
+                    app.logger.error(
+                        "фейловер: активация %s не удалась (валидация)",
+                        ev["to"])
                 elif ev["event"] == "exhausted":
                     app.logger.error(
                         "фейловер: цепочка исчерпана — %s не работает и "
                         "запасных больше нет; проверка продолжается, возврат "
                         "на основной — вручную", ev["active"])
+                    _notify("failover_exhausted",
+                            f"NaivePanel: цепочка исчерпана — {ev['active']} "
+                            f"не работает, запасных нет")
                 # failing не логируем: до порога это нормальный шум сети
         except Exception:  # один сбойный тик не должен останавливать поток
             app.logger.warning("failover cycle failed", exc_info=True)
@@ -1838,8 +2113,15 @@ def api_failover_put():
                 abort(404, description=f"preset {name!r} not found")
     else:
         chain_raw = []
+    auto_return = data.get("auto_return", False)
+    if not isinstance(auto_return, bool):
+        abort(400, description="auto_return must be boolean")
+    # авто-возврат осмыслен только с включённым фейловером
+    if auto_return and not enabled:
+        abort(400, description="auto_return requires enabled chain")
     _ensure_dirs()
-    _save_json(FAILOVER_CONF, {"enabled": enabled, "chain": chain_raw})
+    _save_json(FAILOVER_CONF, {"enabled": enabled, "chain": chain_raw,
+                               "auto_return": auto_return})
     return jsonify(_failover.snapshot())
 
 
@@ -2715,6 +2997,11 @@ if __name__ == "__main__":
     else:
         app.logger.info(
             "monitor (e2e history + failover) disabled by NAIVEPANEL_FAILOVER=0")
+    if NOTIFY_CHANNEL is not None:
+        app.logger.info("notifications enabled: %s", NOTIFY_CHANNEL)
+        threading.Thread(
+            target=_notify_loop, name="naive-notify", daemon=True
+        ).start()
     host, port = _parse_bind(PANEL_BIND)
     # host берётся из env/panel.conf: предупреждаем только для unspecified
     # адресов (0.0.0.0 / ::) — фактического bind здесь нет.

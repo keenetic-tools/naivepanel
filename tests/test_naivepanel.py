@@ -2344,3 +2344,235 @@ def test_failover_snapshot_rechecks_stale_idle(client, app):
     assert fo.snapshot()["idle"] == "прокси остановлен вручную"  # маркер реален
     app.STOP_MARKER.unlink()
     assert fo.snapshot()["idle"] is None           # маркер сняли — пауза устарела
+
+
+# --- v0.14: авто-возврат, каскад с пробой, уведомления -------------------------
+
+def _fo_setup2(client, app, presets=("home", "backup"), chain=None,
+               activate="home", auto_return=False):
+    """Как _fo_setup, но с auto_return и активацией любого пресета."""
+    for name in presets:
+        _create(client, name=name)
+    if activate:
+        assert client.post(f"/api/configs/{activate}/activate",
+                           headers=CSRF).status_code == 200
+    app._save_json(app.FAILOVER_CONF,
+                   {"enabled": True,
+                    "chain": list(chain if chain is not None else presets),
+                    "auto_return": auto_return})
+    return app._Failover(threshold=2)
+
+
+def test_failover_conf_v2_auto_return(client, app):
+    _create(client, name="home")
+    _create(client, name="backup")
+    r = client.put("/api/failover", headers=CSRF,
+                   json={"enabled": True, "chain": ["home", "backup"],
+                         "auto_return": True})
+    assert r.status_code == 200
+    d = r.get_json()
+    assert d["auto_return"] is True and d["chain"] == ["home", "backup"]
+    # валидация: не-bool и авто-возврат без цепочки
+    assert client.put("/api/failover", headers=CSRF,
+                      json={"enabled": True, "chain": ["home"],
+                            "auto_return": "yes"}).status_code == 400
+    assert client.put("/api/failover", headers=CSRF,
+                      json={"enabled": False, "chain": [],
+                            "auto_return": True}).status_code == 400
+
+
+def test_auto_return_after_streak_and_probe(client, app, monkeypatch):
+    # активен backup; upstream основного ожил: 3 ok-цикла копят стрик,
+    # на третьем — проба живым naive и активация основного
+    fo = _fo_setup2(client, app, presets=("home", "backup"),
+                    activate="backup", auto_return=True)
+    monkeypatch.setattr(app, "FAILOVER_RETURN_ALIVE", 3)
+    _fo_e2e(monkeypatch, app, ok=True)
+    monkeypatch.setattr(app, "_tcp_probe", lambda h, p, timeout=3.0: 5)
+    monkeypatch.setattr(app, "_probe_preset",
+                        lambda cfg, timeout=15.0: {"ok": True, "probe": True})
+    assert fo.cycle() is None                    # стрик 1
+    assert fo.cycle() is None                    # стрик 2
+    ev = fo.cycle()
+    assert ev["event"] == "returned" and ev["to"] == "home"
+    assert app._active_name() == "home"
+    assert fo.returns == 1
+    snap = fo.snapshot()
+    assert snap["auto_return"] is True and snap["returns"] == 1
+
+
+def test_auto_return_probe_fail_sets_cooldown(client, app, monkeypatch):
+    fo = _fo_setup2(client, app, presets=("home", "backup"),
+                    activate="backup", auto_return=True)
+    monkeypatch.setattr(app, "FAILOVER_RETURN_ALIVE", 1)
+    monkeypatch.setattr(app, "_tcp_probe", lambda h, p, timeout=3.0: 5)
+    probes = [{"ok": False, "error": "TLS через туннель не поднялся"},
+              {"ok": True, "probe": True}]
+    monkeypatch.setattr(app, "_probe_preset",
+                        lambda cfg, timeout=15.0: probes.pop(0))
+    _fo_e2e(monkeypatch, app, ok=True)
+    ev = fo.cycle()
+    assert ev["event"] == "return_probe_failed" and "TLS" in ev["error"]
+    assert app._active_name() == "backup"       # не переключились
+    assert fo.cycle() is None                   # cooldown: стрик готов, но ждём
+    # cooldown истёк — вторая проба успешна
+    fo._cooldown["home"] = 0.0
+    ev = fo.cycle()
+    assert ev["event"] == "returned" and ev["to"] == "home"
+
+
+def test_auto_return_no_streak_no_probe(client, app, monkeypatch):
+    # основной мёртв по TCP: стрик не копится, пробу не поднимаем
+    fo = _fo_setup2(client, app, presets=("home", "backup"),
+                    activate="backup", auto_return=True)
+    monkeypatch.setattr(app, "FAILOVER_RETURN_ALIVE", 2)
+    _fo_e2e(monkeypatch, app, ok=True)
+    monkeypatch.setattr(app, "_tcp_probe", lambda h, p, timeout=3.0: None)
+    called = []
+    monkeypatch.setattr(app, "_probe_preset",
+                        lambda cfg, timeout=15.0: called.append(1) or {"ok": True})
+    for _ in range(4):
+        assert fo.cycle() is None
+    assert called == [] and app._active_name() == "backup"
+
+
+def test_cascade_probes_first_alive(client, app, monkeypatch):
+    # 3 пресета: home умер, dead — существующий, но не живой; переключаемся
+    # на backup, минуя dead (проба живым naive перед активацией)
+    for name in ("home", "dead", "backup"):
+        _create(client, name=name, upstream=f"https://{name}.example.com")
+    assert client.post("/api/configs/home/activate", headers=CSRF).status_code == 200
+    app._save_json(app.FAILOVER_CONF,
+                   {"enabled": True, "chain": ["home", "dead", "backup"],
+                    "auto_return": False})
+    fo = app._Failover(threshold=2)
+    _fo_e2e(monkeypatch, app, ok=False, error="x")
+    probed = []
+
+    def fake_probe(cfg, timeout=10.0):
+        name = "backup" if "backup" in cfg["proxy"] else "dead"
+        probed.append(name)
+        return {"ok": name == "backup", "probe": True}
+    monkeypatch.setattr(app, "_probe_preset", fake_probe)
+    fo.cycle()
+    ev = fo.cycle()
+    assert ev["event"] == "switched" and ev["to"] == "backup"
+    assert probed == ["dead", "backup"]         # dead проверили и отвергли
+
+
+def test_cascade_single_candidate_skips_probe(client, app, monkeypatch):
+    # единственный запасной: скорость важнее — активируем без пробы,
+    # E2E следующим тиком проверит (поведение v0.13 сохранено)
+    fo = _fo_setup2(client, app, presets=("home", "backup"))
+    _fo_e2e(monkeypatch, app, ok=False, error="x")
+    called = []
+    monkeypatch.setattr(app, "_probe_preset",
+                        lambda cfg, timeout=10.0: called.append(1) or {"ok": True})
+    fo.cycle()
+    ev = fo.cycle()
+    assert ev["event"] == "switched" and ev["to"] == "backup"
+    assert called == []
+
+
+class _FakeProc:
+    def __init__(self, alive=True):
+        self._alive = alive
+
+    def poll(self):
+        return None if self._alive else 1
+
+    def terminate(self):
+        self._alive = False
+
+    def wait(self, timeout=None):
+        return 0
+
+    def kill(self):
+        self._alive = False
+
+
+def test_probe_preset_via_stub(app, monkeypatch):
+    # проба поднимает naive на свободном порту — подменяем spawn, порт
+    # указываем на живой socks-стаб: должен пройти полный E2E через него
+    stub = _StubServer(_socks5_proxy_ok)
+    monkeypatch.setattr(app, "NAIVE_BIN", Path("/bin/sh"))  # exists() ✓
+    monkeypatch.setattr(app, "_free_port", lambda: stub.port)
+    monkeypatch.setattr(app.subprocess, "Popen",
+                        lambda *a, **kw: _FakeProc(alive=True))
+    monkeypatch.setattr(app, "E2E_URL", "http://e2e.example/")
+    try:
+        d = app._probe_preset({"listen": "socks://127.0.0.1:1",
+                               "proxy": "https://u:p@h.example"})
+        assert d["ok"] is True, d
+        assert d.get("probe") is True
+        assert d["exit_ip"] == "198.51.100.99"
+    finally:
+        stub.close()
+
+
+def test_probe_preset_binary_missing(app, monkeypatch):
+    monkeypatch.setattr(app, "NAIVE_BIN", Path("/nonexistent/naive"))
+    d = app._probe_preset({"proxy": "https://u:p@h"})
+    assert d["ok"] is False and "не найден" in d["error"]
+
+
+def test_notify_dedupe_and_disabled(app, monkeypatch):
+    # без канала — тихо
+    app._notify("e", "x")
+    assert app._notify_queue.qsize() == 0
+    monkeypatch.setattr(app, "NOTIFY_CHANNEL", "webhook")
+    app._notify("e1", "one")
+    app._notify("e1", "spam")                    # дедуп в пределах окна
+    assert list(app._notify_queue.queue) == [("e1", "one")]
+    app._notify_last["e1"] = 0.0
+    app._notify("e1", "two")
+    assert app._notify_queue.qsize() == 2
+
+
+def test_notify_send_webhook(app, monkeypatch):
+    captured = {}
+
+    def fake_run(cmd, timeout=10):
+        captured["cmd"] = cmd
+        captured["timeout"] = timeout
+        return {"rc": 0, "stdout": "", "stderr": ""}
+
+    monkeypatch.setattr(app, "NOTIFY_CHANNEL", "webhook")
+    monkeypatch.setattr(app, "NOTIFY_URL", "https://example.com/hook")
+    monkeypatch.setattr(app, "_run", fake_run)
+    app._notify_send("failover_switch", "home → backup")
+    cmd = captured["cmd"]
+    assert cmd[0] == "curl" and cmd[-1] == "https://example.com/hook"
+    body = json.loads(cmd[cmd.index("-d") + 1])
+    assert body["event"] == "failover_switch"
+    assert body["text"] == "home → backup"
+
+
+def test_notify_send_curl_failure_logged(app, monkeypatch):
+    monkeypatch.setattr(app, "NOTIFY_CHANNEL", "webhook")
+    monkeypatch.setattr(app, "NOTIFY_URL", "https://example.com/hook")
+    monkeypatch.setattr(app, "_run",
+                        lambda cmd, timeout=10: {"rc": 7, "stdout": "",
+                                                 "stderr": "refused"})
+    app._notify_send("e", "x")   # rc!=0 → warning, не исключение
+
+
+def test_notify_send_failure_does_not_raise(app, monkeypatch):
+    monkeypatch.setattr(app, "NOTIFY_CHANNEL", "webhook")
+    monkeypatch.setattr(app, "NOTIFY_URL", "https://127.0.0.1:1/hook")
+    app._notify_send("e", "x")   # недоступный адрес → warning, не исключение
+
+
+def test_status_reports_notify_channel(conf_env):
+    conf_env.write_text('NAIVEPANEL_NOTIFY_URL="https://example.com/hook"\n')
+    m = _reload()
+    assert m.NOTIFY_CHANNEL == "webhook"
+    d = m.app.test_client().get("/api/status").get_json()
+    assert d["notify"] == {"enabled": True, "channel": "webhook"}
+
+
+def test_ui_has_v014_controls(app):
+    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    for marker in ('id="foAuto"', 'id="ntInfo"', "auto_return",
+                   "return_watch", "ждём возврата"):
+        assert marker in html, marker

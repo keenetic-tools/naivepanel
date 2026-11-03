@@ -612,11 +612,21 @@ if [ ! -f "$PANEL_CONF" ]; then
 #NAIVEPANEL_FAILOVER_INTERVAL="30"
 #NAIVEPANEL_FAILOVER_FAST="5"
 #NAIVEPANEL_FAILOVER_THRESHOLD="3"
+# Auto-return to primary (opt-in checkbox in the UI): N alive TCP probes ->
+# live-naive probe with full E2E -> activate; failed probe -> cooldown.
+#NAIVEPANEL_FAILOVER_RETURN_ALIVE="3"
+#NAIVEPANEL_FAILOVER_RETURN_COOLDOWN="900"
 
 # E2E check history for the status-card sparkline (ring buffer, survives
 # panel restarts; default keeps a day of 30s-interval checks).
 #NAIVEPANEL_E2E_HISTORY="/opt/etc/naive/proxy/e2e-history.jsonl"
 #NAIVEPANEL_E2E_KEEP="2880"
+
+# Notifications (Telegram or webhook): switches, returns, watchdog restarts,
+# chain exhausted. Secrets live ONLY here - the UI shows just the channel.
+#NAIVEPANEL_TG_TOKEN=""
+#NAIVEPANEL_TG_CHAT=""
+#NAIVEPANEL_NOTIFY_URL=""
 EOF
     chmod 0644 "$PANEL_CONF"
     info "created $PANEL_CONF (settings template — uncomment what you need)"
