@@ -522,6 +522,14 @@ function fmtUptime(s) {
 function renderStatus(st) {
   // смена активного пресета (в т.ч. автофейловером) отражается на чипах
   if (st.current !== activeName) { activeName = st.current; foRerender(); }
+  // а свежие цифры фейловера приходят в каждом статусе — обновляем строку,
+  // не дожидаясь GET /api/failover (баг v0.13.0: «актив 1/3» висел после
+  // автопереключения до перезагрузки страницы)
+  if (st.failover) {
+    const line = foInfoLine(st.failover);
+    $('foInfo').textContent = line.text;
+    $('foInfo').title = line.title;
+  }
   const ver = st.version ? ' · v'+escapeHtml(st.version) : '';
   const dotOn = '<span class="dot on" aria-hidden="true"></span>', dotOff = '<span class="dot off" aria-hidden="true"></span>';
   $('status').innerHTML = (st.active
@@ -759,8 +767,34 @@ async function loadFailover() {
   } catch (e) { /* тихо: секция некритична, ошибка всплывёт в статусе */ }
 }
 
+// Строкa статуса фейловера как чистая функция: её же дёргает 3-секундный
+// поллинг из renderStatus — после АВТОпереключения цифры (актив N/M, fails,
+// ok, переключений) должны оживать без перезагрузки страницы. Чипы и select
+// при этом НЕ перерисовываются: открытый dropdown не должен закрываться.
+function foInfoLine(d) {
+  const inChain = new Set(foChainArr);
+  let t = d.enabled || foChainArr.length
+    ? 'цепочка: '+(foChainArr.length ? foChainArr.join(' → ') : '—') : 'выкл';
+  const dirty = !foEq(foChainArr, foSavedChain);
+  if (!d.enabled && !dirty) t = 'выкл';
+  if (d.enabled && d.idle) t += ' · пауза: '+d.idle;
+  else {
+    // актив/ok показываем только вне паузы: причина паузы может быть от
+    // прошлого цикла монитора, и «актив 2/2» рядом с ней противоречит
+    if (d.enabled && !dirty && d.active_index != null)
+      t += ' · актив '+(d.active_index+1)+'/'+d.chain.length;
+    if (d.enabled && !dirty && d.last_ok != null)
+      t += d.last_ok ? ' · ok' : ' · НЕ проходит ('+d.fails+'/'+d.threshold+')';
+  }
+  if (d.enabled && d.probing_fast && d.last_ok === false) t += ' · частые проверки';
+  if (d.enabled && d.switches) t += ' · переключений: '+d.switches;
+  if (dirty) t += ' · НЕ СОХРАНЕНО';
+  if (d.enabled && activeName && foChainArr.length && !inChain.has(activeName))
+    t += ' · активный вне цепочки — монитор не следит';
+  return {text: 'фейловер: '+t, title: d.last_error ? String(d.last_error) : ''};
+}
+
 function renderFailover(d) {
-  const info = $('foInfo');
   // чипы цепочки: первый — основной, активный подсвечен
   const box = $('foChips');
   box.innerHTML = foChainArr.length ? foChainArr.map((n, i) => {
@@ -786,22 +820,9 @@ function renderFailover(d) {
   save.textContent = d.enabled ? 'Сохранить' : 'Включить';
   save.disabled = !foChainArr.length;
   $('btnFoOff').hidden = !d.enabled;
-  // строка статуса: цепочка локальная, здоровье — с сервера
-  let t = d.enabled || foChainArr.length
-    ? 'цепочка: '+(foChainArr.length ? foChainArr.join(' → ') : '—') : 'выкл';
-  const dirty = !foEq(foChainArr, foSavedChain);
-  if (!d.enabled && !dirty) t = 'выкл';
-  if (d.enabled && !dirty && d.active_index != null) t += ' · актив '+(d.active_index+1)+'/'+d.chain.length;
-  if (d.enabled && d.idle) t += ' · пауза: '+d.idle;
-  else if (d.enabled && !dirty && d.last_ok != null)
-    t += d.last_ok ? ' · ok' : ' · НЕ проходит ('+d.fails+'/'+d.threshold+')';
-  if (d.enabled && d.probing_fast && d.last_ok === false) t += ' · частые проверки';
-  if (d.enabled && d.switches) t += ' · переключений: '+d.switches;
-  if (dirty) t += ' · НЕ СОХРАНЕНО';
-  if (d.enabled && activeName && foChainArr.length && !inChain.has(activeName))
-    t += ' · активный вне цепочки — монитор не следит';
-  info.textContent = 'фейловер: '+t;
-  info.title = d.last_error ? String(d.last_error) : '';
+  const line = foInfoLine(d);
+  $('foInfo').textContent = line.text;
+  $('foInfo').title = line.title;
 }
 
 function foRerender() { if (foLast) renderFailover(foLast); }

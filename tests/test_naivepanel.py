@@ -2329,3 +2329,18 @@ def test_failover_snapshot_reports_probing_fast(client, app, monkeypatch):
     fo.cycle()
     snap = fo.snapshot()
     assert snap["probing_fast"] is True and snap["fast_interval"] >= 2
+
+
+def test_failover_snapshot_rechecks_stale_idle(client, app):
+    # idle_reason — итог последнего цикла монитора; состояние могло измениться
+    # до следующего цикла. snapshot перепроверяет динамические причины,
+    # чтобы не показывать «пауза» рядом со свежим active_index
+    fo = _fo_setup(client, app, presets=("home",), chain=("home",))
+    fo._idle("нет активного пресета с listen")     # было до появления пресета
+    assert fo.snapshot()["idle"] is None           # listen уже есть — причина устарела
+    app.STOP_MARKER.parent.mkdir(parents=True, exist_ok=True)
+    app.STOP_MARKER.write_text("")
+    fo._idle("прокси остановлен вручную")
+    assert fo.snapshot()["idle"] == "прокси остановлен вручную"  # маркер реален
+    app.STOP_MARKER.unlink()
+    assert fo.snapshot()["idle"] is None           # маркер сняли — пауза устарела

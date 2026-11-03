@@ -1099,6 +1099,15 @@ class _Failover:
         conf = _load_failover_conf()
         active = _active_name()
         idx = conf["chain"].index(active) if active in conf["chain"] else None
+        # Динамические причины паузы перепроверяем: idle_reason — итог
+        # ПОСЛЕДНЕГО цикла монитора, и до следующего цикла (до 30с) мог
+        # появиться пресет / сняться маркер stop. Показывать устаревшую
+        # паузу рядом со свежим active_index — противоречие в статусе.
+        idle = self.idle_reason
+        if idle == "прокси остановлен вручную" and not STOP_MARKER.exists():
+            idle = None
+        elif idle == "нет активного пресета с listen" and active and _active_listen():
+            idle = None
         return {
             "enabled": FAILOVER_ENABLED and conf["enabled"],
             "chain": conf["chain"],
@@ -1114,7 +1123,7 @@ class _Failover:
             "last_ms": self._last_ms,
             "switches": self.switches,
             "last_switch": self._last_switch,
-            "idle": self.idle_reason,
+            "idle": idle,
         }
 
     def _idle(self, reason: str) -> None:
