@@ -2154,6 +2154,12 @@ def test_failover_switch_restarts_service(client, app, monkeypatch, env):
 
 def test_ui_has_failover_controls(app):
     html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
-    for marker in ('data-action="foSave"', 'data-action="foOff"', 'id="foChain"',
-                   'id="foInfo"', "/api/failover", "renderFailover"):
+    for marker in ('data-action="foSave"', 'data-action="foOff"',
+                   'data-action="foAdd"', 'data-action="foDel"',
+                   'data-action="foUp"', 'data-action="foDown"',
+                   'data-action="foAll"',
+                   'id="foPick"', 'id="foChips"', 'id="foInfo"', 'class="fochip',
+                   "/api/failover", "renderFailover"):
         assert marker in html, marker
+    # поле ручного ввода имён убрано: выбор пресетов — только чипами/select
+    assert 'id="foChain"' not in html

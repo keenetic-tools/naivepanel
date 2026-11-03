@@ -167,6 +167,18 @@
   textarea { min-height:120px; resize:vertical; }
   .row { display:flex; gap:8px; flex-wrap:wrap; margin-top:14px; }
   .actions { display:flex; gap:8px; flex-wrap:wrap; margin-top:14px; }
+  .fochips { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; }
+  .fochip { display:inline-flex; align-items:center; gap:5px; padding:4px 6px 4px 10px;
+            border:1px solid var(--border); border-radius:14px; font-size:12px;
+            background:var(--card); }
+  .fochip.act { border-color:var(--acc); background:var(--acc-tint); }
+  .fochip .pos { color:var(--acc); font-weight:600; white-space:nowrap; }
+  .fochip .onb { color:var(--acc); font-size:10px; border:1px solid var(--acc);
+                 border-radius:8px; padding:0 5px; line-height:16px; white-space:nowrap; }
+  .fochip .mini { border:none; background:none; color:var(--mut); cursor:pointer;
+                  padding:0 2px; font-size:12px; line-height:1; }
+  .fochip .mini:hover:not(:disabled) { color:var(--fg); }
+  .fochip .mini:disabled { opacity:.25; cursor:default; }
   pre.log { background:var(--log-bg); color:var(--log-fg); padding:12px; border:1px solid var(--border);
             border-radius:10px; box-shadow:inset 0 1px 4px rgba(0,0,0,.12);
             max-height:260px; overflow:auto; font:12px/1.55 ui-monospace,Menlo,monospace;
@@ -318,12 +330,18 @@
   <section class="card" style="grid-area:ops">
     <h2>Обслуживание</h2>
     <div id="foInfo" style="font-size:12px;color:var(--mut)">фейловер: проверка…</div>
+    <div id="foChips" class="fochips"></div>
     <div class="actions" style="margin-top:8px">
-      <input id="foChain" placeholder="home, backup" aria-label="Цепочка фейловера"
-             autocomplete="off" spellcheck="false" style="flex:1;min-width:140px"
-             title="Пресеты через запятую: основной → запасные. После порога неудачных E2E-проверок подряд панель переключает на следующий. Назад, на основной — только вручную">
+      <select id="foPick" aria-label="Добавить пресет в цепочку фейловера"
+              style="flex:1;min-width:140px"></select>
+      <button class="ghost" data-action="foAdd" id="btnFoAdd"
+              title="Добавить выбранный пресет в конец цепочки (следующий по приоритету)">Добавить</button>
+    </div>
+    <div class="actions" style="margin-top:8px">
+      <button class="ghost" data-action="foAll" id="btnFoAll"
+              title="Добавить в цепочку все пресеты в порядке списка — подходящий старт, порядок потом поправьте ↑↓">Собрать из всех</button>
       <button class="ghost" data-action="foSave" id="btnFoSave"
-              title="Сохранить цепочку и включить автофейловер">Включить</button>
+              title="Сохранить цепочку и включить автофейловер. Первый пресет — основной, при сбоях переключение вперёд; назад — вручную">Включить</button>
       <button class="ghost" data-action="foOff" id="btnFoOff" hidden
               title="Выключить автофейловер (цепочка удалится)">Выключить</button>
     </div>
@@ -496,6 +514,8 @@ function fmtUptime(s) {
 }
 
 function renderStatus(st) {
+  // смена активного пресета (в т.ч. автофейловером) отражается на чипах
+  if (st.current !== activeName) { activeName = st.current; foRerender(); }
   const ver = st.version ? ' · v'+escapeHtml(st.version) : '';
   const dotOn = '<span class="dot on" aria-hidden="true"></span>', dotOff = '<span class="dot off" aria-hidden="true"></span>';
   $('status').innerHTML = (st.active
@@ -675,48 +695,118 @@ async function checkProxy() {
   finally { b.disabled = false; b.textContent = 'Проверить прокси'; }
 }
 
-// Фейловер: цепочка «основной → запасные». Фоновый монитор панели делает
+// Фейловер: цепочка «основной → запасные» собирается чипами (без ввода
+// имён руками: select знает существующие пресеты, дубли исключены). Правки
+// локальные до кнопки «Включить/Сохранить»; монитор панели делает
 // E2E-проверку активного пресета и после порога неудач подряд переключает
 // на следующий; назад, на основной — только вручную (активация как обычно).
+let foChainArr = [];    // редактируемая цепочка (сохраняется кнопкой)
+let foSavedChain = [];  // последняя сохранённая на сервере
+let foLast = null;      // последний ответ /api/failover (для перерисовки)
+let activeName = null;  // активный пресет (из /api/status)
+
+const foEq = (a, b) => a.length === b.length && a.every((v, i) => v === b[i]);
+
 async function loadFailover() {
-  try { renderFailover(await jget('/api/failover')); }
-  catch (e) { /* тихо: секция некритична, ошибка всплывёт в статусе */ }
+  try {
+    const d = await jget('/api/failover');
+    foLast = d;
+    // цепочка с сервера — истина; локальные правки держим, пока не сохранят
+    const hadEdits = !foEq(foChainArr, foSavedChain);
+    foSavedChain = d.chain;
+    if (!hadEdits) foChainArr = d.chain.slice();
+    renderFailover(d);
+  } catch (e) { /* тихо: секция некритична, ошибка всплывёт в статусе */ }
 }
+
 function renderFailover(d) {
   const info = $('foInfo');
-  if (d.chain && d.chain.length) $('foChain').value = d.chain.join(', ');
+  // чипы цепочки: первый — основной, активный подсвечен
+  const box = $('foChips');
+  box.innerHTML = foChainArr.length ? foChainArr.map((n, i) => {
+    const act = n === activeName;
+    return '<span class="fochip'+(act ? ' act' : '')+'">'
+      + '<span class="pos">'+(i === 0 ? 'основной' : (i+1))+'</span>'
+      + escapeHtml(n)
+      + (act ? '<span class="onb">активен</span>' : '')
+      + '<button class="mini" data-action="foUp" data-arg="'+escapeHtml(n)+'" title="Выше по приоритету"'+(i === 0 ? ' disabled' : '')+'>↑</button>'
+      + '<button class="mini" data-action="foDown" data-arg="'+escapeHtml(n)+'" title="Ниже по приоритету"'+(i === foChainArr.length-1 ? ' disabled' : '')+'>↓</button>'
+      + '<button class="mini" data-action="foDel" data-arg="'+escapeHtml(n)+'" title="Убрать из цепочки">×</button>'
+      + '</span>';
+  }).join('') : '<span style="font-size:12px;color:var(--mut)">пусто — добавьте пресеты; первый станет основным</span>';
+  // выбор: только пресеты вне цепочки, с замаскированным upstream для различия
+  const inChain = new Set(foChainArr);
+  const avail = lastPresets.filter(p => !inChain.has(p.name));
+  $('foPick').innerHTML = avail.length
+    ? avail.map(p => '<option value="'+escapeHtml(p.name)+'">'+escapeHtml(p.name)+' · '+escapeHtml(p.proxy)+'</option>').join('')
+    : '<option value="" disabled>'+(lastPresets.length ? 'все пресеты уже в цепочке' : 'пресетов пока нет — создайте в списке слева')+'</option>';
+  $('btnFoAdd').disabled = !avail.length;
+  $('btnFoAll').disabled = !(avail.length);
+  const save = $('btnFoSave');
+  save.textContent = d.enabled ? 'Сохранить' : 'Включить';
+  save.disabled = !foChainArr.length;
   $('btnFoOff').hidden = !d.enabled;
-  $('btnFoSave').textContent = d.enabled ? 'Сохранить' : 'Включить';
-  if (!d.enabled) {
-    info.textContent = 'фейловер: выкл';
-    return;
-  }
-  let t = 'цепочка: '+d.chain.join(' → ');
-  if (d.active_index != null) t += ' · актив '+(d.active_index+1)+'/'+d.chain.length;
-  if (d.idle) t += ' · пауза: '+d.idle;
-  else if (d.last_ok != null) {
-    t += d.last_ok ? ' · ok' : ' · НЕ проходит ('+d.fails+'/'+d.threshold+')';
-  }
-  if (d.switches) t += ' · переключений: '+d.switches;
+  // строка статуса: цепочка локальная, здоровье — с сервера
+  let t = d.enabled || foChainArr.length
+    ? 'цепочка: '+(foChainArr.length ? foChainArr.join(' → ') : '—') : 'выкл';
+  const dirty = !foEq(foChainArr, foSavedChain);
+  if (!d.enabled && !dirty) t = 'выкл';
+  if (d.enabled && !dirty && d.active_index != null) t += ' · актив '+(d.active_index+1)+'/'+d.chain.length;
+  if (d.enabled && d.idle) t += ' · пауза: '+d.idle;
+  else if (d.enabled && !dirty && d.last_ok != null) t += d.last_ok ? ' · ok' : ' · НЕ проходит ('+d.fails+'/'+d.threshold+')';
+  if (d.enabled && d.switches) t += ' · переключений: '+d.switches;
+  if (dirty) t += ' · НЕ СОХРАНЕНО';
+  if (d.enabled && activeName && foChainArr.length && !inChain.has(activeName))
+    t += ' · активный вне цепочки — монитор не следит';
   info.textContent = 'фейловер: '+t;
   info.title = d.last_error ? String(d.last_error) : '';
 }
+
+function foRerender() { if (foLast) renderFailover(foLast); }
+
+function foAdd() {
+  const v = $('foPick').value;
+  if (!v) return;
+  foChainArr.push(v);
+  foRerender();
+}
+function foAll() {
+  // все пресеты, которых ещё нет в цепочке, в порядке списка
+  for (const p of lastPresets) if (!foChainArr.includes(p.name)) foChainArr.push(p.name);
+  foRerender();
+}
+function foMove(name, dir) {
+  const i = foChainArr.indexOf(name), j = i + dir;
+  if (i < 0 || j < 0 || j >= foChainArr.length) return;
+  [foChainArr[i], foChainArr[j]] = [foChainArr[j], foChainArr[i]];
+  foRerender();
+}
+function foDel(name) {
+  foChainArr = foChainArr.filter(n => n !== name);
+  foRerender();
+}
 async function saveFailover() {
   const btn = $('btnFoSave');
-  const chain = $('foChain').value.split(',').map(s => s.trim()).filter(Boolean);
   btn.disabled = true;
   try {
-    renderFailover(await jput('/api/failover', {enabled: true, chain}));
-    flash('Фейловер включён: '+chain.join(' → '), true);
+    const d = await jput('/api/failover', {enabled: true, chain: foChainArr});
+    foLast = d;
+    foSavedChain = d.chain;
+    foChainArr = d.chain.slice();
+    renderFailover(d);
+    flash('Фейловер: цепочка '+foChainArr.join(' → '), true);
   } catch (e) { flash(e.message, false); }
-  finally { btn.disabled = false; }
+  finally { foRerender(); btn.disabled = !foChainArr.length; }
 }
 async function offFailover() {
   if (!(await askConfirm('Выключить автофейловер? Цепочка будет удалена.',
                          {ok:'Выключить', danger:true}))) return;
   try {
-    renderFailover(await jdel('/api/failover'));
-    $('foChain').value = '';
+    const d = await jdel('/api/failover');
+    foLast = d;
+    foChainArr = [];
+    foSavedChain = [];
+    renderFailover(d);
     flash('Фейловер выключен', true);
   } catch (e) { flash(e.message, false); }
 }
@@ -1197,6 +1287,11 @@ const ACTIONS = {
   import: () => $('importFile').click(),
   foSave: () => saveFailover(),
   foOff: () => offFailover(),
+  foAdd: () => foAdd(),
+  foAll: () => foAll(),
+  foUp: (arg) => foMove(arg, -1),
+  foDown: (arg) => foMove(arg, 1),
+  foDel: (arg) => foDel(arg),
   panelRestart: () => panelRestart(),
   updateCheck: () => checkUpdate(true),
   updateApply: () => applyUpdate(),
