@@ -623,7 +623,10 @@ if [ ! -f "$PANEL_CONF" ]; then
 #NAIVEPANEL_E2E_KEEP="2880"
 
 # Notifications (Telegram or webhook): switches, returns, watchdog restarts,
-# chain exhausted. Secrets live ONLY here - the UI shows just the channel.
+# chain exhausted. Delivery: through the active naive proxy first (Telegram
+# is blocked without it), then direct; undelivered events are queued and
+# sent when any path revives. TG_CHAT: your numeric id from @userinfobot
+# (DMs; /start the bot first) or a -100... group id. Secrets ONLY here.
 #NAIVEPANEL_TG_TOKEN=""
 #NAIVEPANEL_TG_CHAT=""
 #NAIVEPANEL_NOTIFY_URL=""

@@ -540,7 +540,8 @@ function renderStatus(st) {
   if (st.notify) {
     $('ntInfo').textContent = 'уведомления: '+
       (st.notify.channel ? (st.notify.channel === 'telegram' ? 'Telegram' : 'webhook')
-       : 'выкл (panel.conf)');
+       : 'выкл (panel.conf)')
+      + (st.notify.pending ? ' · отложено: '+st.notify.pending : '');
   }
   const ver = st.version ? ' · v'+escapeHtml(st.version) : '';
   const dotOn = '<span class="dot on" aria-hidden="true"></span>', dotOff = '<span class="dot off" aria-hidden="true"></span>';

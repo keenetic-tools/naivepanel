@@ -1040,7 +1040,8 @@ def _status() -> dict[str, Any]:
         "watchdog": _watchdog.snapshot(),
         "failover": _failover.snapshot(),
         "notify": {"enabled": NOTIFY_CHANNEL is not None,
-                   "channel": NOTIFY_CHANNEL},
+                   "channel": NOTIFY_CHANNEL,
+                   "pending": len(_notify_pending_all())},
     }
 
 
@@ -1066,11 +1067,16 @@ def _notify(event: str, text: str, dedupe_s: float = 60.0) -> None:
     _notify_queue.put((event, text))
 
 
-def _notify_send(event: str, text: str) -> None:
-    """Одна отправка: Telegram sendMessage или POST JSON в webhook.
+def _notify_send(event: str, text: str) -> bool:
+    """Доставка события: три пути, возвращаем — доставлено ли.
 
-    HTTP — через curl, как все внешние запросы панели (_http_get): curl
-    обязателен при установке, а единый путь наружу проще audit'ить.
+    1) через активный naive (curl -x socks5h/http) — Telegram за блокировками
+       доступен только так; DNS тоже через прокси (socks5h). Используем, когда
+       listen активного пресета жив — в момент большинства событий какой-то
+       прокси уже работает (переключились на backup / вернулись на основной);
+    2) напрямую — webhook на своём сервере и незаблокированные каналы;
+    3) не вышло — False: вызывающий положит в pending, доставим первым
+       ожившим путём (watchdog/failover поднимут прокси).
     """
     if NOTIFY_CHANNEL == "telegram":
         url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
@@ -1079,23 +1085,111 @@ def _notify_send(event: str, text: str) -> None:
     else:
         url, body = NOTIFY_URL, {"event": event, "text": text,
                                  "ts": int(time.time())}
+    post = ["-H", "Content-Type: application/json", "-d", json.dumps(body)]
+    # argv-списки; команды не логируем (токен Telegram в URL)
+
+    listen = _active_listen()
+    ep = _listen_endpoint(listen) if listen else None
+    if ep and _tcp_probe(ep[1], ep[2], timeout=1.0) is not None:
+        proxy = f"{'socks5h' if ep[0] == 'socks' else 'http'}://{ep[1]}:{ep[2]}"
+        try:
+            res = _run(["curl", "-fsS", "--max-time", "15", "-x", proxy,
+                        *post, url], timeout=20)
+            if res["rc"] == 0:
+                return True
+        except HTTPException:
+            pass  # прокси-путь не вышел — пробуем напрямую
     try:
-        # argv-список; команду не логируем (токен Telegram в URL)
-        res = _run(["curl", "-fsS", "--max-time", "10",
-                    "-H", "Content-Type: application/json",
-                    "-d", json.dumps(body), url], timeout=15)
-    except HTTPException as exc:  # curl нет / таймаут — монитор не должен страдать
-        app.logger.warning("notify %s failed: %s", event, exc.description)
-        return
-    if res["rc"] != 0:
-        app.logger.warning("notify %s failed: rc=%s %s", event, res["rc"],
-                           (res["stderr"] or "")[:200])
+        res = _run(["curl", "-fsS", "--max-time", "10", *post, url],
+                   timeout=15)
+    except HTTPException:
+        return False
+    return res["rc"] == 0
+
+
+# --- Pending: недоставленные события ждут оживания любого пути ---------------
+
+NOTIFY_PENDING = PANEL_DIR / "notify-pending.jsonl"
+_NOTIFY_PENDING_CAP = 50
+
+
+def _notify_pending_append(event: str, text: str) -> None:
+    """Событие в файл-очередь (переживает рестарт панели); cap по последним."""
+    try:
+        PANEL_DIR.mkdir(parents=True, exist_ok=True)
+        lines = [str(x) for x in _notify_pending_all(raw=True)]
+        lines.append(json.dumps({"event": event, "text": text,
+                                 "ts": int(time.time())}))
+        tmp = NOTIFY_PENDING.with_suffix(".jsonl.tmp")
+        with tmp.open("w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines[-_NOTIFY_PENDING_CAP:]) + "\n")
+        tmp.replace(NOTIFY_PENDING)
+    except OSError as exc:
+        app.logger.warning("notify pending append failed: %s", exc)
+
+
+def _notify_pending_all(raw: bool = False) -> list[Any]:
+    """Отложенные события (старые → новые); битые строки пропускаем."""
+    try:
+        lines = NOTIFY_PENDING.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    if raw:
+        return lines
+    out: list[Any] = []
+    for line in lines:
+        try:
+            item = json.loads(line)
+            if isinstance(item, dict) and item.get("event") and item.get("text"):
+                out.append(item)
+        except (json.JSONDecodeError, ValueError):
+            continue
+    return out
+
+
+def _notify_flush_pending() -> int:
+    """Доставить отложенные: до 5 за тик, стоп на первой неудаче (не долбим)."""
+    items = _notify_pending_all()
+    if not items:
+        return 0
+    delivered = 0
+    kept_from: int | None = None
+    for i, item in enumerate(items[:5]):
+        if _notify_send(item["event"], item["text"]):
+            delivered += 1
+            app.logger.warning(
+                "notify: доставлено отложенное %s (событие %s)",
+                item["event"],
+                time.strftime("%H:%M:%S", time.localtime(item.get("ts", 0))))
+        else:
+            kept_from = i
+            break
+    if delivered:
+        kept = items[kept_from:] if kept_from is not None else items[5:]
+        try:
+            tmp = NOTIFY_PENDING.with_suffix(".jsonl.tmp")
+            with tmp.open("w", encoding="utf-8") as fh:
+                fh.write("\n".join(json.dumps(i) for i in kept)
+                         + ("\n" if kept else ""))
+            tmp.replace(NOTIFY_PENDING)
+        except OSError as exc:
+            app.logger.warning("notify pending flush failed: %s", exc)
+    return delivered
 
 
 def _notify_loop() -> None:
     while True:
-        event, text = _notify_queue.get()
-        _notify_send(event, text)
+        _notify_flush_pending()
+        try:
+            event, text = _notify_queue.get(timeout=30)
+        except queue.Empty:
+            continue
+        if _notify_send(event, text):
+            continue
+        app.logger.warning(
+            "notify %s: все пути недоступны (прокси и напрямую) — отложено",
+            event)
+        _notify_pending_append(event, text)
 
 
 # --- Watchdog: авто-рестарт упавшего naive ----------------------------------

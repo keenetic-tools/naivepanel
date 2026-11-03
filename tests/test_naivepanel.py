@@ -2568,7 +2568,7 @@ def test_status_reports_notify_channel(conf_env):
     m = _reload()
     assert m.NOTIFY_CHANNEL == "webhook"
     d = m.app.test_client().get("/api/status").get_json()
-    assert d["notify"] == {"enabled": True, "channel": "webhook"}
+    assert d["notify"] == {"enabled": True, "channel": "webhook", "pending": 0}
 
 
 def test_ui_has_v014_controls(app):
@@ -2576,3 +2576,83 @@ def test_ui_has_v014_controls(app):
     for marker in ('id="foAuto"', 'id="ntInfo"', "auto_return",
                    "return_watch", "ждём возврата"):
         assert marker in html, marker
+
+
+# --- Уведомления v0.14.1: через прокси → напрямую → pending -------------------
+
+def _nt_run_capture(captured, results):
+    """Фейковый _run: пишет команды; результаты по очереди."""
+    def fake(cmd, timeout=10):
+        captured.append(cmd)
+        r = results.pop(0) if results else {"rc": 0, "stdout": "", "stderr": ""}
+        return r
+    return fake
+
+
+def test_notify_send_via_alive_proxy(app, monkeypatch):
+    # listen активного жив → первая попытка с -x socks5h (через naive)
+    import socket as s
+    srv = s.socket(); srv.bind(("127.0.0.1", 0)); srv.listen(1)
+    port = srv.getsockname()[1]
+    app._save_json(app.ACTIVE_CONFIG,
+                   {"listen": f"socks://127.0.0.1:{port}", "proxy": "https://u:p@h"})
+    captured = []
+    monkeypatch.setattr(app, "NOTIFY_CHANNEL", "webhook")
+    monkeypatch.setattr(app, "NOTIFY_URL", "https://example.com/hook")
+    monkeypatch.setattr(app, "_run", _nt_run_capture(captured, []))
+    try:
+        assert app._notify_send("e", "x") is True
+        assert captured[0][4] == "-x" and captured[0][5] == f"socks5h://127.0.0.1:{port}"
+        assert captured[0][-1] == "https://example.com/hook"
+    finally:
+        srv.close()
+
+
+def test_notify_send_proxy_dead_falls_back_direct(app, monkeypatch):
+    # listen мёртв → сразу прямой путь, без -x
+    app._save_json(app.ACTIVE_CONFIG,
+                   {"listen": "socks://127.0.0.1:1", "proxy": "https://u:p@h"})
+    captured = []
+    monkeypatch.setattr(app, "NOTIFY_CHANNEL", "webhook")
+    monkeypatch.setattr(app, "NOTIFY_URL", "https://example.com/hook")
+    monkeypatch.setattr(app, "_run", _nt_run_capture(captured, []))
+    assert app._notify_send("e", "x") is True
+    assert len(captured) == 1 and "-x" not in captured[0]
+
+
+def test_notify_send_all_dead_returns_false(app, monkeypatch):
+    app._save_json(app.ACTIVE_CONFIG,
+                   {"listen": "socks://127.0.0.1:1", "proxy": "https://u:p@h"})
+    captured = []
+    monkeypatch.setattr(app, "NOTIFY_CHANNEL", "webhook")
+    monkeypatch.setattr(app, "NOTIFY_URL", "https://example.com/hook")
+    monkeypatch.setattr(app, "_run",
+                        _nt_run_capture(captured, [{"rc": 7, "stdout": "",
+                                                    "stderr": "refused"}]))
+    assert app._notify_send("e", "x") is False
+
+
+def test_notify_pending_append_flush_and_status(app, monkeypatch):
+    app._notify_pending_append("failover_switch", "дом без интернета")
+    app._notify_pending_append("failover_exhausted", "всё лежит")
+    items = app._notify_pending_all()
+    assert [i["event"] for i in items] == ["failover_switch", "failover_exhausted"]
+    # доставляем: первый успех, второй неудача → остаётся второй
+    results = [{"rc": 0, "stdout": "", "stderr": ""},
+               {"rc": 7, "stdout": "", "stderr": "refused"}]
+    monkeypatch.setattr(app, "NOTIFY_CHANNEL", "webhook")
+    monkeypatch.setattr(app, "_run", lambda cmd, timeout=10: results.pop(0))
+    app._save_json(app.ACTIVE_CONFIG,
+                   {"listen": "socks://127.0.0.1:1", "proxy": "https://u:p@h"})
+    assert app._notify_flush_pending() == 1
+    left = app._notify_pending_all()
+    assert [i["event"] for i in left] == ["failover_exhausted"]
+    # статус показывает счётчик отложенных
+    d = app.app.test_client().get("/api/status").get_json()
+    assert d["notify"]["pending"] == 1
+    # кап: 60 событий → в файле последние 50
+    app.NOTIFY_PENDING.unlink()
+    for i in range(60):
+        app._notify_pending_append("e", f"t{i}")
+    assert len(app._notify_pending_all()) == 50
+    assert app._notify_pending_all()[-1]["text"] == "t59"
