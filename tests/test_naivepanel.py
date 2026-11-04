@@ -8,6 +8,7 @@ import importlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -2656,3 +2657,276 @@ def test_notify_pending_append_flush_and_status(app, monkeypatch):
         app._notify_pending_append("e", f"t{i}")
     assert len(app._notify_pending_all()) == 50
     assert app._notify_pending_all()[-1]["text"] == "t59"
+
+
+# --- Rollback: откат панели и бинарника из бэкапов ----------------------------
+
+def _rb_env_reload(env, monkeypatch):
+    """Env для откатов панели: init-пути с РАЗНЫМИ именами (в базовой фикстуре
+    оба absent-init.sh — имена бы склеились в бэкапе) + reload."""
+    monkeypatch.setenv("NAIVEPANEL_INIT", str(env / "pinit.sh"))
+    monkeypatch.setenv("NAIVEPROXY_INIT", str(env / "ninit.sh"))
+    return _reload()
+
+
+def _rb_make_backup(m, version, code="# old panel code", tmpl="old-tpl"):
+    """Каталог backup/vX.Y.Z с файлами, как их пишет self-update."""
+    backup = m.PANEL_DIR / "backup" / version
+    backup.mkdir(parents=True, exist_ok=True)
+    (backup / "naivepanel.py").write_text(code)
+    (backup / "index.html").write_text(tmpl)
+    (backup / m.PANEL_INIT.name).write_text("#!/bin/sh\n# panel init v old\n")
+    return backup
+
+
+def _rb_make_panel(m, code="# current panel code"):
+    (m.PANEL_DIR / "templates").mkdir(parents=True, exist_ok=True)
+    (m.PANEL_DIR / "naivepanel.py").write_text(code)
+    (m.PANEL_DIR / "templates" / "index.html").write_text("cur-tpl")
+
+
+def test_rollback_get_lists_versions_sorted_and_skips_junk(client, app):
+    _rb_make_backup(app, "v0.9.0", code="a" * 10)
+    _rb_make_backup(app, "v0.14.0", code="b" * 20)
+    junk = app.PANEL_DIR / "backup" / "trash"
+    junk.mkdir(parents=True)
+    (app.PANEL_DIR / "backup" / "stray.file").write_text("x")
+    d = client.get("/api/rollback").get_json()
+    assert d["current"] == app.APP_VERSION
+    assert [v["version"] for v in d["panel"]] == ["v0.14.0", "v0.9.0"]  # новые сверху
+    assert d["panel"][0]["size"] > d["panel"][1]["size"]
+    assert all(v["ts"] > 0 for v in d["panel"])
+    assert d["binary"] == {"present": False, "tag": None, "size": 0}
+
+
+def test_rollback_get_binary_with_and_without_tag(app):
+    prev = app.NAIVEPROXY_DIR / "backup" / "naive.previous"
+    prev.parent.mkdir(parents=True, exist_ok=True)
+    prev.write_bytes(b"\x00binary")
+    d = app.app.test_client().get("/api/rollback").get_json()
+    assert d["binary"]["present"] is True
+    assert d["binary"]["tag"] is None          # старый бэкап без тега
+    assert d["binary"]["size"] == 7
+    (app.NAIVEPROXY_DIR / "backup" / "naive.previous.tag").write_text(
+        "v113.0.5672.3-1\n")
+    d = app.app.test_client().get("/api/rollback").get_json()
+    assert d["binary"]["tag"] == "v113.0.5672.3-1"
+
+
+def test_rollback_panel_restores_files_backs_up_current_and_restarts(
+        client, app, env, monkeypatch):
+    m = _rb_env_reload(env, monkeypatch)
+    c = m.app.test_client()
+    _rb_make_panel(m, code="# current panel code")
+    _rb_make_backup(m, "v0.9.0", code="# old panel code", tmpl="old-tpl")
+    stub, marker = _stub_init(env, "rb-restarts.txt")
+    monkeypatch.setattr(m, "PANEL_INIT", stub)
+    # INIT_SCRIPT тоже возвращается: своё имя, свой файл
+    ninit = env / "ninit.sh"
+    (m.PANEL_DIR / "backup" / "v0.9.0" / "ninit.sh").write_text("# naive init old\n")
+
+    r = c.post("/api/rollback", json={"panel": "v0.9.0"}, headers=CSRF)
+    assert r.status_code == 202, r.get_json()
+    body = r.get_json()
+    assert body["target"] == "v0.9.0" and body["current"] == m.APP_VERSION
+    assert sorted(body["restored"]) == ["index.html", "naivepanel.py",
+                                        "ninit.sh", "pinit.sh"]
+    # файлы вернулись старым содержимым
+    assert (m.PANEL_DIR / "naivepanel.py").read_text() == "# old panel code"
+    assert (m.PANEL_DIR / "templates" / "index.html").read_text() == "old-tpl"
+    assert ninit.read_text() == "# naive init old\n"
+    # откат обратим: текущая версия тоже ушла в бэкап
+    cur = m.PANEL_DIR / "backup" / f"v{m.APP_VERSION}" / "naivepanel.py"
+    assert cur.read_text() == "# current panel code"
+    # state + лог — как у update: поднятая старая панель закроет «running»
+    st = json.loads(m.UPDATE_STATE.read_text())
+    assert st["phase"] == "running" and st["target"] == "v0.9.0"
+    assert st["rollback"] is True and st["pid"] > 0
+    assert m.UPDATE_LOG.read_text().startswith("== rollback")
+    # рестартер отсоединён — ждём маркер, как existing-тесты установщика
+    for _ in range(50):
+        if marker.exists():
+            break
+        time.sleep(0.1)
+    assert marker.read_text().strip() == "restart"
+
+
+def test_rollback_panel_404_on_unknown_version(client, app):
+    assert client.post("/api/rollback", json={"panel": "v9.9.9"},
+                       headers=CSRF).status_code == 404
+
+
+def test_rollback_panel_rejects_bad_names_and_current(client, app):
+    for bad in ("../etc", "v0.9", "main", ""):
+        r = client.post("/api/rollback", json={"panel": bad}, headers=CSRF)
+        assert r.status_code == 400, bad
+    # своя версия — не откат
+    _rb_make_backup(app, f"v{app.APP_VERSION}")
+    r = client.post("/api/rollback", json={"panel": f"v{app.APP_VERSION}"},
+                    headers=CSRF)
+    assert r.status_code == 400
+    assert "already running" in r.get_json()["error"]
+
+
+def test_rollback_panel_409_while_update_running(client, app, monkeypatch):
+    _rb_make_backup(app, "v0.9.0")
+    app._update_state_write({"phase": "running", "target": "v9.9.9",
+                             "started": time.time(), "pid": os.getpid()})
+    r = client.post("/api/rollback", json={"panel": "v0.9.0"}, headers=CSRF)
+    assert r.status_code == 409
+    assert "in progress" in r.get_json()["error"]
+
+
+def test_rollback_panel_503_without_panel_init(client, app, monkeypatch):
+    _rb_make_backup(app, "v0.9.0")
+    # init-путь базовой фикстуры (absent-init.sh) не существует
+    r = client.post("/api/rollback", json={"panel": "v0.9.0"}, headers=CSRF)
+    assert r.status_code == 503
+
+
+def test_rollback_refuses_exposed_panel_without_password(client, app, monkeypatch):
+    _rb_make_backup(app, "v0.9.0")
+    app.PANEL_BIND = "192.168.1.1:8089"  # admin.pass не существует (fixture)
+    r = client.post("/api/rollback", json={"panel": "v0.9.0"}, headers=CSRF)
+    assert r.status_code == 403
+    assert "password" in r.get_json()["error"]
+    # бинарник — тот же гейт
+    r = client.post("/api/rollback", json={"binary": True}, headers=CSRF)
+    assert r.status_code == 403
+
+
+def _rb_naive_setup(env, monkeypatch, prev_tag=None):
+    """Бинарник + naive.previous (+ опц. тег) в отдельном env."""
+    m = _naive_env_reload(env, monkeypatch)
+    cur = env / "naive"
+    cur.write_text('#!/bin/sh\necho "naive 154.0.8037.49"\n')
+    cur.chmod(0o755)
+    m.NAIVE_TAG.write_text("v154.0.8037.49-2\n")
+    prev = m.NAIVEPROXY_DIR / "backup" / "naive.previous"
+    prev.parent.mkdir(parents=True, exist_ok=True)
+    prev.write_text('#!/bin/sh\necho "naive 113.0.5672.3"\n')
+    prev.chmod(0o755)
+    if prev_tag is not None:
+        (m.NAIVEPROXY_DIR / "backup" / "naive.previous.tag").write_text(
+            prev_tag + "\n")
+    return m
+
+
+def test_rollback_binary_restores_previous(client, env, monkeypatch):
+    m = _rb_naive_setup(env, monkeypatch, prev_tag="v113.0.5672.3-1")
+    stub, marker = _stub_init(env, "rb-naive-restarts.txt")
+    monkeypatch.setattr(m, "INIT_SCRIPT", stub)
+    # «работающий» прокси — как в тестах воркера обновления
+    m.PID_FILE.parent.mkdir(parents=True, exist_ok=True)
+    m.PID_FILE.write_text(str(os.getpid()))
+    monkeypatch.setattr(m, "_pid_is_naive", lambda pid: True)
+
+    r = m.app.test_client().post("/api/rollback", json={"binary": True},
+                                 headers=CSRF)
+    assert r.status_code == 200, r.get_json()
+    body = r.get_json()
+    assert body["restored"] == "v113.0.5672.3-1"
+    assert body["version"] == "naive 113.0.5672.3"
+    assert body["restarted"] is True
+    # бинарник реально заменён, тег вернулся, мусора .new нет
+    assert m._naive_bin_version() == "113.0.5672.3"
+    assert m.NAIVE_TAG.read_text().strip() == "v113.0.5672.3-1"
+    assert not (env / "naive.new").exists()
+    assert marker.read_text().strip() == "restart"
+    st = m._naive_state_read()
+    assert st["phase"] == "done" and st["rollback"] is True
+
+
+def test_rollback_binary_without_tag_clears_naive_tag(client, env, monkeypatch):
+    m = _rb_naive_setup(env, monkeypatch, prev_tag=None)  # старый бэкап без тега
+    # прокси неактивен → без рестарта
+    r = m.app.test_client().post("/api/rollback", json={"binary": True},
+                                 headers=CSRF)
+    assert r.status_code == 200
+    assert r.get_json()["restarted"] is False
+    # тег новой версии врать не должен — его нет, check возьмёт из бинарника
+    assert not m.NAIVE_TAG.exists()
+    assert r.get_json()["restored"] == "naive 113.0.5672.3"
+
+
+def test_rollback_binary_404_and_broken_backup(client, env, monkeypatch):
+    m = _naive_env_reload(env, monkeypatch)  # бэкапа нет
+    r = m.app.test_client().post("/api/rollback", json={"binary": True},
+                                 headers=CSRF)
+    assert r.status_code == 404
+    # битый бэкап: --version падает → текущий бинарник не трогаем
+    prev = m.NAIVEPROXY_DIR / "backup" / "naive.previous"
+    prev.parent.mkdir(parents=True, exist_ok=True)
+    prev.write_text('#!/bin/sh\nexit 7\n')
+    prev.chmod(0o755)
+    (env / "naive").write_text('#!/bin/sh\necho "naive 154.0.8037.49"\n')
+    (env / "naive").chmod(0o755)
+    r = m.app.test_client().post("/api/rollback", json={"binary": True},
+                                 headers=CSRF)
+    assert r.status_code == 500
+    assert "keeping the current" in r.get_json()["error"]
+    assert m._naive_bin_version() == "154.0.8037.49"
+
+
+def test_rollback_binary_409_while_naive_update_running(client, env, monkeypatch):
+    m = _rb_naive_setup(env, monkeypatch)
+    m._naive_state_write({"phase": "running", "target": "v1.0",
+                          "started": time.time()})
+    r = m.app.test_client().post("/api/rollback", json={"binary": True},
+                                 headers=CSRF)
+    assert r.status_code == 409
+
+
+def test_naive_update_records_previous_tag(client, env, monkeypatch):
+    m = _rb_naive_setup(env, monkeypatch, prev_tag=None)
+    # тег текущего (v154) уже в NAIVE_TAG от _rb_naive_setup; воркер при
+    # обновлении обязан записать его в naive.previous.tag
+    m.NAIVE_BUILD.write_text("x86_64\n")  # таргет не должен зависеть от хоста
+    tarball = env / "naive.tar.xz"
+    _build_naive_tarball(tarball, '#!/bin/sh\necho "naive 200.0.0.1"\n',
+                         tag="v200.0.0.1-1")
+    _naive_rel(monkeypatch, m, tag="v200.0.0.1-1",
+               assets=(("naiveproxy-v200.0.0.1-1-openwrt-x86_64.tar.xz", "u"),))
+    monkeypatch.setattr(m, "_http_download",
+                        lambda url, dst: shutil.copy(tarball, dst))
+    m._naive_update_worker()
+    st = m._naive_state_read()
+    assert st["phase"] == "done", st
+    tagfile = m.NAIVEPROXY_DIR / "backup" / "naive.previous.tag"
+    assert tagfile.read_text().strip() == "v154.0.8037.49-2"
+
+
+def test_rollback_delete_removes_single_version(client, app):
+    _rb_make_backup(app, "v0.14.0")
+    _rb_make_backup(app, "v0.9.0")
+    junk = app.PANEL_DIR / "backup" / "trash"
+    junk.mkdir(parents=True)
+    r = client.delete("/api/rollback/v0.9.0", headers=CSRF)
+    assert r.status_code == 200
+    assert r.get_json()["left"] == ["v0.14.0"]
+    assert not (app.PANEL_DIR / "backup" / "v0.9.0").exists()
+    assert junk.exists()  # не-версии не трогаем
+
+
+def test_rollback_delete_404_and_400(client, app):
+    assert client.delete("/api/rollback/v0.9.0", headers=CSRF).status_code == 404
+    assert client.delete("/api/rollback/main", headers=CSRF).status_code == 400
+
+
+def test_rollback_cleanup_keeps_newest(client, app):
+    for v in ("v0.9.0", "v0.13.0", "v0.14.0"):
+        _rb_make_backup(app, v)
+    r = client.post("/api/rollback/cleanup", json={"keep": 1}, headers=CSRF)
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["left"] == ["v0.14.0"]
+    assert sorted(body["removed"]) == ["v0.13.0", "v0.9.0"]
+    # keep=0 вычищает всё
+    r = client.post("/api/rollback/cleanup", json={"keep": 0}, headers=CSRF)
+    assert r.get_json() == {"removed": ["v0.14.0"], "left": []}
+
+
+def test_rollback_cleanup_rejects_bad_keep(client, app):
+    for bad in ("all", -1, 1.5, True):
+        r = client.post("/api/rollback/cleanup", json={"keep": bad}, headers=CSRF)
+        assert r.status_code == 400, bad

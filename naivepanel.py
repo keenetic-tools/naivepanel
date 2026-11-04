@@ -260,6 +260,11 @@ UPDATE_RAW_BASE = os.environ.get("NAIVEPANEL_UPDATE_RAW", "https://raw.githubuse
 PANEL_DIR = Path(os.environ.get("NAIVEPANEL_DIR", "/opt/etc/naive/panel"))
 UPDATE_LOG = Path(os.environ.get("NAIVEPANEL_UPDATE_LOG", "/opt/var/log/naivepanel-update.log"))
 UPDATE_STATE = PANEL_DIR / "update.state"
+# Файлы, заменяемые обновлением панели — их же восстанавливает откат
+# (бэкап хранит под именем оригинала; S99naivepanel/S99naiveproxy различаются)
+PANEL_UPDATE_FILES = (PANEL_DIR / "naivepanel.py",
+                      PANEL_DIR / "templates" / "index.html",
+                      PANEL_INIT, INIT_SCRIPT)
 # Источник обновления — только строгие vX.Y.Z: ни веток, ни хэшей, ни main
 _TAG_RE = re.compile(r"^v\d+\.\d+\.\d+$")
 _UPDATE_CHECK_TTL = 6 * 3600.0  # авто-check при загрузке страницы не должен
@@ -2409,6 +2414,20 @@ def _update_state() -> dict[str, Any]:
     return st
 
 
+def _backup_panel_files() -> Path:
+    """Снапшот заменяемых файлов панели в backup/v{APP_VERSION}.
+
+    Вызывается и перед self-update, и перед откатом: оба пути обязаны быть
+    обратимыми. Файл хранится под именем оригинала — откат ищет по имени.
+    """
+    backup = PANEL_DIR / "backup" / f"v{APP_VERSION}"
+    backup.mkdir(parents=True, exist_ok=True)
+    for src in PANEL_UPDATE_FILES:
+        if src.exists():
+            shutil.copy2(src, backup / src.name)
+    return backup
+
+
 _update_check_cache: dict[str, Any] = {}
 
 
@@ -2479,14 +2498,8 @@ def api_update_apply():
         abort(502, description=f"cannot download install.sh@{tag}: {exc}")
     try:
         PANEL_DIR.mkdir(parents=True, exist_ok=True)
-        # бэкап заменяемых файлов — для ручного отката после неудачного апдейта
-        backup = PANEL_DIR / "backup" / f"v{APP_VERSION}"
-        backup.mkdir(parents=True, exist_ok=True)
-        for src in (PANEL_DIR / "naivepanel.py",
-                    PANEL_DIR / "templates" / "index.html",
-                    PANEL_INIT, INIT_SCRIPT):
-            if src.exists():
-                shutil.copy2(src, backup / src.name)
+        # бэкап заменяемых файлов — для отката из UI после неудачного апдейта
+        _backup_panel_files()
         stage = PANEL_DIR / ".update-install.sh"
         stage.write_text(installer, encoding="utf-8")
         os.chmod(stage, 0o700)
@@ -2790,6 +2803,11 @@ def _naive_update_worker() -> None:
             backup = NAIVEPROXY_DIR / "backup" / "naive.previous"
             backup.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(NAIVE_BIN, backup)
+            # тег откатываемой версии: без него откатчик не знает, что вернёт
+            prev_tag = _naive_read(NAIVE_TAG)
+            if prev_tag:
+                backup.with_name(backup.name + ".tag").write_text(
+                    prev_tag + "\n", encoding="utf-8")
         # cp в тот же каталог + os.replace = rename внутри ФС: открытый
         # для записи работающий бинарник дал бы ETXTBSY, а rename оставляет
         # старый образ выполняющемуся процессу
@@ -2909,6 +2927,237 @@ def api_naive_status():
                     "state": _naive_state()})
     resp.headers["Cache-Control"] = "no-store"
     return resp
+
+
+# --- Rollback: откат панели и бинарника из бэкапов, без SSH -------------------
+# Self-update перед заменой снапшотит файлы в panel/backup/vX.Y.Z/, обновление
+# бинарника — в proxy/backup/naive.previous. До v0.15 доставать их можно было
+# только руками по SSH — ровно тот случай, когда консоли под рукой нет. Здесь
+# — чтение бэкапов, восстановление и чистка: откат панели перезапускает её саму
+# (панель продолжает работать старым кодом, пока файлы не вернутся на место),
+# откат бинарника — тот же паттерн, что обновление: rename + рестарт сервиса.
+
+NAIVE_PREV_BIN = NAIVEPROXY_DIR / "backup" / "naive.previous"
+NAIVE_PREV_TAG = NAIVEPROXY_DIR / "backup" / "naive.previous.tag"
+
+
+def _rollback_panel_versions() -> list[dict[str, Any]]:
+    """Версии панели в backup/: [{version, size, ts}], новые сверху.
+
+    Считаем только каталоги строгого vX.Y.Z — мусорные имена туда не попадают.
+    """
+    out: list[dict[str, Any]] = []
+    try:
+        dirs = [d for d in (PANEL_DIR / "backup").iterdir()
+                if d.is_dir() and _TAG_RE.match(d.name)]
+    except OSError:
+        return out
+    for d in dirs:
+        size = 0
+        try:
+            size = sum(f.stat().st_size for f in d.iterdir() if f.is_file())
+            ts = int(d.stat().st_mtime)
+        except OSError:
+            continue
+        out.append({"version": d.name, "size": size, "ts": ts})
+    out.sort(key=lambda v: _ver_key(v["version"]), reverse=True)
+    return out
+
+
+@app.route("/api/rollback")
+def api_rollback_get():
+    """Что можно откатить: версии панели в backup/ + прошлый бинарник.
+
+    Тег бинарника — из naive.previous.tag (пишется с v0.15; у более старых
+    бэкапов неизвестен, UI так и показывает). Сам бэкап не запускаем: GET
+    должен остаться дешёвым.
+    """
+    binary: dict[str, Any] = {"present": False, "tag": None, "size": 0}
+    try:
+        if NAIVE_PREV_BIN.is_file():
+            binary = {"present": True,
+                      "tag": _naive_read(NAIVE_PREV_TAG),
+                      "size": NAIVE_PREV_BIN.stat().st_size}
+    except OSError:
+        pass
+    return jsonify({"current": APP_VERSION,
+                    "panel": _rollback_panel_versions(),
+                    "binary": binary})
+
+
+def _rollback_binary():
+    """Возврат naive.previous на место бинарника: проверили — заменили —
+    перезапустили, если прокси работал. Синхронно: сеть не нужна, это
+    локальный rename, сервер при этом живёт."""
+    bprev = NAIVE_PREV_BIN
+    if not bprev.is_file():
+        abort(404, description="no naive.previous backup — nothing to roll back to")
+    try:
+        rv = subprocess.run([str(bprev), "--version"], capture_output=True,
+                            text=True, timeout=15)  # nosec B603
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        abort(500, description=f"cannot run backup binary: {exc}")
+    out = (rv.stdout or "").strip().splitlines()
+    if rv.returncode != 0 or not out:
+        abort(500, description="backup binary failed --version check — "
+                               "keeping the current one")
+    new_ver = out[0].strip()
+    prev_tag = _naive_read(NAIVE_PREV_TAG)
+    was_active = _status()["active"]
+    try:
+        # тот же rename-паттерн, что обновление: работающий naive доживает
+        # свой инод, ETXTBSY не бывает
+        placed = NAIVE_BIN.with_name(NAIVE_BIN.name + ".new")
+        shutil.copy2(bprev, placed)
+        placed.chmod(0o755)
+        os.replace(placed, NAIVE_BIN)
+        if prev_tag:
+            NAIVE_TAG.write_text(prev_tag + "\n", encoding="utf-8")
+        else:
+            # тег прошлой версии неизвестен; оставить тег текущей — врать
+            # в /api/naive/check, лучше без тега (check возьмёт из бинарника)
+            NAIVE_TAG.unlink(missing_ok=True)
+    except OSError as exc:
+        abort(500, description=f"cannot restore binary: {exc}")
+    _naive_log(f"rollback -> {prev_tag or new_ver}")
+    restarted = False
+    if was_active and INIT_SCRIPT.exists():
+        restarted = True
+        rst = _service("restart")
+        _naive_log(f"service restart rc={rst['rc']}")
+    _naive_state_write({"phase": "done", "target": prev_tag or new_ver,
+                        "finished": time.time(), "version": new_ver,
+                        "restarted": restarted, "rollback": True})
+    app.logger.warning("naive binary rolled back to %s by %s",
+                       prev_tag or new_ver, request.remote_addr)
+    return jsonify({"restored": prev_tag or new_ver, "version": new_ver,
+                    "restarted": restarted})
+
+
+@app.route("/api/rollback", methods=["POST"])
+def api_rollback_post():
+    """Откат панели на версию из backup/ или бинарника на naive.previous.
+
+    Тело: {"panel": "vX.Y.Z"} или {"binary": true}. Замена кода панели и
+    root-бинарника — гейт как у update/apply: без пароля только loopback.
+    Откат панели тоже снапшотит текущие файлы — обратим в обе стороны.
+    """
+    if not PANEL_ADMIN_PASS.exists() and not _bind_is_loopback():
+        abort(403, description="panel is exposed without a password — set one "
+                               "(install.sh --with-auth) before rolling back")
+    body = request.get_json(silent=True) or {}
+    if body.get("binary"):
+        st = _naive_state()
+        if st.get("phase") == "running" and not st.get("stale"):
+            abort(409, description=f"naive update to {st.get('target')} already in "
+                                   f"progress — log: {NAIVE_UPDATE_LOG}")
+        return _rollback_binary()
+    version = str(body.get("panel") or "")
+    if not _TAG_RE.match(version):
+        abort(400, description="bad version name — expected vX.Y.Z")
+    if version.lstrip("vV") == APP_VERSION:
+        abort(400, description=f"v{APP_VERSION} is already running")
+    backup = PANEL_DIR / "backup" / version
+    if not (backup / "naivepanel.py").is_file():
+        abort(404, description=f"no usable backup {version} "
+                               f"(need naivepanel.py inside)")
+    state = _update_state()
+    if state.get("phase") == "running" and not state.get("stale"):
+        abort(409, description=f"update to {state.get('target')} already in "
+                               f"progress — installer log: {UPDATE_LOG}")
+    if not PANEL_INIT.exists():
+        abort(503, description=f"{PANEL_INIT} not found")
+    try:
+        _backup_panel_files()   # откат обратим: текущая версия — тоже в бэкап
+        restored = []
+        for dst in PANEL_UPDATE_FILES:
+            src = backup / dst.name
+            if not src.is_file():
+                continue
+            # через tmp+rename: середина файла не мелькает на диске, а живущий
+            # в памяти процесс вообще ничего не замечает до рестарта
+            tmp = dst.with_name(dst.name + ".restore")
+            shutil.copy2(src, tmp)
+            os.replace(tmp, dst)
+            restored.append(dst.name)
+        if "naivepanel.py" not in restored:  # проверено выше, но после копий — надёжнее
+            abort(500, description="restore produced no naivepanel.py")
+        UPDATE_LOG.parent.mkdir(parents=True, exist_ok=True)
+        UPDATE_LOG.write_text(
+            f"== rollback {APP_VERSION} -> {version}, "
+            f"spawn {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"restored: {', '.join(restored)}\n",
+            encoding="utf-8")
+    except OSError as exc:
+        abort(500, description=f"cannot restore files: {exc}")
+    # перезапуск — тот же отсоединённый spawn, что /api/panel/restart:
+    # путь через env (NP_INIT), не позиционные аргументы busybox
+    env = {**os.environ, "NP_INIT": str(PANEL_INIT)}
+    try:
+        proc = subprocess.Popen(  # nosec B603
+            ["/bin/sh", "-c", 'sleep 1; exec /bin/sh "$NP_INIT" restart'],
+            env=env,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        abort(500, description=f"cannot spawn restarter: {exc}")
+    # state переиспользуем от update: поднятая старая панель увидит цель,
+    # равную своей версии, и закроет «running» как «done»
+    _update_state_write({"phase": "running", "target": version,
+                         "started": time.time(), "pid": proc.pid,
+                         "rollback": True})
+    app.logger.warning("rollback to %s triggered by %s", version,
+                       request.remote_addr)
+    return jsonify({"started": True, "target": version,
+                    "current": APP_VERSION, "restored": restored,
+                    "log": str(UPDATE_LOG)}), 202
+
+
+@app.route("/api/rollback/<version>", methods=["DELETE"])
+def api_rollback_delete(version: str):
+    """Удалить один бэкап панели (строгий vX.Y.Z; текущая версия в бэкапах
+    не лежит — удалять можно любой). Автоочистки нет: место занимает только
+    по явному решению."""
+    if not _TAG_RE.match(version):
+        abort(400, description="bad version name — expected vX.Y.Z")
+    target = PANEL_DIR / "backup" / version
+    if not target.is_dir():
+        abort(404, description=f"no backup {version}")
+    try:
+        shutil.rmtree(target)
+    except OSError as exc:
+        abort(500, description=f"cannot remove {version}: {exc}")
+    left = [v["version"] for v in _rollback_panel_versions()]
+    app.logger.info("backup %s removed by %s, left: %s", version,
+                    request.remote_addr, ", ".join(left) or "none")
+    return jsonify({"deleted": version, "left": left})
+
+
+@app.route("/api/rollback/cleanup", methods=["POST"])
+def api_rollback_cleanup():
+    """Удалить все бэкапы панели, кроме N новейших (по умолчанию 1).
+
+    Типовой сценарий: «оставить ближайший откат, хвост из десятка версий
+    убрать» — без выкалачивания крестиков по одному.
+    """
+    body = request.get_json(silent=True) or {}
+    keep = body.get("keep", 1)
+    if not isinstance(keep, int) or isinstance(keep, bool) or keep < 0:
+        abort(400, description="keep must be a non-negative integer")
+    versions = _rollback_panel_versions()
+    removed = []
+    for v in versions[keep:]:
+        try:
+            shutil.rmtree(PANEL_DIR / "backup" / v["version"])
+        except OSError as exc:
+            abort(500, description=f"cannot remove {v['version']}: {exc}")
+        removed.append(v["version"])
+    if removed:
+        app.logger.info("backups removed by %s: %s", request.remote_addr,
+                        ", ".join(removed))
+    return jsonify({"removed": removed,
+                    "left": [v["version"] for v in _rollback_panel_versions()]})
 
 
 # Лог какого хвоста показывать: по умолчанию — naive, src=panel — сама панель

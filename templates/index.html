@@ -203,6 +203,16 @@
   dialog::backdrop { background:rgba(0,0,0,.45); }
   #confirmMsg { margin:0; white-space:pre-line; }
   .dlg-actions { display:flex; gap:8px; justify-content:flex-end; margin-top:16px; }
+  /* Строка версии в диалоге отката */
+  .rbrow { display:flex; align-items:center; gap:8px; padding:5px 6px;
+           border-radius:8px; cursor:pointer; }
+  .rbrow:hover { background:var(--hov); }
+  .rbrow .rbname { font-variant-numeric:tabular-nums; white-space:nowrap; }
+  .rbrow .rbmeta { color:var(--mut); font-size:12px; margin-left:auto;
+                   white-space:nowrap; }
+  .rbrow .del { background:none; border:none; color:var(--err); cursor:pointer;
+                padding:0 4px; font-size:14px; }
+  .rbrow .del:hover { background:var(--hov); }
   /* Визуально скрытый aria-live: текст flash() анонсируется скринридером,
      а пользователь видит toast (двойной вывод был бы шумным). */
   .sr-only { position:absolute; width:1px; height:1px; margin:-1px; overflow:hidden;
@@ -374,6 +384,11 @@
       <button data-action="updateApply" id="btnUpdApply" hidden>Обновить</button>
       <button class="ghost" data-action="updateNotes" id="btnUpdNotes" hidden title="Описание грядущего релиза">Что нового</button>
     </div>
+    <div id="rbInfo" style="font-size:12px;color:var(--mut);margin-top:12px">откат: …</div>
+    <div class="actions" style="margin-top:8px">
+      <button class="ghost" data-action="rollbackOpen"
+              title="Откат панели или бинарника naive на сохранённую версию — без SSH">Откат версий…</button>
+    </div>
   </section>
 </main>
 <dialog id="confirmDlg" aria-labelledby="confirmMsg">
@@ -399,6 +414,24 @@
   <form method="dialog" class="dlg-actions">
     <button class="ghost" value="close" title="Обновление продолжит идти в фоне">Свернуть</button>
   </form>
+</dialog>
+<dialog id="rbDlg" aria-labelledby="rbTitle">
+  <p id="rbTitle" style="margin:0;font-weight:600">Откат версий</p>
+  <p id="rbCur" style="margin:6px 0 0;font-size:12px;color:var(--mut)">текущая версия панели: …</p>
+  <div style="display:flex;align-items:center;gap:8px;margin-top:12px;padding:8px 10px;
+              border:1px solid var(--border);border-radius:8px">
+    <span id="rbBinInfo" style="flex:1;font-size:13px">бинарник naive: …</span>
+    <button class="ghost" id="btnRbBin" data-action="rbBin" hidden
+            title="Вернуть предыдущий бинарник naive из бэкапа">Откатить</button>
+  </div>
+  <p style="margin:12px 0 4px;font-size:12px;color:var(--mut)">Панель — сохранённые версии:</p>
+  <div id="rbList" style="max-height:220px;overflow:auto"></div>
+  <div class="dlg-actions">
+    <button class="ghost" data-action="rbKeep"
+            title="Удалить все бэкапы панели, кроме самого свежего">Оставить только последнюю</button>
+    <button class="ghost" data-action="rbClose">Закрыть</button>
+    <button id="btnRbDo" data-action="rbDo" title="Откатить панель на выбранную версию">Откатить</button>
+  </div>
 </dialog>
 <div id="toasts"></div>
 
@@ -1212,6 +1245,153 @@ async function updateNaive() {
   }
 }
 
+// --- Откат версий: панель и бинарник из бэкапов -------------------------------
+let rb = null; // ответ /api/rollback: {current, panel:[{version,size,ts}], binary}
+
+function fmtBytes(n) {
+  if (!n) return '0 Б';
+  const units = ['Б', 'КБ', 'МБ', 'ГБ'];
+  let i = 0;
+  while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+  return (i === 0 ? String(n) : n.toFixed(1).replace('.', ',')) + ' ' + units[i];
+}
+
+async function loadRollback() {
+  try { rb = await jget('/api/rollback'); }
+  catch (e) { rb = null; }
+  renderRollback();
+}
+
+function renderRollback() {
+  const info = $('rbInfo');
+  if (!rb) { info.textContent = 'откат: список версий недоступен'; return; }
+  const total = (rb.panel || []).reduce((s, v) => s + v.size, 0);
+  info.textContent = (rb.panel || []).length
+    ? 'откат: бэкапов ' + rb.panel.length + ' (' + fmtBytes(total) + ')'
+    : 'откат: бэкапов панели пока нет';
+  $('rbCur').textContent = 'текущая версия панели: v' + (rb.current || '?');
+  const b = rb.binary || {};
+  $('rbBinInfo').textContent = b.present
+    ? 'Бинарник naive: ' + (b.tag || 'версия неизвестна') + ' · ' + fmtBytes(b.size)
+    : 'Бинарник naive: бэкапа нет';
+  $('btnRbBin').hidden = !b.present;
+  const curName = 'v' + (rb.current || '');
+  const firstOk = (rb.panel || []).find(v => v.version !== curName);
+  $('btnRbDo').disabled = !firstOk;  // выбирать нечего — и кнопки жать незачем
+  $('rbList').innerHTML = (rb.panel || []).map(v => {
+    // бэкап текущей версии (остаётся после отката как «путь назад») — откат
+    // на неё бессмыслен, сервер ответит 400: строку показываем, но глушим
+    const isCur = v.version === curName;
+    const checked = !isCur && firstOk !== undefined && v.version === firstOk.version;
+    return '<label class="rbrow"' + (isCur ? ' style="opacity:.5;cursor:default"' : '') + '>'
+      + '<input type="radio" name="rbVer" value="' + escapeHtml(v.version) + '"'
+      + (isCur ? ' disabled' : (checked ? ' checked' : '')) + '>'
+      + '<span class="rbname">' + escapeHtml(v.version)
+      + (isCur ? ' <span style="color:var(--mut);font-size:11px">— текущая</span>' : '') + '</span>'
+      + '<span class="rbmeta">' + fmtBytes(v.size) + '</span>'
+      + '<button type="button" class="del" aria-label="Удалить бэкап '
+      + escapeHtml(v.version) + '" title="Удалить бэкап ' + escapeHtml(v.version)
+      + '" data-action="rbDel" data-arg="' + escapeHtml(v.version) + '">✕</button></label>';
+  }).join('') || '<p style="margin:4px 0;font-size:12px;color:var(--mut)">'
+    + 'бэкапов панели нет — появятся после первого обновления</p>';
+}
+
+async function openRollback() {
+  await loadRollback();
+  $('rbDlg').showModal();
+}
+
+function rbSelected() {
+  const el = document.querySelector('input[name="rbVer"]:checked');
+  return el ? el.value : null;
+}
+
+async function rollbackPanel() {
+  const ver = rbSelected();
+  if (!ver || !rb) return;
+  const ok = await askConfirm(
+    'Откатить панель на ' + ver + '?\nВеб-панель перезапустится; прокси продолжит '
+    + 'работать. Текущая версия v' + rb.current + ' тоже сохранится в бэкап — откат обратим.',
+    {ok: 'Откатить', danger: true});
+  if (!ok) return;
+  let d;
+  try { d = await jpost('/api/rollback', {panel: ver}); }
+  catch (e) { flash('Откат не запущен: ' + e.message, false); return; }
+  $('rbDlg').close();
+  // тот же диалог и цикл ожидания, что у обновления: панель должна упасть и
+  // подняться уже старым кодом — ловим смену версии в /api/status
+  const want = String(d.target || ver).replace(/^v/, '');
+  $('updMsg').textContent = 'Откат панели на v' + want + '…';
+  $('updLog').textContent = '';
+  $('updPanelLog').textContent = '';
+  $('updPanelLogTitle').style.display = '';
+  $('updPanelLog').style.display = '';
+  $('updDlg').showModal();
+  flash('Откат до v' + want + ' запущен', true);
+  const t0 = Date.now(), deadline = t0 + 120000; // файлы локальные — 2 мин за глаза
+  let wentDown = false;
+  for (;;) {
+    await new Promise(res => setTimeout(res, 1000));
+    try { renderUpdLog(await jget('/api/update/log?lines=30')); } catch (e) { /* рестарт панели */ }
+    let st = null;
+    try { st = await (await fetch('/api/status', {cache:'no-store'})).json(); }
+    catch (e) { wentDown = true; }
+    if (st && st.version === want && (wentDown || Date.now() - t0 > 15000)) {
+      $('updMsg').textContent = 'Откачено на v' + want + ' — перезагружаю страницу…';
+      setTimeout(() => location.reload(), 900);
+      return;
+    }
+    if (Date.now() > deadline) {
+      $('updMsg').textContent = 'v' + want + ' не поднялась за 2 мин — лог ниже; подробности в '
+        + String(d.log || '/opt/var/log/naivepanel-update.log');
+      flash('Откат не завершился вовремя — см. лог обновления', false);
+      return;
+    }
+  }
+}
+
+async function rollbackBinary() {
+  if (!rb || !rb.binary || !rb.binary.present) return;
+  const ok = await askConfirm(
+    'Откатить бинарник naive на ' + (rb.binary.tag || 'предыдущую версию') + '?\n'
+    + 'Прокси перезапустится — соединения оборвутся на секунду.',
+    {ok: 'Откатить', danger: true});
+  if (!ok) return;
+  let d;
+  try { d = await jpost('/api/rollback', {binary: true}); }
+  catch (e) { flash('Откат бинарника не удался: ' + e.message, false); return; }
+  flash('Бинарник откачен на ' + (d.restored || '?')
+        + (d.restarted ? ' — сервис перезапущен' : ''), true);
+  await loadRollback();
+  await checkNaive(true);
+  await refreshAll();
+}
+
+async function rbDelete(ver) {
+  if (!ver) return;
+  const ok = await askConfirm('Удалить бэкап ' + ver + '? Вернуть его будет нельзя.',
+                              {ok: 'Удалить', danger: true});
+  if (!ok) return;
+  try { await jdel('/api/rollback/' + encodeURIComponent(ver)); }
+  catch (e) { flash('Не удалено: ' + e.message, false); return; }
+  flash('Бэкап ' + ver + ' удалён', true);
+  await loadRollback();
+}
+
+async function rbCleanup() {
+  if (!rb) return;
+  if ((rb.panel || []).length <= 1) { flash('Других бэкапов нет', true); return; }
+  const keep = rb.panel[0].version, n = rb.panel.length - 1;
+  const ok = await askConfirm('Оставить только ' + keep + ' и удалить остальные бэкапы (' + n + ')?',
+                              {ok: 'Удалить', danger: true});
+  if (!ok) return;
+  let d;
+  try { d = await jpost('/api/rollback/cleanup', {keep: 1}); }
+  catch (e) { flash('Не получилось: ' + e.message, false); return; }
+  flash('Удалено бэкапов: ' + (d.removed || []).length, true);
+  await loadRollback();
+}
+
 let lastLog = null;   // кэш — не трогаем DOM, если контент не изменился
 let logStuck = true;  // «прилип» к низу лога — автоскролл только когда true
 let logErrOnly = false; // показывать только ошибки/предупреждения
@@ -1391,6 +1571,12 @@ const ACTIONS = {
   updateNotes: () => showNotes(),
   naiveCheck: () => checkNaive(true),
   naiveUpdate: () => updateNaive(),
+  rollbackOpen: () => openRollback(),
+  rbBin: () => rollbackBinary(),
+  rbDo: () => rollbackPanel(),
+  rbDel: (arg) => rbDelete(arg),
+  rbKeep: () => rbCleanup(),
+  rbClose: () => $('rbDlg').close(),
   select: (arg) => selectPreset(arg),
   activate: (arg) => activate(arg),
   duplicate: (arg) => dupPreset(arg),
@@ -1422,6 +1608,8 @@ refreshAll();
 setTimeout(() => checkUpdate(false), 1500);
 // Бинарник naive проверяем следом — тем же паттерном, без тостов
 setTimeout(() => checkNaive(false), 2500);
+// Сводка бэкапов для строки «откат: …» — тоже тихо
+setTimeout(() => loadRollback(), 3500);
 const hashMatch = location.hash.match(/^#preset=(.+)$/);
 if (hashMatch) selectPreset(decodeURIComponent(hashMatch[1]));
 </script>
