@@ -278,7 +278,7 @@ _ALLOWED_PROXY_SCHEMES = ("https://", "http://", "quic://")
 # такой пресет нельзя было бы получить через GET (роутинг отдаёт файл)
 RESERVED_NAMES = frozenset({"export", "import"})
 
-APP_VERSION = "0.14.1"
+APP_VERSION = "0.15.0"
 
 
 def _ensure_dirs() -> None:
