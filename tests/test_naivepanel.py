@@ -904,6 +904,189 @@ def test_import_rejects_invalid_entries(client):
     assert client.post("/api/configs/import", headers=CSRF, json={}).status_code == 400
 
 
+def test_export_includes_failover(client):
+    _create(client, name="home")
+    client.put("/api/failover", headers=CSRF,
+               json={"enabled": True, "chain": ["home"], "auto_return": False})
+    d = client.get("/api/configs/export").get_json()
+    assert d["failover"] == {"enabled": True, "chain": ["home"],
+                             "auto_return": False}
+
+
+def test_export_chain_references_only_exported_presets(client, app):
+    _create(client, name="home")
+    # нечитаемый пресет пропускается экспортом, значит и из цепочки выпадает
+    (app.CONF_D / "bad.json").write_text("{not json")
+    app.FAILOVER_CONF.write_text(json.dumps(
+        {"enabled": True, "chain": ["home", "bad"], "auto_return": True}))
+    d = client.get("/api/configs/export").get_json()
+    assert set(d["presets"]) == {"home"}
+    assert d["failover"] == {"enabled": True, "chain": ["home"],
+                             "auto_return": True}
+
+
+def test_import_applies_failover_to_empty_chain(client):
+    payload = {"format": 1,
+               "presets": {"home": {"listen": "127.0.0.1:1080",
+                                    "proxy": "https://u:p@example.com"}},
+               "failover": {"enabled": True, "chain": ["home"],
+                            "auto_return": False}}
+    r = client.post("/api/configs/import", json=payload, headers=CSRF)
+    assert r.status_code == 200 and r.get_json()["failover"]["applied"] is True
+    assert client.get("/api/failover").get_json()["chain"] == ["home"]
+
+
+def test_import_does_not_replace_existing_chain(client):
+    _create(client, name="home")
+    client.put("/api/failover", headers=CSRF,
+               json={"enabled": True, "chain": ["home"]})
+    payload = {"presets": {"backup": {"listen": "127.0.0.1:1081",
+                                      "proxy": "https://u:p@example.org"}},
+               "failover": {"enabled": True, "chain": ["backup"]}}
+    d = client.post("/api/configs/import", json=payload, headers=CSRF).get_json()
+    assert d["failover"]["applied"] is False
+    assert client.get("/api/failover").get_json()["chain"] == ["home"]
+    # блокирующая причина — существующая цепочка, а не разбор входящей
+    bad = {"presets": {"home": {"listen": "127.0.0.1:1080",
+                                "proxy": "https://u:p@example.com"}},
+           "failover": {"enabled": True, "chain": ["ghost"]}}
+    d = client.post("/api/configs/import", json=bad, headers=CSRF).get_json()
+    assert d["failover"]["applied"] is False
+    assert d["failover"]["reason"] == "target already has a failover chain"
+    assert client.get("/api/failover").get_json()["chain"] == ["home"]
+
+
+def test_import_does_not_replace_disabled_nonempty_chain(client):
+    _create(client, name="home")
+    client.put("/api/failover", headers=CSRF,
+               json={"enabled": False, "chain": ["home"]})
+    payload = {"presets": {"backup": {"listen": "127.0.0.1:1081",
+                                      "proxy": "https://u:p@example.org"}},
+               "failover": {"enabled": True, "chain": ["backup"]}}
+    d = client.post("/api/configs/import", json=payload, headers=CSRF).get_json()
+    assert d["failover"]["applied"] is False
+    assert client.get("/api/failover").get_json()["chain"] == ["home"]
+
+
+def test_import_without_failover_block_is_a_noop(client, app):
+    payload = {"presets": {"home": {"listen": "127.0.0.1:1080",
+                                    "proxy": "https://u:p@example.com"}}}
+    d = client.post("/api/configs/import", json=payload, headers=CSRF).get_json()
+    assert d["failover"] == {"applied": False, "reason": "no failover block"}
+    assert not app.FAILOVER_CONF.exists()
+
+
+def test_import_empty_failover_block_does_not_write(client, app):
+    payload = {"presets": {"home": {"listen": "127.0.0.1:1080",
+                                    "proxy": "https://u:p@example.com"}},
+               "failover": {"enabled": False, "chain": []}}
+    d = client.post("/api/configs/import", json=payload, headers=CSRF).get_json()
+    assert d["failover"] == {"applied": False,
+                             "reason": "empty failover block"}
+    assert not app.FAILOVER_CONF.exists()
+
+
+def test_import_rejects_non_bool_enabled(client):
+    payload = {"presets": {"home": {"listen": "127.0.0.1:1080",
+                                    "proxy": "https://u:p@example.com"}},
+               "failover": {"enabled": "false", "chain": ["home"]}}
+    d = client.post("/api/configs/import", json=payload, headers=CSRF).get_json()
+    assert d["failover"]["applied"] is False
+    assert "boolean" in d["failover"]["reason"]
+
+
+def test_import_rejects_non_bool_auto_return(client):
+    payload = {"presets": {"home": {"listen": "127.0.0.1:1080",
+                                    "proxy": "https://u:p@example.com"}},
+               "failover": {"enabled": True, "chain": ["home"],
+                            "auto_return": "yes"}}
+    d = client.post("/api/configs/import", json=payload, headers=CSRF).get_json()
+    assert d["failover"] == {"applied": False,
+                             "reason": "auto_return must be boolean"}
+
+
+def test_import_rejects_auto_return_without_enabled(client, app):
+    # зеркало PUT: авто-возврат без включённой цепочки — явная ошибка, а не
+    # молчаливое понижение в auto_return:false
+    payload = {"presets": {"home": {"listen": "127.0.0.1:1080",
+                                    "proxy": "https://u:p@example.com"}},
+               "failover": {"enabled": False, "chain": ["home"],
+                            "auto_return": True}}
+    d = client.post("/api/configs/import", json=payload, headers=CSRF).get_json()
+    assert d["failover"] == {"applied": False,
+                             "reason": "auto_return requires enabled chain"}
+    assert not app.FAILOVER_CONF.exists()
+
+
+def test_import_skips_failover_with_missing_names(client):
+    payload = {"presets": {"home": {"listen": "127.0.0.1:1080",
+                                    "proxy": "https://u:p@example.com"}},
+               "failover": {"enabled": True, "chain": ["home", "ghost"]}}
+    d = client.post("/api/configs/import", json=payload, headers=CSRF).get_json()
+    assert d["failover"]["applied"] is False
+    assert "ghost" in d["failover"]["reason"]
+
+
+def test_import_skips_failover_with_duplicate_names(client):
+    payload = {"presets": {"home": {"listen": "127.0.0.1:1080",
+                                    "proxy": "https://u:p@example.com"}},
+               "failover": {"enabled": True, "chain": ["home", "home"]}}
+    d = client.post("/api/configs/import", json=payload, headers=CSRF).get_json()
+    assert d["failover"]["applied"] is False
+    assert "duplicates" in d["failover"]["reason"]
+    assert client.get("/api/failover").get_json()["chain"] == []
+
+
+def test_import_skips_failover_chain_too_long(client, app):
+    names = [f"p{i}" for i in range(app.FAILOVER_CHAIN_MAX + 1)]
+    presets = {n: {"listen": f"127.0.0.1:{1080 + i}",
+                   "proxy": f"https://u:p@h{i}.example"}
+               for i, n in enumerate(names)}
+    payload = {"presets": presets,
+               "failover": {"enabled": True, "chain": names}}
+    d = client.post("/api/configs/import", json=payload, headers=CSRF).get_json()
+    assert d["failover"]["applied"] is False
+    assert "too long" in d["failover"]["reason"]
+
+
+def test_import_rejects_non_object_failover(client):
+    payload = {"presets": {"home": {"listen": "127.0.0.1:1080",
+                                    "proxy": "https://u:p@example.com"}},
+               "failover": ["home"]}
+    d = client.post("/api/configs/import", json=payload, headers=CSRF).get_json()
+    assert d["failover"]["applied"] is False
+    assert "expected object" in d["failover"]["reason"]
+
+
+def test_import_rejects_traversal_name_in_failover(client, app):
+    payload = {"presets": {"home": {"listen": "127.0.0.1:1080",
+                                    "proxy": "https://u:p@example.com"}},
+               "failover": {"enabled": True, "chain": ["../etc/passwd"]}}
+    d = client.post("/api/configs/import", json=payload, headers=CSRF).get_json()
+    assert d["failover"]["applied"] is False
+    assert client.get("/api/failover").get_json()["chain"] == []
+    assert not app.FAILOVER_CONF.exists()
+
+
+def test_import_rechecks_presets_inside_lock(client, app, monkeypatch):
+    _create(client, name="home")
+    real_load = app._load_failover_conf
+    calls = {"n": 0}
+
+    def load_and_vanish():
+        calls["n"] += 1
+        if calls["n"] == 2:  # второй вызов — уже под локом, перед re-glob
+            (app.CONF_D / "home.json").unlink()
+        return real_load()
+
+    monkeypatch.setattr(app, "_load_failover_conf", load_and_vanish)
+    payload = {"presets": {}, "failover": {"enabled": True, "chain": ["home"]}}
+    d = client.post("/api/configs/import", json=payload, headers=CSRF).get_json()
+    assert d["failover"]["applied"] is False
+    assert "unknown presets: home" in d["failover"]["reason"]
+    assert not app.FAILOVER_CONF.exists()
+
+
 def test_reserved_names_rejected(client):
     # /api/configs/export и /api/configs/import — статические маршруты:
     # пресет с таким именем нельзя получить через GET
@@ -2209,6 +2392,23 @@ def test_failover_put_validates_chain(client):
     assert r.status_code == 200 and r.get_json()["enabled"] is False
 
 
+def test_failover_delete_takes_lock(app, monkeypatch):
+    seen = []
+
+    class FakeConf:
+        def unlink(self):
+            seen.append(app._FAILOVER_LOCK.locked())
+            raise FileNotFoundError
+
+        def read_text(self, encoding=None):
+            raise FileNotFoundError
+
+    monkeypatch.setattr(app, "FAILOVER_CONF", FakeConf())
+    assert app.app.test_client().delete(
+        "/api/failover", headers=CSRF).status_code == 200
+    assert seen == [True]
+
+
 def test_failover_delete_disables(client, app):
     _create(client, name="home")
     client.put("/api/failover", headers=CSRF,
@@ -2348,17 +2548,23 @@ def test_failover_switch_restarts_service(client, app, monkeypatch, env):
 
 # --- UI: фейловер ---------------------------------------------------------------
 
-def test_ui_has_failover_controls(app):
+def test_ui_failover_lives_with_presets(app):
     html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
-    for marker in ('data-action="foSave"', 'data-action="foOff"',
-                   'data-action="foAdd"', 'data-action="foDel"',
+    for marker in ('id="foInfo"', 'id="foEnabled"', 'id="foAuto"',
+                   'id="foCount"', 'data-action="foOrder"',
+                   'data-action="foAll"', 'data-action="foToggle"',
                    'data-action="foUp"', 'data-action="foDown"',
-                   'data-action="foAll"',
-                   'id="foPick"', 'id="foChips"', 'id="foInfo"', 'class="fochip',
-                   "/api/failover", "renderFailover"):
+                   "foOrderMode", "FO_CHAIN_MAX", "orderedPresets",
+                   "captureFocus", "restoreFocus", 'aria-label="Добавить',
+                   'id="foEnabled" aria-label="Автофейловер включён" disabled',
+                   'id="foAuto" aria-label="Возвращать на основной" disabled',
+                   "d.failover",
+                   "/api/failover"):
         assert marker in html, marker
-    # поле ручного ввода имён убрано: выбор пресетов — только чипами/select
-    assert 'id="foChain"' not in html
+    assert html.count('id="foInfo"') == 1
+    assert 'id="foChips"' not in html and 'id="foPick"' not in html
+    assert 'id="btnFoSave"' not in html and 'id="btnFoOff"' not in html
+    assert "saveFailover" not in html and "offFailover" not in html
 
 
 # --- История E2E-проверок: буфер, API, спарклайн -----------------------------
@@ -2533,6 +2739,261 @@ def test_failover_conf_v2_auto_return(client, app):
     assert client.put("/api/failover", headers=CSRF,
                       json={"enabled": False, "chain": [],
                             "auto_return": True}).status_code == 400
+
+
+def test_failover_put_disabled_keeps_chain(client):
+    _create(client, name="home")
+    _create(client, name="backup")
+    r = client.put("/api/failover", headers=CSRF,
+                   json={"enabled": True, "chain": ["home", "backup"]})
+    assert r.status_code == 200
+    r = client.put("/api/failover", headers=CSRF,
+                   json={"enabled": False, "chain": ["home", "backup"]})
+    assert r.status_code == 200
+    d = r.get_json()
+    assert d["enabled"] is False
+    assert d["chain"] == ["home", "backup"]
+    assert d["auto_return"] is False
+
+
+def test_failover_put_validates_chain_when_disabled(client):
+    _create(client, name="home")
+    assert client.put("/api/failover", headers=CSRF,
+                      json={"enabled": False, "chain": ["nope"]}).status_code == 404
+    assert client.put("/api/failover", headers=CSRF,
+                      json={"enabled": False, "chain": ["home", "home"]}).status_code == 400
+
+
+def test_failover_put_rejects_non_bool_enabled(client):
+    _create(client, name="home")
+    r = client.put("/api/failover", headers=CSRF,
+                   json={"enabled": "false", "chain": ["home"]})
+    assert r.status_code == 400
+
+
+def test_failover_snapshot_filters_stale_names(client, app):
+    _create(client, name="home")
+    app.FAILOVER_CONF.write_text(json.dumps(
+        {"enabled": True, "chain": ["home", "ghost"], "auto_return": True}))
+    d = client.get("/api/failover").get_json()
+    assert d["chain"] == ["home"]
+    assert d["enabled"] is True and d["auto_return"] is True
+    assert d["monitor"] is True
+    assert d["chain_max"] == 8          # предел цепочки отдаём клиенту
+
+
+def test_failover_snapshot_keeps_valid_entries_from_mixed_chain(client, app):
+    _create(client, name="home")
+    app.FAILOVER_CONF.write_text(json.dumps(
+        {"enabled": True, "chain": ["home", 5, "../etc/passwd", "BAD!"],
+         "auto_return": True}))
+    d = client.get("/api/failover").get_json()
+    assert d["chain"] == ["home"]
+
+
+def test_failover_all_stale_chain_disables(client, app):
+    _create(client, name="home")
+    app.FAILOVER_CONF.write_text(json.dumps(
+        {"enabled": True, "chain": ["ghost1", "ghost2"], "auto_return": True}))
+    d = client.get("/api/failover").get_json()
+    assert d["chain"] == [] and d["enabled"] is False
+    assert d["auto_return"] is False
+
+
+def test_failover_disable_without_chain_keeps_chain(client):
+    _create(client, name="home")
+    _create(client, name="backup")
+    client.put("/api/failover", headers=CSRF,
+               json={"enabled": True, "chain": ["home", "backup"]})
+    r = client.put("/api/failover", headers=CSRF, json={"enabled": False})
+    assert r.status_code == 200
+    assert r.get_json()["chain"] == ["home", "backup"]
+
+
+def test_failover_rejected_put_does_not_touch_conf(client, app):
+    _create(client, name="home")
+    client.put("/api/failover", headers=CSRF,
+               json={"enabled": True, "chain": ["home"]})
+    before = app.FAILOVER_CONF.read_text()
+    r = client.put("/api/failover", headers=CSRF,
+                   json={"enabled": True, "chain": ["home", "ghost"]})
+    assert r.status_code == 404
+    assert app.FAILOVER_CONF.read_text() == before
+
+
+def test_delete_preset_removes_it_from_failover_chain(client):
+    _create(client, name="home")
+    _create(client, name="backup")
+    client.put("/api/failover", headers=CSRF,
+               json={"enabled": True, "chain": ["home", "backup"],
+                     "auto_return": True})
+    assert client.delete("/api/configs/backup", headers=CSRF).status_code == 200
+    d = client.get("/api/failover").get_json()
+    assert d["chain"] == ["home"]
+    assert d["enabled"] is True and d["auto_return"] is True
+
+
+def test_delete_last_chain_member_disables_failover(client, app):
+    _create(client, name="home")
+    client.put("/api/failover", headers=CSRF,
+               json={"enabled": True, "chain": ["home"], "auto_return": True})
+    assert client.delete("/api/configs/home", headers=CSRF).status_code == 200
+    d = client.get("/api/failover").get_json()
+    assert d["chain"] == [] and d["enabled"] is False
+    assert d["auto_return"] is False
+    assert json.loads(app.FAILOVER_CONF.read_text()) == {
+        "enabled": False, "chain": [], "auto_return": False}
+
+
+def test_delete_preset_with_undecodable_failover_conf(client, app):
+    _create(client, name="home")
+    app.FAILOVER_CONF.parent.mkdir(parents=True, exist_ok=True)
+    app.FAILOVER_CONF.write_bytes(b"\xff\xfe{broken utf-8")
+    assert client.delete("/api/configs/home", headers=CSRF).status_code == 200
+    assert not (app.CONF_D / "home.json").exists()
+
+
+def test_delete_preset_without_failover_conf_creates_none(client, app):
+    _create(client, name="home")
+    assert not app.FAILOVER_CONF.exists()
+    assert client.delete("/api/configs/home", headers=CSRF).status_code == 200
+    assert not app.FAILOVER_CONF.exists()
+
+
+def test_delete_preset_with_malformed_failover_conf_keeps_file(client, app):
+    _create(client, name="home")
+    app.FAILOVER_CONF.parent.mkdir(parents=True, exist_ok=True)
+    app.FAILOVER_CONF.write_text("{not json")
+    assert client.delete("/api/configs/home", headers=CSRF).status_code == 200
+    assert app.FAILOVER_CONF.read_text() == "{not json"
+
+
+def test_delete_chain_member_logs_failover_write_failure(client, app,
+                                                         monkeypatch, caplog):
+    _create(client, name="home")
+    _create(client, name="backup")
+    client.put("/api/failover", headers=CSRF,
+               json={"enabled": True, "chain": ["home", "backup"]})
+    before = app.FAILOVER_CONF.read_bytes()
+
+    def boom(path, data):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(app, "_save_json", boom)
+    with caplog.at_level("WARNING"):
+        r = client.delete("/api/configs/backup", headers=CSRF)
+    assert r.status_code == 200
+    assert not (app.CONF_D / "backup.json").exists()
+    assert app.FAILOVER_CONF.read_bytes() == before
+    assert any("failover cleanup" in rec.getMessage()
+               for rec in caplog.records)
+
+
+def test_failover_concurrent_puts_are_serialized(app, monkeypatch):
+    setup = app.app.test_client()
+    for name in ("home", "backup"):
+        _create(setup, name=name)
+    states = [
+        {"enabled": True, "chain": ["home"], "auto_return": False},
+        {"enabled": True, "chain": ["backup"], "auto_return": True},
+    ]
+    real_save = app._save_json
+    guard = threading.Lock()
+    depth = 0
+    max_depth = 0
+    lock_missing = []
+    barrier = threading.Barrier(2)
+    errors = []
+
+    def slow_save(path, data):
+        nonlocal depth, max_depth
+        if not app._FAILOVER_LOCK.locked():
+            lock_missing.append(True)
+        with guard:
+            depth += 1
+            max_depth = max(max_depth, depth)
+        try:
+            time.sleep(0.05)  # даём второму писателю шанс войти без лока
+            real_save(path, data)
+        finally:
+            with guard:
+                depth -= 1
+
+    def put(payload):
+        try:
+            c = app.app.test_client()
+            barrier.wait(timeout=10)
+            r = c.put("/api/failover", headers=CSRF, json=payload)
+            if r.status_code != 200:
+                errors.append(f"status {r.status_code}")
+        except Exception as exc:  # noqa: BLE001 - любой сбой = провал теста
+            errors.append(f"{type(exc).__name__}: {exc}")
+
+    monkeypatch.setattr(app, "_save_json", slow_save)
+    threads = [threading.Thread(target=put, args=(s,)) for s in states]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=15)
+    assert not any(t.is_alive() for t in threads), "writer thread hung"
+    assert errors == []
+    assert lock_missing == []
+    assert max_depth == 1
+    raw = json.loads(app.FAILOVER_CONF.read_text())
+    assert raw in states
+    assert set(raw) == {"enabled", "chain", "auto_return"}
+
+
+def test_delete_preset_rewrites_failover_chain_on_disk(client, app):
+    _create(client, name="home")
+    _create(client, name="backup")
+    client.put("/api/failover", headers=CSRF,
+               json={"enabled": True, "chain": ["home", "backup"],
+                     "auto_return": True})
+    assert client.delete("/api/configs/backup", headers=CSRF).status_code == 200
+    raw = json.loads(app.FAILOVER_CONF.read_text())
+    assert raw == {"enabled": True, "chain": ["home"], "auto_return": True}
+    # пересоздание пресета с тем же именем не должно молча взвести цепочку
+    _create(client, name="backup")
+    assert client.get("/api/failover").get_json()["chain"] == ["home"]
+
+
+def test_delete_preset_reaps_stale_chain_names(client, app):
+    _create(client, name="home")
+    _create(client, name="backup")
+    app.FAILOVER_CONF.write_text(json.dumps(
+        {"enabled": True, "chain": ["home", "backup", "ghost"],
+         "auto_return": True}))
+    assert client.delete("/api/configs/backup", headers=CSRF).status_code == 200
+    stored = json.loads(app.FAILOVER_CONF.read_text())
+    assert stored["chain"] == ["home"]
+    assert stored["enabled"] is True and stored["auto_return"] is True
+    # пересоздание stale-имени не должно взвести его обратно
+    _create(client, name="ghost")
+    assert client.get("/api/failover").get_json()["chain"] == ["home"]
+
+
+def test_delete_preset_outside_chain_keeps_failover_conf(client, app):
+    _create(client, name="home")
+    _create(client, name="other")
+    client.put("/api/failover", headers=CSRF,
+               json={"enabled": True, "chain": ["home"], "auto_return": True})
+    before = app.FAILOVER_CONF.read_bytes()
+    assert client.delete("/api/configs/other", headers=CSRF).status_code == 200
+    assert app.FAILOVER_CONF.read_bytes() == before
+
+
+def test_failover_monitor_flag_from_env(conf_env, monkeypatch):
+    monkeypatch.setenv("NAIVEPANEL_FAILOVER", "0")
+    m = _reload()
+    m.CONF_D.mkdir(parents=True, exist_ok=True)
+    (m.CONF_D / "home.json").write_text(json.dumps(
+        {"name": "home", "listen": "127.0.0.1:1080"}))
+    m.FAILOVER_CONF.write_text(json.dumps(
+        {"enabled": True, "chain": ["home"], "auto_return": True}))
+    d = m.app.test_client().get("/api/failover").get_json()
+    assert d["monitor"] is False and d["enabled"] is False
+    assert d["auto_return"] is False
 
 
 def test_auto_return_after_streak_and_probe(client, app, monkeypatch):

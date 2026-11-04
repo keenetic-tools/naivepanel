@@ -220,6 +220,7 @@ _E2E_TRIM_EVERY = 100  # аппендов между обрезками буфе
 # основной, панель не возвращается сама — только вперёд (возврат ручной).
 # Штатный stop (маркер) и активный-вне-цепочки монитор не трогают.
 FAILOVER_CONF = NAIVEPROXY_DIR / "failover.json"
+_FAILOVER_LOCK = threading.Lock()  # PUT / delete / import: read-modify-write
 _FAILOVER_RAW = os.environ.get("NAIVEPANEL_FAILOVER", "1") or "1"
 FAILOVER_ENABLED = _FAILOVER_RAW.strip().lower() not in {"0", "no", "off", "false"}
 _FAILOVER_INTERVAL_RAW = os.environ.get("NAIVEPANEL_FAILOVER_INTERVAL", "30") or "30"
@@ -298,7 +299,7 @@ _ALLOWED_PROXY_SCHEMES = ("https://", "http://", "quic://")
 # такой пресет нельзя было бы получить через GET (роутинг отдаёт файл)
 RESERVED_NAMES = frozenset({"export", "import"})
 
-APP_VERSION = "0.16.0"
+APP_VERSION = "0.17.0"
 
 
 def _ensure_dirs() -> None:
@@ -1449,17 +1450,21 @@ def _load_failover_conf() -> dict[str, Any]:
     empty = {"enabled": False, "chain": [], "auto_return": False}
     try:
         data = json.loads(FAILOVER_CONF.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, ValueError):
         return empty
     if not isinstance(data, dict):
         return empty
     chain = data.get("chain")
-    if not isinstance(chain, list) or not all(isinstance(n, str) for n in chain):
+    if not isinstance(chain, list):
         chain = []
-    auto_return = data.get("auto_return")
-    return {"enabled": bool(data.get("enabled")) and bool(chain),
-            "chain": chain,
-            "auto_return": auto_return is True}
+    # stale/невалидные имена (в т.ч. попытки path traversal) не участвуют
+    chain = [n for n in chain
+             if isinstance(n, str) and NAME_RE.match(n)
+             and (CONF_D / f"{n}.json").exists()]
+    enabled = bool(data.get("enabled")) and bool(chain)
+    auto_return = data.get("auto_return") is True and enabled
+    return {"enabled": enabled, "chain": chain,
+            "auto_return": auto_return}
 
 
 def _preset_cfg(name: str) -> dict[str, Any] | None:
@@ -1514,7 +1519,9 @@ class _Failover:
             idle = None
         return {
             "enabled": FAILOVER_ENABLED and conf["enabled"],
+            "monitor": FAILOVER_ENABLED,
             "chain": conf["chain"],
+            "chain_max": FAILOVER_CHAIN_MAX,
             "active_index": idx,
             "threshold": self._threshold,
             "interval": FAILOVER_INTERVAL,
@@ -1527,7 +1534,7 @@ class _Failover:
             "last_ms": self._last_ms,
             "switches": self.switches,
             "returns": self.returns,
-            "auto_return": conf["auto_return"],
+            "auto_return": FAILOVER_ENABLED and conf["auto_return"],
             "return_watch": self._return_watch,
             "last_switch": self._last_switch,
             "idle": idle,
@@ -2285,6 +2292,27 @@ def api_configs_delete(name: str):
     if not path.exists():
         abort(404, description=f"preset {name!r} not found")
     path.unlink()
+    # цепочка фейловера не должна ссылаться ни на удалённый пресет, ни на
+    # прочие stale-имена: _load_failover_conf уже отфильтровывает всё, чего
+    # нет в conf.d. Пишем нормализованный конфиг только если он отличается
+    # от сырых значений — иначе не трогаем файл (в т.ч. битый).
+    with _FAILOVER_LOCK:
+        try:
+            raw = json.loads(FAILOVER_CONF.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            raw = None
+        if isinstance(raw, dict):
+            conf = _load_failover_conf()
+            stored = {"enabled": raw.get("enabled"),
+                      "chain": raw.get("chain"),
+                      "auto_return": raw.get("auto_return")}
+            if conf != stored:
+                try:
+                    _save_json(FAILOVER_CONF, conf)
+                except OSError as exc:
+                    app.logger.warning(
+                        "failover cleanup after deleting %s failed: %s",
+                        name, exc)
     return jsonify({"name": name, "deleted": True})
 
 
@@ -2362,11 +2390,18 @@ def api_configs_export():
             presets[p.stem] = _load_json(p)
         except Exception as exc:  # битый файл не должен ронять весь экспорт
             app.logger.warning("export: skipping %s: %s", p.name, exc)
+    fo = _load_failover_conf()
+    # цепочка должна ссылаться только на реально экспортированные пресеты:
+    # нечитаемый файл пропущен выше, и импорт такой цепочки провалился бы.
+    fo["chain"] = [n for n in fo["chain"] if n in presets]
+    fo["enabled"] = fo["enabled"] and bool(fo["chain"])
+    fo["auto_return"] = fo["auto_return"] and fo["enabled"]
     resp = jsonify({
         "format": 1,
         "version": APP_VERSION,
         "exported": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "presets": presets,
+        "failover": fo,
     })
     resp.headers["Content-Disposition"] = 'attachment; filename="naivepanel-presets.json"'
     resp.headers["Cache-Control"] = "no-store"  # ответ содержит секреты
@@ -2379,7 +2414,9 @@ def api_configs_import():
 
     Существующие имена НЕ перезаписываются (причина — в ответе), каждый
     пресет проходит _validate_cfg — файл мог быть отредактирован руками.
-    Лимит тела 256 КБ (MAX_CONTENT_LENGTH) покрывает ~сотни пресетов.
+    Блок failover применяется только на «пустой» цели: существующая цепочка
+    не перезаписывается. Лимит тела 256 КБ (MAX_CONTENT_LENGTH) покрывает
+    ~сотни пресетов.
     """
     data = request.get_json(silent=True) or {}
     incoming = data.get("presets")
@@ -2407,9 +2444,75 @@ def api_configs_import():
             continue
         _save_json(CONF_D / f"{name}.json", cfg)
         imported.append(name)
+    fo_res: dict[str, Any] = {"applied": False, "reason": "no failover block"}
+    incoming_fo = data.get("failover")
+    if incoming_fo is not None:
+        if not isinstance(incoming_fo, dict):
+            fo_res = {"applied": False, "reason": "failover: expected object"}
+        else:
+            enabled = incoming_fo.get("enabled", False)
+            chain = incoming_fo.get("chain")
+            reason = None
+            # Блокер-цель проверяем ДО разбора входящей цепочки: на роутере
+            # с рабочей цепочкой причина должна быть про цель, а не про
+            # случайный мусор в импортируемом файле.
+            if _load_failover_conf()["chain"]:
+                reason = "target already has a failover chain"
+            elif not isinstance(enabled, bool):
+                reason = "enabled must be boolean"
+            elif "auto_return" in incoming_fo and not isinstance(
+                    incoming_fo["auto_return"], bool):
+                reason = "auto_return must be boolean"
+            elif not isinstance(chain, list) or not all(
+                    isinstance(n, str) for n in chain):
+                reason = "failover chain must be a list of names"
+            elif len(chain) > FAILOVER_CHAIN_MAX:
+                reason = f"failover chain too long (max {FAILOVER_CHAIN_MAX})"
+            elif len(set(chain)) != len(chain):
+                reason = "failover chain has duplicates"
+            elif not all(NAME_RE.match(n) for n in chain):
+                reason = "failover chain has invalid preset names"
+            elif not enabled and not chain:
+                reason = "empty failover block"
+            elif enabled and not chain:
+                reason = "enabled failover needs a non-empty chain"
+            elif incoming_fo.get("auto_return") is True and not enabled:
+                # зеркало PUT: не понижаем молча в auto_return:false
+                reason = "auto_return requires enabled chain"
+            if reason is None:
+                available = {p.stem for p in CONF_D.glob("*.json")}
+                missing = [n for n in chain if n not in available]
+                if missing:
+                    reason = "unknown presets: " + ", ".join(missing)
+            if reason is not None:
+                fo_res = {"applied": False, "reason": reason}
+            else:
+                auto = incoming_fo.get("auto_return") is True
+                # check-and-set под локом: параллельный PUT не должен
+                # перезаписать уже существующую цепочку
+                with _FAILOVER_LOCK:
+                    if _load_failover_conf()["chain"]:
+                        fo_res = {"applied": False,
+                                  "reason": "target already has a failover chain"}
+                    else:
+                        # пресет мог исчезнуть после первой проверки —
+                        # существование перепроверяем прямо перед записью
+                        available = {p.stem for p in CONF_D.glob("*.json")}
+                        missing = [n for n in chain if n not in available]
+                        if missing:
+                            fo_res = {"applied": False,
+                                      "reason": "unknown presets: "
+                                                + ", ".join(missing)}
+                        else:
+                            _ensure_dirs()
+                            _save_json(FAILOVER_CONF,
+                                       {"enabled": enabled, "chain": chain,
+                                        "auto_return": auto})
+                            fo_res = {"applied": True, "reason": None}
     if imported:
         app.logger.info("import: created %s", ", ".join(imported))
-    return jsonify({"imported": imported, "skipped": skipped})
+    return jsonify({"imported": imported, "skipped": skipped,
+                    "failover": fo_res})
 
 
 @app.route("/api/probe", methods=["POST"])
@@ -2505,14 +2608,25 @@ def api_failover_put():
     """Задать цепочку: {"enabled": true, "chain": ["home", "backup"]}.
 
     Имена валидируются как у пресетов и проверяются на существование —
-    опечатка не должна остаться в цепочке до первого сбоя.
+    опечатка не должна остаться в цепочке до первого сбоя. Цепочка
+    валидируется и при enabled=false: сохранённая цепочка остаётся
+    рабочей для следующего включения. Если при выключении chain не
+    передан вовсе — сохраняется текущая (старые клиенты).
     """
     data = request.get_json(silent=True) or {}
-    enabled = bool(data.get("enabled"))
+    enabled = data.get("enabled", False)
+    if not isinstance(enabled, bool):
+        abort(400, description="enabled must be boolean")
     chain_raw = data.get("chain")
-    if enabled:
-        if not isinstance(chain_raw, list) or not chain_raw:
-            abort(400, description="chain required (non-empty list) when enabled")
+    # read-modify-write failover.json: chain-less PUT читает текущую цепочку,
+    # поэтому чтение, зависящая от неё валидация и запись — под одним локом.
+    with _FAILOVER_LOCK:
+        if chain_raw is None:
+            if enabled:
+                abort(400, description="chain required (non-empty list) when enabled")
+            chain_raw = _load_failover_conf()["chain"]
+        if not isinstance(chain_raw, list):
+            abort(400, description="chain must be a list")
         if len(chain_raw) > FAILOVER_CHAIN_MAX:
             abort(400, description=f"chain too long (max {FAILOVER_CHAIN_MAX})")
         seen: set[str] = set()
@@ -2524,28 +2638,29 @@ def api_failover_put():
             seen.add(name)
             if not (CONF_D / f"{name}.json").exists():
                 abort(404, description=f"preset {name!r} not found")
-    else:
-        chain_raw = []
-    auto_return = data.get("auto_return", False)
-    if not isinstance(auto_return, bool):
-        abort(400, description="auto_return must be boolean")
-    # авто-возврат осмыслен только с включённым фейловером
-    if auto_return and not enabled:
-        abort(400, description="auto_return requires enabled chain")
-    _ensure_dirs()
-    _save_json(FAILOVER_CONF, {"enabled": enabled, "chain": chain_raw,
-                               "auto_return": auto_return})
+        if enabled and not chain_raw:
+            abort(400, description="chain required (non-empty list) when enabled")
+        auto_return = data.get("auto_return", False)
+        if not isinstance(auto_return, bool):
+            abort(400, description="auto_return must be boolean")
+        # авто-возврат осмыслен только с включённым фейловером
+        if auto_return and not enabled:
+            abort(400, description="auto_return requires enabled chain")
+        _ensure_dirs()
+        _save_json(FAILOVER_CONF, {"enabled": enabled, "chain": chain_raw,
+                                   "auto_return": auto_return})
     return jsonify(_failover.snapshot())
 
 
 @app.route("/api/failover", methods=["DELETE"])
 def api_failover_delete():
-    try:
-        FAILOVER_CONF.unlink()
-    except FileNotFoundError:
-        pass
-    except OSError as exc:
-        abort(500, description=f"cannot remove failover.json: {exc}")
+    with _FAILOVER_LOCK:
+        try:
+            FAILOVER_CONF.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            abort(500, description=f"cannot remove failover.json: {exc}")
     return jsonify(_failover.snapshot())
 
 

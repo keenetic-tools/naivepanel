@@ -130,6 +130,8 @@
   ul.presets .del { background:none; border:none; color:var(--err); cursor:pointer;
                     padding:4px 6px; border-radius:6px; }
   ul.presets .act:hover, ul.presets .del:hover { background:var(--hov); }
+  ul.presets .act:disabled, ul.presets .del:disabled { opacity:.35; cursor:default; }
+  ul.presets .act:disabled:hover, ul.presets .del:disabled:hover { background:none; }
   /* Пустое состояние списка — мягкая заглушка вместо голого текста */
   .empty { text-align:center; color:var(--mut); font-size:13px; padding:26px 12px;
            border:1px dashed var(--border); border-radius:10px; }
@@ -171,18 +173,6 @@
   textarea { min-height:120px; resize:vertical; }
   .row { display:flex; gap:8px; flex-wrap:wrap; margin-top:14px; }
   .actions { display:flex; gap:8px; flex-wrap:wrap; margin-top:14px; }
-  .fochips { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; }
-  .fochip { display:inline-flex; align-items:center; gap:5px; padding:4px 6px 4px 10px;
-            border:1px solid var(--border); border-radius:14px; font-size:12px;
-            background:var(--card); }
-  .fochip.act { border-color:var(--acc); background:var(--acc-tint); }
-  .fochip .pos { color:var(--acc); font-weight:600; white-space:nowrap; }
-  .fochip .onb { color:var(--acc); font-size:10px; border:1px solid var(--acc);
-                 border-radius:8px; padding:0 5px; line-height:16px; white-space:nowrap; }
-  .fochip .mini { border:none; background:none; color:var(--mut); cursor:pointer;
-                  padding:0 2px; font-size:12px; line-height:1; }
-  .fochip .mini:hover:not(:disabled) { color:var(--fg); }
-  .fochip .mini:disabled { opacity:.25; cursor:default; }
   pre.log { background:var(--log-bg); color:var(--log-fg); padding:12px; border:1px solid var(--border);
             border-radius:10px; box-shadow:inset 0 1px 4px rgba(0,0,0,.12);
             max-height:260px; overflow:auto; font:12px/1.55 ui-monospace,Menlo,monospace;
@@ -262,6 +252,23 @@
               title="Загрузить пресеты из ранее экспортированного JSON">Импорт</button>
       <input type="file" id="importFile" accept=".json,application/json" style="display:none" aria-hidden="true" tabindex="-1">
     </div>
+    <h2 class="sect">Фейловер <span id="foCount" class="hint"></span></h2>
+    <div id="foInfo" style="font-size:12px;color:var(--mut);margin-top:8px">фейловер: …</div>
+    <div class="actions" style="margin-top:8px">
+      <button class="ghost" data-action="foOrder" id="btnFoOrder"
+              aria-pressed="false"
+              title="Показать цепочку в порядке приоритета и включить ↑↓">Порядок</button>
+      <button class="ghost" data-action="foAll" id="btnFoAll"
+              title="Добавить все пресеты в цепочку (не больше 8)">Все в цепочку</button>
+    </div>
+    <label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--mut);margin-top:10px;cursor:pointer">
+      <input type="checkbox" id="foEnabled" aria-label="Автофейловер включён" disabled>
+      автофейловер включён
+    </label>
+    <label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--mut);margin-top:6px;cursor:pointer">
+      <input type="checkbox" id="foAuto" aria-label="Возвращать на основной" disabled>
+      возвращать на основной
+    </label>
   </section>
 
   <section class="card" style="grid-area:main">
@@ -344,27 +351,6 @@
 
   <section class="card" style="grid-area:ops">
     <h2>Обслуживание</h2>
-    <div id="foInfo" style="font-size:12px;color:var(--mut)">фейловер: проверка…</div>
-    <div id="foChips" class="fochips"></div>
-    <div class="actions" style="margin-top:8px">
-      <select id="foPick" aria-label="Добавить пресет в цепочку фейловера"
-              style="flex:1;min-width:140px"></select>
-      <button class="ghost" data-action="foAdd" id="btnFoAdd"
-              title="Добавить выбранный пресет в конец цепочки (следующий по приоритету)">Добавить</button>
-    </div>
-    <div class="actions" style="margin-top:8px">
-      <button class="ghost" data-action="foAll" id="btnFoAll"
-              title="Добавить в цепочку все пресеты в порядке списка — подходящий старт, порядок потом поправьте ↑↓">Собрать из всех</button>
-      <button class="ghost" data-action="foSave" id="btnFoSave"
-              title="Сохранить цепочку и включить автофейловер. Первый пресет — основной, при сбоях переключение вперёд">Включить</button>
-      <button class="ghost" data-action="foOff" id="btnFoOff" hidden
-              title="Выключить автофейловер (цепочка удалится)">Выключить</button>
-    </div>
-    <label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--mut);margin-top:10px;cursor:pointer">
-      <input type="checkbox" id="foAuto" aria-label="Авто-возврат на основной">
-      возвращать на основной, когда ожил
-      <span class="hint" style="font-size:10px;color:var(--mut)">(TCP N подряд → проба E2E)</span>
-    </label>
     <h2 class="sect">Бинарник naive</h2>
     <div id="nvInfo" style="font-size:12px;color:var(--mut);margin-top:10px">бинарник: проверка…</div>
     <div class="actions" style="margin-top:8px">
@@ -633,15 +619,22 @@ function fmtUptime(s) {
 }
 
 function renderStatus(st) {
-  // смена активного пресета (в т.ч. автофейловером) отражается на чипах
+  // смена активного пресета (в т.ч. автофейловером) отражается в списке пресетов
   if (st.current !== activeName) { activeName = st.current; foRerender(); }
   // а свежие цифры фейловера приходят в каждом статусе — обновляем строку,
   // не дожидаясь GET /api/failover (баг v0.13.0: «актив 1/3» висел после
   // автопереключения до перезагрузки страницы)
   if (st.failover) {
-    const line = foInfoLine(st.failover);
-    $('foInfo').textContent = line.text;
-    $('foInfo').title = line.title;
+    const f = st.failover;
+    const changed = !foEq(f.chain || [], foChainArr)
+      || !!f.enabled !== foEnabled || !!f.auto_return !== foAutoReturn;
+    if (!foBusy && changed) applyFailover(f);
+    else {
+      foLast = f;
+      const line = foInfoLine(f);
+      $('foInfo').textContent = line.text;
+      $('foInfo').title = line.title;
+    }
   }
   if (st.notify) {
     $('ntInfo').textContent = 'уведомления: '+
@@ -748,11 +741,52 @@ async function pollStatus() {
 
 let lastPresets = []; // кэш для перерисовки при смене selected/поиска без запроса
 
+function orderedPresets(presets) {
+  if (!foOrderMode) return presets;
+  const chain = foChainArr
+    .map(n => presets.find(p => p.name === n)).filter(Boolean);
+  const rest = presets.filter(p => !foChainArr.includes(p.name));
+  return chain.concat(rest);
+}
+
+function captureFocus() {
+  const el = document.activeElement;
+  if (!el) return null;
+  // чекбоксы (и прочие элементы с id) переживают перерисовку списка: их
+  // disabled на время PUT снимает фокус, поэтому запоминаем именно id
+  if (el.id) return {id: el.id};
+  return el.dataset && el.dataset.action
+    ? {action: el.dataset.action, arg: el.dataset.arg || ''} : null;
+}
+
+function restoreFocus(f) {
+  if (!f) return;
+  const byAction = (action) => [...document.querySelectorAll('[data-action]')]
+    .find(e => e.dataset.action === action && (e.dataset.arg || '') === f.arg);
+  let el = f.id ? document.getElementById(f.id) : byAction(f.action);
+  if (!el) return;
+  // id-captured кнопка могла сама выключиться после PUT (например «Вся
+  // цепочка» при заполнении): без этого фокус падал бы на <body>. Уводим
+  // на «Порядок», он доступен при непустой цепочке или включённом режиме.
+  if (el.disabled && f.id) {
+    const order = document.getElementById('btnFoOrder');
+    if (order && !order.disabled) el = order;
+  }
+  // на краях цепочки стрелка disabled — фокус уводим на соседнюю стрелку,
+  // иначе на ⛓: иначе после PUT фокус падал бы на <body>
+  if (el.disabled && (f.action === 'foUp' || f.action === 'foDown')) {
+    const other = byAction(f.action === 'foUp' ? 'foDown' : 'foUp');
+    el = (other && !other.disabled) ? other : (byAction('foToggle') || el);
+  }
+  if (!el.disabled) el.focus();
+}
+
 function renderPresets(presets) {
   lastPresets = presets;
+  const ordered = orderedPresets(presets);
   const q = ($('search').value || '').trim().toLowerCase();
-  const shown = q ? presets.filter(p =>
-    (p.name + ' ' + (p.proxy || '')).toLowerCase().includes(q)) : presets;
+  const shown = q ? ordered.filter(p =>
+    (p.name + ' ' + (p.proxy || '')).toLowerCase().includes(q)) : ordered;
   const ul = $('presets'); ul.setAttribute('aria-busy','false'); ul.innerHTML = '';
   if (!shown.length) {
     const search = presets.length;
@@ -767,19 +801,45 @@ function renderPresets(presets) {
   }
   for (const p of shown) {
     const li = document.createElement('li');
-    li.className = (p.active ? 'active' : '') + (p.name === current ? ' selected' : '');
+    // активность берём из свежего /api/status (activeName), а p.active —
+    // запасной вариант до первого статуса: автопереключение и авто-возврат
+    // должны подсвечиваться сразу, без перезапроса списка
+    const isActive = activeName ? p.name === activeName : p.active;
+    li.className = (isActive ? 'active' : '') + (p.name === current ? ' selected' : '');
     // односторочная строка: имя + бейджи + замаскированный proxy с ellipsis;
     // полный URI — в title (proxy уже без пароля, маска только для UI)
     const masked = p.proxy.replace(/:\/\/[^@]+@/, '://***@');
+    const idx = foChainArr.indexOf(p.name);
+    const role = idx === 0
+      ? '<span class="badge" title="Основной в цепочке">осн.</span>'
+      : (idx > 0
+          ? '<span class="badge" title="Резерв ' + (idx + 1) + '">№' + (idx + 1) + '</span>'
+          : (foOrderMode ? '<span class="badge" title="Вне цепочки">—</span>' : ''));
+    const full = idx < 0 && foChainArr.length >= FO_CHAIN_MAX;
+    const updown = foOrderMode && idx >= 0
+      ? '<button class="act" data-action="foUp" data-arg="' + escapeHtml(p.name) + '" aria-label="Выше ' + escapeHtml(p.name) + '" title="Выше"' + (idx === 0 || foBusy ? ' disabled' : '') + '>↑</button>'
+        + '<button class="act" data-action="foDown" data-arg="' + escapeHtml(p.name) + '" aria-label="Ниже ' + escapeHtml(p.name) + '" title="Ниже"' + (idx === foChainArr.length - 1 || foBusy ? ' disabled' : '') + '>↓</button>'
+      : '';
+    const chainTitle = full ? 'Цепочка заполнена (' + FO_CHAIN_MAX + ')'
+      : (idx >= 0 ? 'Убрать из цепочки' : 'Добавить в цепочку');
+    const chainBtn = '<button class="act" data-action="foToggle" data-arg="' + escapeHtml(p.name) + '"'
+      + (idx >= 0
+          ? ' aria-label="Убрать ' + escapeHtml(p.name) + ' из цепочки"'
+          : ' aria-label="Добавить ' + escapeHtml(p.name) + ' в цепочку"')
+      + ' aria-pressed="' + (idx >= 0) + '" title="' + chainTitle + '"'
+      + (foBusy || full ? ' disabled' : '') + '>⛓</button>';
     li.innerHTML = '<button class="sel" '+(p.name === current ? 'aria-current="true" ' : '')
       + 'data-action="select" data-arg="'+escapeHtml(p.name)+'">'
       + '<span class="name" title="'+escapeHtml(p.name)+'">'+escapeHtml(p.name)+'</span>'
-      + (p.active ? '<span class="badge">активен</span>' : '')
+      + (isActive ? '<span class="badge">активен</span>' : '')
+      + role
       + (p.listen_count > 1 ? '<span class="badge listen" title="слушает '+p.listen_count+' адреса(ов)">×'+p.listen_count+'</span>' : '')
       + '<span class="proxy" title="'+escapeHtml(masked)+'">'+escapeHtml(masked)+'</span>'
       + '</button>'
       + '<span class="acts">'
-      + (!p.active ? '<button class="act" aria-label="Активировать '+escapeHtml(p.name)+'" title="Активировать" data-action="activate" data-arg="'+escapeHtml(p.name)+'">→</button>' : '')
+      + updown
+      + chainBtn
+      + (!isActive ? '<button class="act" aria-label="Активировать '+escapeHtml(p.name)+'" title="Активировать" data-action="activate" data-arg="'+escapeHtml(p.name)+'">→</button>' : '')
       + '<button class="act" aria-label="Дублировать '+escapeHtml(p.name)+'" title="Дублировать (пароль переносится)" data-action="duplicate" data-arg="'+escapeHtml(p.name)+'">⧉</button>'
       + '<button class="del" aria-label="Удалить '+escapeHtml(p.name)+'" title="Удалить" data-action="del" data-arg="'+escapeHtml(p.name)+'">✕</button>'
       + '</span>';
@@ -930,150 +990,158 @@ function fmtSpan(s) {
   return m ? m+'м' : '<1м';
 }
 
-// Фейловер: цепочка «основной → запасные» собирается чипами (без ввода
-// имён руками: select знает существующие пресеты, дубли исключены). Правки
-// локальные до кнопки «Включить/Сохранить»; монитор панели делает
+// Фейловер: цепочка «основной → запасные» правится прямо из строк пресетов
+// (⛓), порядок — режимом «Порядок» (↑↓). Каждое изменение сразу уходит PUT
+// /api/failover: без черновиков и кнопки «Сохранить». Монитор панели делает
 // E2E-проверку активного пресета и после порога неудач подряд переключает
-// на следующий; назад, на основной — только вручную (активация как обычно).
-let foChainArr = [];    // редактируемая цепочка (сохраняется кнопкой)
-let foSavedChain = [];  // последняя сохранённая на сервере
-let foAutoReturn = false;   // чекбокс «возвращать на основной» (локально до Сохранить)
-let foAutoSaved = false;
-let foLast = null;      // последний ответ /api/failover (для перерисовки)
-let activeName = null;  // активный пресет (из /api/status)
+// на следующий; назад, на основной — только вручную или авто-возвратом.
+let foChainArr = [];       // эффективная цепочка с сервера
+let foEnabled = false;     // фейловер включён
+let foAutoReturn = false;  // авто-возврат
+let foOrderMode = false;   // режим отображения «Порядок» (не сохраняется)
+let foBusy = false;        // идёт PUT — контролы заблокированы
+let foLast = null;         // последний ответ /api/failover (для перерисовки)
+let activeName = null;     // активный пресет (из /api/status)
+
+let FO_CHAIN_MAX = 8; // дефолт; реальный предел приходит с сервера (chain_max)
 
 const foEq = (a, b) => a.length === b.length && a.every((v, i) => v === b[i]);
 
+function applyFailover(d) {
+  foLast = d;
+  if (d.chain_max) FO_CHAIN_MAX = d.chain_max;
+  foChainArr = Array.isArray(d.chain) ? d.chain.slice() : [];
+  foEnabled = !!d.enabled;
+  foAutoReturn = !!d.auto_return;
+  renderFailover(d);
+  renderPresets(lastPresets);
+}
+
 async function loadFailover() {
-  try {
-    const d = await jget('/api/failover');
-    foLast = d;
-    // цепочка с сервера — истина; локальные правки держим, пока не сохранят
-    const hadEdits = !foEq(foChainArr, foSavedChain) || foAutoReturn !== foAutoSaved;
-    foSavedChain = d.chain;
-    foAutoSaved = !!d.auto_return;
-    if (!hadEdits) { foChainArr = d.chain.slice(); foAutoReturn = foAutoSaved; }
-    renderFailover(d);
-  } catch (e) { /* тихо: секция некритична, ошибка всплывёт в статусе */ }
+  if (foBusy) return;  // не затирать состояние, пока летит PUT
+  try { applyFailover(await jget('/api/failover')); }
+  catch (e) { /* transient */ }
 }
 
 // Строкa статуса фейловера как чистая функция: её же дёргает 3-секундный
 // поллинг из renderStatus — после АВТОпереключения цифры (актив N/M, fails,
-// ok, переключений) должны оживать без перезагрузки страницы. Чипы и select
-// при этом НЕ перерисовываются: открытый dropdown не должен закрываться.
+// ok, переключений) должны оживать без перезагрузки страницы.
 function foInfoLine(d) {
-  const inChain = new Set(foChainArr);
-  let t = d.enabled || foChainArr.length
-    ? 'цепочка: '+(foChainArr.length ? foChainArr.join(' → ') : '—') : 'выкл';
-  const dirty = !foEq(foChainArr, foSavedChain) || foAutoReturn !== foAutoSaved;
-  if (!d.enabled && !dirty) t = 'выкл';
-  if (d.enabled && d.idle) t += ' · пауза: '+d.idle;
+  const chain = d.chain || [];
+  let t;
+  if (!d.monitor) t = 'монитор выключен в panel.conf';
+  else if (!chain.length) t = 'выкл, цепочка пуста';
+  else if (!d.enabled) t = 'выкл, цепочка: ' + chain.join(' → ');
   else {
-    // актив/ok показываем только вне паузы: причина паузы может быть от
-    // прошлого цикла монитора, и «актив 2/2» рядом с ней противоречит
-    if (d.enabled && !dirty && d.active_index != null)
-      t += ' · актив '+(d.active_index+1)+'/'+d.chain.length;
-    if (d.enabled && !dirty && d.last_ok != null)
-      t += d.last_ok ? ' · ok' : ' · НЕ проходит ('+d.fails+'/'+d.threshold+')';
+    t = 'вкл, цепочка: ' + chain.join(' → ');
+    if (d.idle) t += ' · пауза: ' + d.idle;
+    else {
+      if (d.active_index != null) t += ' · актив ' + (d.active_index + 1) + '/' + chain.length;
+      if (d.last_ok != null) t += d.last_ok ? ' · ok' : ' · НЕ проходит (' + d.fails + '/' + d.threshold + ')';
+    }
+    if (d.probing_fast && d.last_ok === false) t += ' · частые проверки';
+    if (d.switches) t += ' · переключений: ' + d.switches;
+    if (d.auto_return) {
+      if (d.return_watch) t += ' · ждём возврата: ' + d.return_watch.name + ' ' + d.return_watch.streak + '/' + d.return_watch.need;
+      if (d.returns) t += ' · возвратов: ' + d.returns;
+    }
+    if (activeName && !chain.includes(activeName))
+      t += ' · активный вне цепочки';
   }
-  if (d.enabled && d.probing_fast && d.last_ok === false) t += ' · частые проверки';
-  if (d.enabled && d.switches) t += ' · переключений: '+d.switches;
-  if (d.enabled && !dirty && d.auto_return) {
-    if (d.return_watch)
-      t += ' · ждём возврата: '+d.return_watch.name+' '+d.return_watch.streak+'/'+d.return_watch.need;
-    if (d.returns) t += ' · возвратов: '+d.returns;
-  }
-  if (dirty) t += ' · НЕ СОХРАНЕНО';
-  if (d.enabled && activeName && foChainArr.length && !inChain.has(activeName))
-    t += ' · активный вне цепочки — монитор не следит';
-  return {text: 'фейловер: '+t, title: d.last_error ? String(d.last_error) : ''};
+  return {text: 'фейловер: ' + t,
+          title: d.last_error ? String(d.last_error) : ''};
 }
 
 function renderFailover(d) {
-  // чипы цепочки: первый — основной, активный подсвечен
-  const box = $('foChips');
-  box.innerHTML = foChainArr.length ? foChainArr.map((n, i) => {
-    const act = n === activeName;
-    return '<span class="fochip'+(act ? ' act' : '')+'">'
-      + '<span class="pos">'+(i === 0 ? 'основной' : (i+1))+'</span>'
-      + escapeHtml(n)
-      + (act ? '<span class="onb">активен</span>' : '')
-      + '<button class="mini" data-action="foUp" data-arg="'+escapeHtml(n)+'" title="Выше по приоритету"'+(i === 0 ? ' disabled' : '')+'>↑</button>'
-      + '<button class="mini" data-action="foDown" data-arg="'+escapeHtml(n)+'" title="Ниже по приоритету"'+(i === foChainArr.length-1 ? ' disabled' : '')+'>↓</button>'
-      + '<button class="mini" data-action="foDel" data-arg="'+escapeHtml(n)+'" title="Убрать из цепочки">×</button>'
-      + '</span>';
-  }).join('') : '<span style="font-size:12px;color:var(--mut)">пусто — добавьте пресеты; первый станет основным</span>';
-  // выбор: только пресеты вне цепочки, с замаскированным upstream для различия
-  const inChain = new Set(foChainArr);
-  const avail = lastPresets.filter(p => !inChain.has(p.name));
-  $('foPick').innerHTML = avail.length
-    ? avail.map(p => '<option value="'+escapeHtml(p.name)+'">'+escapeHtml(p.name)+' · '+escapeHtml(p.proxy)+'</option>').join('')
-    : '<option value="" disabled>'+(lastPresets.length ? 'все пресеты уже в цепочке' : 'пресетов пока нет — создайте в списке слева')+'</option>';
-  $('btnFoAdd').disabled = !avail.length;
-  $('btnFoAll').disabled = !(avail.length);
-  const save = $('btnFoSave');
-  save.textContent = d.enabled ? 'Сохранить' : 'Включить';
-  save.disabled = !foChainArr.length;
-  $('btnFoOff').hidden = !d.enabled;
-  $('foAuto').checked = foAutoReturn;
-  $('foAuto').disabled = !foChainArr.length;
+  d = d || {chain: [], enabled: false, auto_return: false, monitor: true};
+  const chain = d.chain || [];
+  $('foCount').textContent = chain.length + ' из ' + lastPresets.length;
   const line = foInfoLine(d);
   $('foInfo').textContent = line.text;
   $('foInfo').title = line.title;
+  $('foEnabled').disabled = !d.monitor || foBusy || !chain.length;
+  if (!foBusy) $('foEnabled').checked = !!d.enabled;
+  $('foAuto').disabled = !d.enabled || !chain.length || foBusy;
+  if (!foBusy) $('foAuto').checked = !!d.auto_return;
+  const order = $('btnFoOrder');
+  order.textContent = foOrderMode ? 'Готово' : 'Порядок';
+  order.setAttribute('aria-pressed', foOrderMode ? 'true' : 'false');
+  order.disabled = foBusy || (!chain.length && !foOrderMode);
+  $('btnFoAll').disabled = foBusy
+    || chain.length >= FO_CHAIN_MAX
+    || !lastPresets.some(p => !chain.includes(p.name));
 }
 
-function foRerender() { if (foLast) renderFailover(foLast); }
+async function foSaveState(enabled, chain, auto) {
+  if (foBusy) return;
+  const focus = captureFocus();
+  foBusy = true;
+  renderFailover(foLast);
+  renderPresets(lastPresets);
+  try {
+    applyFailover(await jput('/api/failover',
+      {enabled: enabled, chain: chain, auto_return: auto}));
+  } catch (e) {
+    flash(e.message, false);
+    foBusy = false;  // иначе loadFailover() ниже выйдет по своему guard'у
+    await loadFailover();
+  } finally {
+    foBusy = false;
+    renderFailover(foLast);
+    renderPresets(lastPresets);
+    restoreFocus(focus);
+  }
+}
 
-function foAdd() {
-  const v = $('foPick').value;
-  if (!v) return;
-  foChainArr.push(v);
-  foRerender();
+async function foToggle(name) {
+  if (foBusy) return;
+  const inChain = foChainArr.includes(name);
+  if (!inChain && foChainArr.length >= FO_CHAIN_MAX) {
+    flash('В цепочке уже ' + FO_CHAIN_MAX + ' пресетов', false);
+    return;
+  }
+  if (inChain && name === activeName) {
+    const ok = await askConfirm(
+      'Активный пресет выйдет из цепочки — автофейловер не будет его защищать. Продолжить?',
+      {ok: 'Убрать', danger: true});
+    if (!ok) return;
+  }
+  const chain = inChain
+    ? foChainArr.filter(n => n !== name) : foChainArr.concat(name);
+  const enabled = foEnabled && chain.length > 0;
+  await foSaveState(enabled, chain, enabled ? foAutoReturn : false);
 }
-function foAll() {
-  // все пресеты, которых ещё нет в цепочке, в порядке списка
-  for (const p of lastPresets) if (!foChainArr.includes(p.name)) foChainArr.push(p.name);
-  foRerender();
-}
-function foMove(name, dir) {
+
+async function foMove(name, dir) {
+  if (foBusy) return;
   const i = foChainArr.indexOf(name), j = i + dir;
   if (i < 0 || j < 0 || j >= foChainArr.length) return;
-  [foChainArr[i], foChainArr[j]] = [foChainArr[j], foChainArr[i]];
-  foRerender();
+  const chain = foChainArr.slice();
+  [chain[i], chain[j]] = [chain[j], chain[i]];
+  await foSaveState(foEnabled, chain, foEnabled ? foAutoReturn : false);
 }
-function foDel(name) {
-  foChainArr = foChainArr.filter(n => n !== name);
-  foRerender();
+
+async function foAll() {
+  if (foBusy) return;
+  const add = lastPresets.map(p => p.name)
+    .filter(n => !foChainArr.includes(n));
+  let chain = foChainArr.concat(add);
+  if (chain.length > FO_CHAIN_MAX) {
+    chain = chain.slice(0, FO_CHAIN_MAX);
+    flash('В цепочку влезли первые ' + FO_CHAIN_MAX + ' пресетов', false);
+  }
+  await foSaveState(foEnabled, chain, foEnabled ? foAutoReturn : false);
 }
-async function saveFailover() {
-  const btn = $('btnFoSave');
-  btn.disabled = true;
-  try {
-    const d = await jput('/api/failover',
-                         {enabled: true, chain: foChainArr, auto_return: foAutoReturn});
-    foLast = d;
-    foSavedChain = d.chain;
-    foAutoSaved = !!d.auto_return;
-    foChainArr = d.chain.slice();
-    foAutoReturn = foAutoSaved;
-    renderFailover(d);
-    flash('Фейловер: цепочка '+foChainArr.join(' → ')+(d.auto_return ? ' + авто-возврат' : ''), true);
-  } catch (e) { flash(e.message, false); }
-  finally { foRerender(); btn.disabled = !foChainArr.length; }
+
+function foToggleOrder() {
+  foOrderMode = !foOrderMode;
+  renderFailover(foLast);
+  renderPresets(lastPresets);
 }
-async function offFailover() {
-  if (!(await askConfirm('Выключить автофейловер? Цепочка будет удалена.',
-                         {ok:'Выключить', danger:true}))) return;
-  try {
-    const d = await jdel('/api/failover');
-    foLast = d;
-    foChainArr = [];
-    foSavedChain = [];
-    foAutoReturn = false;
-    foAutoSaved = false;
-    renderFailover(d);
-    flash('Фейловер выключен', true);
-  } catch (e) { flash(e.message, false); }
+
+function foRerender() {
+  renderFailover(foLast);
+  renderPresets(lastPresets);
 }
 
 // Правдивые сообщения о применении: restart.rc отдаёт PUT активного пресета
@@ -1639,8 +1707,16 @@ $('importFile').addEventListener('change', async () => {
     const d = await jpost('/api/configs/import', JSON.parse(await f.text()));
     const parts = ['импортировано: ' + (d.imported.join(', ') || '—')];
     for (const s of d.skipped) parts.push('пропущен ' + s.name + ' — ' + s.reason);
-    flash(parts.join('\n'), d.imported.length > 0, 12000);
-    if (d.imported.length) await refreshAll();
+    // блок фейловера в файле — часть импорта: показываем, применился ли он
+    let tail = '';
+    if (d.failover && d.failover.applied) tail = ' · фейловер: применён';
+    else if (d.failover && d.failover.reason
+             && d.failover.reason !== 'no failover block')
+      tail = ' · фейловер: ' + d.failover.reason;
+    const foApplied = !!(d.failover && d.failover.applied);
+    flash(parts.join('\n') + tail, d.imported.length > 0 || foApplied, 12000);
+    // failover-only импорт тоже должен появиться сразу, не ждём поллинг
+    if (d.imported.length || foApplied) await refreshAll();
   } catch (e) { flash('Импорт не удался: ' + e.message, false); }
 });
 
@@ -1702,13 +1778,11 @@ const ACTIONS = {
   newPreset: () => newPreset(),
   closeEditor: () => closeEditor(),
   import: () => $('importFile').click(),
-  foSave: () => saveFailover(),
-  foOff: () => offFailover(),
-  foAdd: () => foAdd(),
+  foOrder: () => foToggleOrder(),
+  foToggle: (arg) => foToggle(arg),
   foAll: () => foAll(),
   foUp: (arg) => foMove(arg, -1),
   foDown: (arg) => foMove(arg, 1),
-  foDel: (arg) => foDel(arg),
   panelRestart: () => panelRestart(),
   updateCheck: () => checkUpdate(true),
   updateApply: () => applyUpdate(),
@@ -1747,7 +1821,14 @@ document.addEventListener('click', (e) => {
 });
 
 $('editor').addEventListener('submit', save);
-$('foAuto').addEventListener('change', () => { foAutoReturn = $('foAuto').checked; foRerender(); });
+$('foEnabled').addEventListener('change', (e) => {
+  if (!foChainArr.length) { e.target.checked = false; return; }
+  foSaveState(e.target.checked, foChainArr,
+              e.target.checked ? foAutoReturn : false);
+});
+$('foAuto').addEventListener('change', (e) => {
+  foSaveState(foEnabled, foChainArr, e.target.checked);
+});
 
 renderLogSrc();
 refreshAll();
