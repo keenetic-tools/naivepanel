@@ -376,8 +376,12 @@
     <div class="actions" style="margin-top:10px">
       <button class="ghost wide" data-action="panelRestart" title="Перезапуск веб-панели (после обновления файлов)">Перезапуск</button>
     </div>
+    <div class="actions" style="margin-top:8px">
+      <button class="ghost wide" data-action="pwOpen" id="btnPwChange" hidden
+              title="Сменить пароль текущего администратора (без SSH)">Сменить пароль…</button>
+    </div>
     <div id="ntInfo" style="font-size:12px;color:var(--mut);margin-top:10px"
-         title="Настройка — panel.conf: NAIVEPANEL_TG_TOKEN + NAIVEPANEL_TG_CHAT (Telegram) или NAIVEPANEL_NOTIFY_URL (webhook). Секреты хранятся только там">уведомления: …</div>
+         title="Уведомления: настраиваются ниже — токен бота и chat_id, либо webhook в panel.conf (NAIVEPANEL_NOTIFY_URL)">уведомления: …</div>
     <div id="updInfo" style="font-size:12px;color:var(--mut);margin-top:12px">обновления: проверка…</div>
     <div class="actions" style="margin-top:8px">
       <button class="ghost" data-action="updateCheck" title="Сверить версию панели с последним релизом GitHub">Проверить обновления</button>
@@ -389,6 +393,24 @@
       <button class="ghost" data-action="rollbackOpen"
               title="Откат панели или бинарника naive на сохранённую версию — без SSH">Откат версий…</button>
     </div>
+    <h2 class="sect">Уведомления</h2>
+    <form id="tgForm" style="margin-top:10px">
+      <div id="tgInfo" style="font-size:12px;color:var(--mut)">Telegram: …</div>
+      <label style="display:block;font-size:12px;color:var(--mut);margin-top:10px">Токен бота
+        <input type="password" id="tgToken" autocomplete="off"
+               style="width:100%;margin-top:4px"></label>
+      <label style="display:block;font-size:12px;color:var(--mut);margin-top:10px">chat_id
+        <input id="tgChat" placeholder="123456789 или @channel"
+               style="width:100%;margin-top:4px"></label>
+      <p id="tgMsg" class="hint" role="status" style="min-height:16px;margin:10px 0 0"></p>
+      <div class="actions">
+        <button type="submit" id="btnTgSave">Сохранить</button>
+        <button type="button" class="ghost" id="btnTgTest"
+                data-action="tgTest" hidden>Отправить тест</button>
+        <button type="button" class="danger" id="btnTgOff"
+                data-action="tgOff" hidden>Отключить</button>
+      </div>
+    </form>
   </section>
 </main>
 <dialog id="confirmDlg" aria-labelledby="confirmMsg">
@@ -433,12 +455,32 @@
     <button id="btnRbDo" data-action="rbDo" title="Откатить панель на выбранную версию">Откатить</button>
   </div>
 </dialog>
+<dialog id="pwDlg" aria-labelledby="pwTitle">
+  <p id="pwTitle" style="margin:0;font-weight:600">Смена пароля</p>
+  <form id="pwForm" style="margin-top:12px">
+    <label style="display:block;font-size:12px;color:var(--mut)">Текущий пароль
+      <input type="password" id="pwCurrent" autocomplete="current-password"
+             required style="width:100%;margin-top:4px"></label>
+    <label style="display:block;font-size:12px;color:var(--mut);margin-top:10px">Новый пароль
+      <input type="password" id="pwNew" autocomplete="new-password"
+             required style="width:100%;margin-top:4px"></label>
+    <label style="display:block;font-size:12px;color:var(--mut);margin-top:10px">Повторите новый
+      <input type="password" id="pwRepeat" autocomplete="new-password"
+             required style="width:100%;margin-top:4px"></label>
+    <p id="pwMsg" class="hint" role="status" style="min-height:16px;margin:10px 0 0"></p>
+    <div class="dlg-actions">
+      <button type="button" class="ghost" data-action="pwClose">Отмена</button>
+      <button type="submit" id="btnPwSave">Сменить</button>
+    </div>
+  </form>
+</dialog>
 <div id="toasts"></div>
 
 <script nonce="{{ csp_nonce }}">
 const $ = (id) => document.getElementById(id);
 let current = null; // выбранный пресет (имя) или null
 let dirty = false;  // есть несохранённые правки в редакторе
+let authChanged = false; // пароль сменён: поллинг старыми кредами не шлём
 
 const CSRF = {'X-Requested-With': 'naivepanel'}; // мутации без него сервер отбивает 403
 
@@ -534,6 +576,37 @@ function askConfirm(message, opts = {}) {
   });
 }
 
+function openPassword() {
+  $('pwForm').reset();
+  $('pwMsg').textContent = '';
+  $('btnPwSave').disabled = false;
+  $('pwDlg').showModal();
+  $('pwCurrent').focus();
+}
+
+async function changePassword(e) {
+  e.preventDefault();
+  const cur = $('pwCurrent').value, nw = $('pwNew').value;
+  const msg = $('pwMsg');
+  const bytes = new TextEncoder().encode(nw).length; // сервер считает байты
+  if (!cur) { msg.textContent = 'введите текущий пароль'; return; }
+  if (bytes < 8 || bytes > 72) { msg.textContent = 'длина — 8–72 байта'; return; }
+  if (nw !== $('pwRepeat').value) { msg.textContent = 'пароли не совпадают'; return; }
+  const btn = $('btnPwSave');
+  btn.disabled = true;
+  msg.textContent = 'меняю…';
+  try {
+    await jpost('/api/password', {current: cur, new: nw});
+    authChanged = true; // остановить поллинг: старые креды не должны жечь throttle
+    msg.textContent = 'Пароль изменён. Войдите заново.';
+    setTimeout(() => location.reload(), 1500);
+  } catch (err) {
+    msg.textContent = err.message;
+    btn.disabled = false;
+  }
+}
+$('pwForm').addEventListener('submit', changePassword);
+
 async function maybeDiscard() {
   return !dirty || await askConfirm('Есть несохранённые изменения. Отбросить?',
                                      {ok:'Отбросить', danger:true});
@@ -573,9 +646,10 @@ function renderStatus(st) {
   if (st.notify) {
     $('ntInfo').textContent = 'уведомления: '+
       (st.notify.channel ? (st.notify.channel === 'telegram' ? 'Telegram' : 'webhook')
-       : 'выкл (panel.conf)')
+       : 'выкл')
       + (st.notify.pending ? ' · отложено: '+st.notify.pending : '');
   }
+  if (st.auth) $('btnPwChange').hidden = !st.auth.enabled;
   const ver = st.version ? ' · v'+escapeHtml(st.version) : '';
   const dotOn = '<span class="dot on" aria-hidden="true"></span>', dotOff = '<span class="dot off" aria-hidden="true"></span>';
   $('status').innerHTML = (st.active
@@ -598,6 +672,73 @@ function renderStatus(st) {
     '<div class="kv'+(i === 0 ? ' wide' : '')+'"><span>'+k+'</span><b>'+v+'</b></div>').join('');
   $('svcinfo').title = 'обновлено ' + new Date().toLocaleTimeString();
 }
+
+let tgConfigured = false;
+
+async function loadNotify() {
+  try {
+    const d = await jget('/api/notify');
+    tgConfigured = !!(d.telegram && d.telegram.configured);
+    $('tgInfo').textContent = tgConfigured
+      ? 'Telegram: ' + (d.telegram.bot || 'настроен')
+        + (d.telegram.chat_id ? ', chat ' + d.telegram.chat_id : '')
+      : 'Telegram не настроен'
+        + (d.channel === 'webhook' ? ' (активен webhook из panel.conf)' : '');
+    $('tgToken').placeholder = tgConfigured
+      ? 'оставьте пустым, чтобы не менять' : '123456:ABC-DEF…';
+    if (document.activeElement !== $('tgChat')) {
+      $('tgChat').value = (d.telegram && d.telegram.chat_id) || '';
+    }
+    $('btnTgTest').hidden = !tgConfigured;
+    $('btnTgOff').hidden = !tgConfigured;
+  } catch (e) { /* transient */ }
+}
+
+async function saveTelegram(e) {
+  e.preventDefault();
+  const token = $('tgToken').value.trim();
+  const chat = $('tgChat').value.trim();
+  if (!chat) { $('tgMsg').textContent = 'укажите chat_id'; return; }
+  if (!token && !tgConfigured) { $('tgMsg').textContent = 'вставьте токен бота'; return; }
+  const btn = $('btnTgSave');
+  btn.disabled = true;
+  $('tgMsg').textContent = 'сохраняю…';
+  try {
+    const d = await jpost('/api/notify/telegram', {token, chat_id: chat});
+    $('tgToken').value = '';
+    $('tgMsg').textContent = d.warning || 'Сохранено';
+    await loadNotify();
+  } catch (err) {
+    $('tgMsg').textContent = err.message;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function testTelegram() {
+  const btn = $('btnTgTest');
+  btn.disabled = true;
+  $('tgMsg').textContent = 'отправляю тест…';
+  try {
+    await jpost('/api/notify/test');
+    $('tgMsg').textContent = 'Тест отправлен';
+  } catch (err) {
+    $('tgMsg').textContent = 'Ошибка: ' + err.message;
+  } finally {
+    setTimeout(() => { btn.disabled = false; }, 5000);
+  }
+}
+
+async function offTelegram() {
+  if (!await askConfirm('Отключить Telegram-уведомления?',
+                        {ok: 'Отключить', danger: true})) return;
+  try {
+    const d = await jdel('/api/notify/telegram');
+    $('tgMsg').textContent = d.warning || 'Отключено';
+    await loadNotify();
+  } catch (err) { $('tgMsg').textContent = err.message; }
+}
+$('tgForm').addEventListener('submit', saveTelegram);
 
 // Лёгкий поллинг: лог и статус сами показывают, что naive упал, без кликов.
 // Пресеты не трогаем — перерисовка списка каждые 3с мешает наведению/клику.
@@ -1546,10 +1687,13 @@ $('log').addEventListener('scroll', () => {
 });
 
 // Автообновление лога и статуса: раз в 3с, только на видимой вкладке.
-setInterval(() => { if (!document.hidden) { loadLog(); pollStatus(); } }, 3000);
-document.addEventListener('visibilitychange', () => { if (!document.hidden) { loadLog(); pollStatus(); loadSpark(); } });
+setInterval(() => { if (!authChanged && !document.hidden) { loadLog(); pollStatus(); } }, 3000);
+document.addEventListener('visibilitychange', () => {
+  if (authChanged) return; // пароль уже сменён — старыми кредами не поллим
+  if (!document.hidden) { loadLog(); pollStatus(); loadSpark(); }
+});
 // История E2E меняется раз в интервал монитора — свой медленный таймер
-setInterval(() => { if (!document.hidden) loadSpark(); }, 30000);
+setInterval(() => { if (!authChanged && !document.hidden) loadSpark(); }, 30000);
 
 // Делегирование кликов: inline-обработчики запрещены nonce-CSP.
 const ACTIONS = {
@@ -1577,6 +1721,10 @@ const ACTIONS = {
   rbDel: (arg) => rbDelete(arg),
   rbKeep: () => rbCleanup(),
   rbClose: () => $('rbDlg').close(),
+  pwOpen: () => openPassword(),
+  pwClose: () => $('pwDlg').close(),
+  tgTest: () => testTelegram(),
+  tgOff: () => offTelegram(),
   select: (arg) => selectPreset(arg),
   activate: (arg) => activate(arg),
   duplicate: (arg) => dupPreset(arg),
@@ -1610,6 +1758,7 @@ setTimeout(() => checkUpdate(false), 1500);
 setTimeout(() => checkNaive(false), 2500);
 // Сводка бэкапов для строки «откат: …» — тоже тихо
 setTimeout(() => loadRollback(), 3500);
+setTimeout(loadNotify, 1000);
 const hashMatch = location.hash.match(/^#preset=(.+)$/);
 if (hashMatch) selectPreset(decodeURIComponent(hashMatch[1]));
 </script>

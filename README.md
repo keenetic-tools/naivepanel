@@ -20,7 +20,7 @@ HTML page — no CDN, no build step. MIT-licensed.
 - Bind по умолчанию `127.0.0.1:8089`. Доступ из LAN — через внешний reverse proxy
   или напрямую (см. «Доступ из LAN без reverse proxy»).
 
-## Возможности UI (v0.5.0–v0.7.0)
+## Возможности UI
 
 - Карточка статуса: состояние, активный пресет, uptime, PID, версия панели.
 - Поиск по пресетам (клавиша `/`), дублирование пресета в один клик (⧉ —
@@ -63,6 +63,10 @@ HTML page — no CDN, no build step. MIT-licensed.
   naive → активация; неудачная проба — cooldown.
 - Уведомления (v0.14): Telegram/webhook о переключениях, возвратах,
   рестартах watchdog'ом и исчерпании цепочки.
+- Настройка Telegram из UI (v0.16): токен от @BotFather, chat_id и кнопка
+  «Отправить тест» — без правки `panel.conf` и перезапуска панели.
+- Смена пароля администратора из UI (v0.16): текущий пароль + новый, запись
+  `admin.pass` атомарно — без SSH и `htpasswd`.
 - Три колонки на широких экранах (v0.12): слева статус и пресеты, в центре
   редактор с логом, справа «Обслуживание» (фейловер, бинарник, обновления
   панели). Средние экраны — две колонки, телефон — одна с тем же порядком
@@ -100,6 +104,10 @@ HTML page — no CDN, no build step. MIT-licensed.
 | `POST` | `/api/rollback` | откат: `{"panel":"vX.Y.Z"}` — восстановить файлы из бэкапа и перезапустить панель (текущая версия тоже уходит в бэкап, откат обратим); `{"binary":true}` — вернуть `naive.previous` и перезапустить прокси, если работал. Гейт как у update/apply |
 | `DELETE` | `/api/rollback/<vX.Y.Z>` | удалить один бэкап панели |
 | `POST` | `/api/rollback/cleanup` | `{"keep":N}` — удалить все бэкапы панели, кроме N новейших (по умолчанию 1) |
+| `POST` | `/api/password` | смена пароля текущего Basic-пользователя: `{current,new}` → `{ok}`; `400` — неверный текущий или длина не 8–72 байта, `409` — auth выключен |
+| `GET` | `/api/notify` | статус уведомлений: `{channel, enabled, telegram:{configured, chat_id, bot}, pending}`; токен не отдаётся |
+| `POST`/`DELETE` | `/api/notify/telegram` | сохранить `{token, chat_id}` (пустой токен = не менять) или отключить; upsert в `panel.conf`, применяется сразу; `warning`, если ключ задан через env |
+| `POST` | `/api/notify/test` | тестовое сообщение в Telegram (не чаще 1/5с): `200 {ok}`, `409` — канал не настроен, `429` — слишком часто, `502` — доставка не удалась |
 | `GET` | `/api/logs?lines=100` | tail лог-файла: по умолчанию naive, `&src=panel` — лог самой панели (события безопасности, обновления, обрезки логов) |
 
 ## Локальный запуск (для разработки)
@@ -128,7 +136,7 @@ Entware с `opkg`). Скачивает файлы, закреплённые за
 контрольные суммы (`SHA256SUMS`), ставит init-скрипты и запускает панель:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/v0.15.0/install.sh | sh -s -- --with-auth
+curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/v0.16.0/install.sh | sh -s -- --with-auth
 ```
 
 Запуск через пайп безопасен: подтверждение установки и ввод пароля читаются
@@ -142,7 +150,7 @@ curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/v0.15.0/i
 | `--with-auth` | интерактивно создаёт `/opt/etc/naive/panel/admin.pass` (HTTP Basic) |
 | `--bind HOST:PORT` | пишет `NAIVEPANEL_BIND` в `/opt/etc/naive/panel/panel.conf` |
 | `--hosts LIST` | пишет `NAIVEPANEL_HOSTS` в `panel.conf` |
-| `--ref TAG` | устанавливает конкретный тег (по умолчанию `v0.15.0`) |
+| `--ref TAG` | устанавливает конкретный тег (по умолчанию `v0.16.0`) |
 | `--naive-target TGT` | openwrt-таргет бинарника naive, поверх авто-детекта |
 | `--naive-ref TAG` | конкретный тег klzgrad/naiveproxy вместо последнего |
 | `--naive-force` | переустановить бинарник naive, даже если он уже есть |
@@ -177,7 +185,7 @@ curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/v0.15.0/i
 Пример с LAN-доступом:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/v0.15.0/install.sh \
+curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/v0.16.0/install.sh \
   | sh -s -- --with-auth --bind 192.168.1.1:8089 --hosts '192.168.1.1:8089,router.local:8089'
 ```
 
@@ -462,7 +470,7 @@ TCP-пинга upstream в редакторе: проверяется вся ц�
 отключение watchdog'а по флаппингу, исчерпание цепочки.
 
 **Каналы** (panel.conf, секреты только там — UI показывает статус канала
-и счётчик отложенных):
+и счётчик отложенных, Telegram настраивается ниже):
 
 - **Telegram**: `NAIVEPANEL_TG_TOKEN` (бот от @BotFather) +
   `NAIVEPANEL_TG_CHAT`. chat_id — ваш личный числовой id (@userinfobot) —
@@ -470,6 +478,12 @@ TCP-пинга upstream в редакторе: проверяется вся ц�
   запрещает ботам писать первыми); или id группы `-100…`, или @username
   канала;
 - **webhook**: `NAIVEPANEL_NOTIFY_URL` — POST JSON `{event, text, ts}`.
+
+Настроить Telegram можно из UI: «Обслуживание → Уведомления» — токен от
+@BotFather, chat_id и кнопка «Отправить тест». Токен хранится только в
+`panel.conf` и никогда не возвращается в браузер; после сохранения канал
+включается сразу, без перезапуска панели. Webhook по-прежнему задаётся
+только в `panel.conf`; при наличии обоих каналов приоритет у Telegram.
 
 **Доставка — три слоя** (важно за блокировками: Telegram напрямую с
 роутера недоступен):
@@ -572,6 +586,13 @@ ln -sf /opt/etc/init.d/S99naivepanel /opt/etc/rc.d/S99naivepanel
 ```
 
 Панель будет доступна на `http://127.0.0.1:8089` (только с роутера).
+
+### Смена пароля из UI
+
+«Обслуживание → Панель → Сменить пароль…» — текущий пароль, новый (8–72 байта)
+и повтор. Меняется только запись текущего пользователя в `admin.pass`, файл
+пишется атомарно; после смены браузер переспросит креды. Доступно только при
+включённой auth (`admin.pass` существует).
 
 ### Доступ из LAN
 

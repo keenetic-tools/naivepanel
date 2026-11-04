@@ -25,13 +25,15 @@ import socket
 import ssl  # E2E-проверка: TLS через туннель прокси, только системные CA
 # subprocess вызывается только с фиксированными argv-списками (shell=False)
 import subprocess  # nosec B404
+import tempfile
 import threading
 import time
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, unquote, urlsplit
 
-from flask import Flask, Response, abort, g, jsonify, make_response, render_template, request
+from flask import (Flask, Response, abort, g, has_request_context, jsonify,
+                   make_response, render_template, request)
 from werkzeug.exceptions import HTTPException
 
 # --- panel.conf: постоянные настройки панели (переживают апгрейды) --------
@@ -63,6 +65,9 @@ CONF_KEYS = frozenset({
 })
 
 _CONF_SKIPPED: list[str] = []
+# Ключи, которые реально пришли из panel.conf (а не были уже в env):
+# по ним UI понимает, что env перекроет сохранённое значение после рестарта.
+_CONF_FILE_KEYS: set[str] = set()
 
 
 def _parse_conf(path: Path) -> dict[str, str]:
@@ -86,7 +91,9 @@ def _parse_conf(path: Path) -> dict[str, str]:
 
 def _apply_conf_file() -> None:
     for key, value in _parse_conf(PANEL_CONF).items():
-        os.environ.setdefault(key, value)
+        if key not in os.environ:
+            os.environ[key] = value
+            _CONF_FILE_KEYS.add(key)
 
 
 _apply_conf_file()
@@ -239,15 +246,28 @@ FAILOVER_RETURN_COOLDOWN, _FAILOVER_RETURN_COOLDOWN_INVALID = _int_or_default(_F
 FAILOVER_RETURN_COOLDOWN = max(60, FAILOVER_RETURN_COOLDOWN)
 
 # --- Уведомления (Telegram / webhook) ----------------------------------------
-# События монитора (переключение/возврат/рестарт watchdog'ом/исчерпание)
-# уходят ещё и в мессенджер: панель справилась сама — и доложила. Секреты
-# живут ТОЛЬКО в panel.conf/env, в API и UI — лишь статус канала.
-# Отправка напрямую с роутера (свой WAN): лежащий прокси не мешает.
-TG_TOKEN = os.environ.get("NAIVEPANEL_TG_TOKEN", "")
-TG_CHAT = os.environ.get("NAIVEPANEL_TG_CHAT", "")
-NOTIFY_URL = os.environ.get("NAIVEPANEL_NOTIFY_URL", "")
-NOTIFY_CHANNEL = ("telegram" if TG_TOKEN and TG_CHAT
-                  else "webhook" if NOTIFY_URL else None)
+# Конфиг изменяемый: UI пишет его в panel.conf и сразу обновляет runtime,
+# не перезапуская панель. Секреты живут только здесь и в panel.conf.
+_notify_lock = threading.Lock()
+_notify_cfg: dict[str, str] = {
+    "token": os.environ.get("NAIVEPANEL_TG_TOKEN", ""),
+    "chat": os.environ.get("NAIVEPANEL_TG_CHAT", ""),
+    "url": os.environ.get("NAIVEPANEL_NOTIFY_URL", ""),
+}
+
+
+def _notify_snapshot() -> dict[str, str]:
+    with _notify_lock:
+        return dict(_notify_cfg)
+
+
+def _notify_channel(cfg: dict[str, str] | None = None) -> str | None:
+    c = cfg if cfg is not None else _notify_snapshot()
+    if c.get("token") and c.get("chat"):
+        return "telegram"
+    if c.get("url"):
+        return "webhook"
+    return None
 
 # --- Self-update: репозиторий и пути ---------------------------------------
 # Обновление из UI повторяет ручной флоу `install.sh --yes`: панель лишь
@@ -278,7 +298,7 @@ _ALLOWED_PROXY_SCHEMES = ("https://", "http://", "quic://")
 # такой пресет нельзя было бы получить через GET (роутинг отдаёт файл)
 RESERVED_NAMES = frozenset({"export", "import"})
 
-APP_VERSION = "0.15.0"
+APP_VERSION = "0.16.0"
 
 
 def _ensure_dirs() -> None:
@@ -1034,6 +1054,10 @@ def _status() -> dict[str, Any]:
     active_name = _active_name()
     has_init = INIT_SCRIPT.exists()
     running, pid, uptime = _proxy_running()
+    # _status() зовут и фоновые потоки (naive-update, rollback): вне request
+    # context request.authorization бросил бы RuntimeError.
+    auth = request.authorization if has_request_context() else None
+    channel = _notify_channel()
     return {
         "version": APP_VERSION,
         "active": running,
@@ -1044,9 +1068,11 @@ def _status() -> dict[str, Any]:
         "init_present": has_init,
         "watchdog": _watchdog.snapshot(),
         "failover": _failover.snapshot(),
-        "notify": {"enabled": NOTIFY_CHANNEL is not None,
-                   "channel": NOTIFY_CHANNEL,
+        "notify": {"enabled": channel is not None,
+                   "channel": channel,
                    "pending": len(_notify_pending_all())},
+        "auth": {"enabled": PANEL_ADMIN_PASS.exists(),
+                 "user": auth.username if auth else None},
     }
 
 
@@ -1063,7 +1089,7 @@ def _notify(event: str, text: str, dedupe_s: float = 60.0) -> None:
     переключений не должен заспамить чат. Для «доступно обновление» окно
     больше (6ч), чтобы не напоминать при каждом открытии страницы.
     """
-    if NOTIFY_CHANNEL is None:
+    if _notify_channel() is None:
         return
     now = time.time()
     if now - _notify_last.get(event, 0.0) < dedupe_s:
@@ -1072,44 +1098,52 @@ def _notify(event: str, text: str, dedupe_s: float = 60.0) -> None:
     _notify_queue.put((event, text))
 
 
-def _notify_send(event: str, text: str) -> bool:
-    """Доставка события: три пути, возвращаем — доставлено ли.
+def _notify_send(event: str, text: str,
+                 detail: bool = False) -> bool | tuple[bool, str]:
+    """Доставка: сначала через активный naive, затем напрямую.
 
-    1) через активный naive (curl -x socks5h/http) — Telegram за блокировками
-       доступен только так; DNS тоже через прокси (socks5h). Используем, когда
-       listen активного пресета жив — в момент большинства событий какой-то
-       прокси уже работает (переключились на backup / вернулись на основной);
-    2) напрямую — webhook на своём сервере и незаблокированные каналы;
-    3) не вышло — False: вызывающий положит в pending, доставим первым
-       ожившим путём (watchdog/failover поднимут прокси).
+    detail=True → (ok, error) для кнопки «тест»; иначе bool (как раньше).
     """
-    if NOTIFY_CHANNEL == "telegram":
-        url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-        body: dict[str, Any] = {"chat_id": TG_CHAT, "text": text,
+    cfg = _notify_snapshot()
+    channel = _notify_channel(cfg)
+    if channel is None:
+        return (False, "уведомления не настроены") if detail else False
+    if channel == "telegram":
+        url = f"https://api.telegram.org/bot{cfg['token']}/sendMessage"
+        body: dict[str, Any] = {"chat_id": cfg["chat"], "text": text,
                                 "disable_web_page_preview": True}
     else:
-        url, body = NOTIFY_URL, {"event": event, "text": text,
+        url, body = cfg["url"], {"event": event, "text": text,
                                  "ts": int(time.time())}
     post = ["-H", "Content-Type: application/json", "-d", json.dumps(body)]
-    # argv-списки; команды не логируем (токен Telegram в URL)
+    errors: list[str] = []
+
+    def attempt(prefix: list[str], timeout: int) -> bool:
+        try:
+            res = _run([*prefix, *post, url], timeout=timeout)
+        except HTTPException as exc:
+            errors.append(str(exc.description or exc))
+            return False
+        if res["rc"] == 0:
+            return True
+        errors.append(res["stderr"] or f"curl rc={res['rc']}")
+        return False
 
     listen = _active_listen()
     ep = _listen_endpoint(listen) if listen else None
     if ep and _tcp_probe(ep[1], ep[2], timeout=1.0) is not None:
         proxy = f"{'socks5h' if ep[0] == 'socks' else 'http'}://{ep[1]}:{ep[2]}"
-        try:
-            res = _run(["curl", "-fsS", "--max-time", "15", "-x", proxy,
-                        *post, url], timeout=20)
-            if res["rc"] == 0:
-                return True
-        except HTTPException:
-            pass  # прокси-путь не вышел — пробуем напрямую
-    try:
-        res = _run(["curl", "-fsS", "--max-time", "10", *post, url],
-                   timeout=15)
-    except HTTPException:
-        return False
-    return res["rc"] == 0
+        if attempt(["curl", "-fsS", "--max-time", "15", "-x", proxy], 20):
+            return (True, "") if detail else True
+    if attempt(["curl", "-fsS", "--max-time", "10"], 15):
+        return (True, "") if detail else True
+    if detail:
+        err = errors[-1] if errors else "delivery failed"
+        for secret in (cfg.get("token"), cfg.get("url")):
+            if secret:
+                err = err.replace(secret, "***")
+        return False, err[:300]
+    return False
 
 
 # --- Pending: недоставленные события ждут оживания любого пути ---------------
@@ -1182,19 +1216,117 @@ def _notify_flush_pending() -> int:
     return delivered
 
 
+def _notify_tick(timeout: float = 30.0) -> None:
+    if _notify_channel() is not None:
+        _notify_flush_pending()
+    try:
+        event, text = _notify_queue.get(timeout=timeout)
+    except queue.Empty:
+        return
+    if _notify_send(event, text):
+        return
+    if _notify_channel() is None:
+        app.logger.info("notify %s: канал отключён — событие отброшено", event)
+        return
+    app.logger.warning(
+        "notify %s: все пути недоступны (прокси и напрямую) — отложено",
+        event)
+    _notify_pending_append(event, text)
+
+
 def _notify_loop() -> None:
     while True:
-        _notify_flush_pending()
         try:
-            event, text = _notify_queue.get(timeout=30)
-        except queue.Empty:
+            _notify_tick()
+        except Exception:
+            app.logger.exception("notify loop error — продолжаю")
+            time.sleep(1)
+
+
+# --- Настройка Telegram: валидация, кэш имени бота, upsert panel.conf --------
+
+_TG_TOKEN_RE = re.compile(r"^[0-9]{5,}:[A-Za-z0-9_-]{20,}$")
+_TG_CHAT_RE = re.compile(r"^(-?[0-9]{1,20}|@[A-Za-z][A-Za-z0-9_]{3,31})$")
+_bot_cache: dict[str, tuple[str | None, float]] = {}
+_BOT_TTL = 3600.0
+_BOT_NEG_TTL = 300.0
+
+
+def _tg_bot_name(token: str) -> str | None:
+    """@username бота через getMe; положительный кэш 1ч, отрицательный 5м."""
+    if not token:
+        return None
+    now = time.monotonic()
+    hit = _bot_cache.get(token)
+    if hit and hit[1] > now:
+        return hit[0]
+    name = None
+    try:
+        raw = _http_get(f"https://api.telegram.org/bot{token}/getMe", timeout=5)
+        payload = json.loads(raw)
+        result = payload.get("result") if isinstance(payload, dict) else None
+        username = result.get("username") if isinstance(result, dict) else None
+        name = f"@{username}" if username else None
+    except (RuntimeError, ValueError, KeyError, TypeError):
+        pass
+    _bot_cache[token] = (name, now + (_BOT_TTL if name else _BOT_NEG_TTL))
+    return name
+
+
+def _conf_upsert(updates: dict[str, str | None]) -> None:
+    """Атомарно обновить/удалить ключи panel.conf, сохранив остальные строки.
+
+    Дубли ключа схлопываются: _parse_conf работает по принципу last-wins,
+    поэтому оставленная старая копия победила бы после рестарта (и вернула
+    бы удалённый токен). Первое вхождение переписываем, остальные выкидываем.
+    """
+    try:
+        lines = PANEL_CONF.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        lines = []
+    pending = dict(updates)
+    seen: set[str] = set()
+    out: list[str] = []
+    for line in lines:
+        s = line.strip()
+        key = (s.split("=", 1)[0].strip()
+               if s and not s.startswith("#") and "=" in s else None)
+        if key in pending:
+            if key not in seen and pending[key] is not None:
+                out.append(f'{key}="{pending[key]}"')
+            seen.add(key)
             continue
-        if _notify_send(event, text):
-            continue
-        app.logger.warning(
-            "notify %s: все пути недоступны (прокси и напрямую) — отложено",
-            event)
-        _notify_pending_append(event, text)
+        out.append(line)
+    for key, value in pending.items():
+        if key not in seen and value is not None:
+            out.append(f'{key}="{value}"')
+    text = "\n".join(out) + ("\n" if out else "")
+    tmp: Path | None = None
+    try:
+        PANEL_CONF.parent.mkdir(parents=True, exist_ok=True)
+        # Уникальный temp на каждый вызов: waitress обслуживает запросы потоками,
+        # общий panel.conf.tmp давал гонку (replace → FileNotFoundError, потеря
+        # ключа, чужой finally удалял файл посреди записи).
+        fd, tmp_name = tempfile.mkstemp(
+            dir=str(PANEL_CONF.parent), prefix=".panel.conf.", suffix=".tmp")
+        tmp = Path(tmp_name)
+        # install.sh кладёт panel.conf с 0644, а внутри секреты: всегда 0600.
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, PANEL_CONF)
+    except OSError as exc:
+        # путь в тело ответа не отдаём — только в лог
+        app.logger.error("panel.conf write failed: %s", exc)
+        abort(500, description="cannot write panel.conf")
+    finally:
+        if tmp is not None:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
 
 
 # --- Watchdog: авто-рестарт упавшего naive ----------------------------------
@@ -1890,6 +2022,72 @@ def _htpasswd_verify(stored: str, user: str, password: str) -> bool:
     return False  # пользователь не найден
 
 
+def _htpasswd_replace(stored: str, user: str, new_hash: str) -> str:
+    """Заменить хэш одного пользователя, сохранив комментарии и чужие строки."""
+    out: list[str] = []
+    found = False
+    for line in stored.splitlines():
+        s = line.strip()
+        if s and not s.startswith("#") and ":" in s:
+            u = s.split(":", 1)[0]
+            if u == user:
+                out.append(f"{user}:{new_hash}")
+                found = True
+                continue
+        out.append(line)
+    if not found:
+        raise LookupError(user)
+    return "\n".join(out) + "\n"
+
+
+def _write_admin_pass(user: str, new_password: str) -> None:
+    """Атомарно заменить хэш пользователя; кэш успешных проверок сбросить."""
+    global _admin_pass_stamp
+    import bcrypt  # type: ignore
+
+    # bcrypt принимает не больше 72 байт: 5.x кидает ValueError, 4.x молча
+    # обрезает. Проверяем до записи, чтобы файл не остался в странном виде.
+    if not 8 <= len(new_password.encode("utf-8")) <= 72:
+        abort(400, description="new password must be 8–72 bytes")
+    try:
+        stored = PANEL_ADMIN_PASS.read_text(encoding="utf-8")
+    except OSError:
+        abort(409, description="auth is not configured")
+    try:
+        new_hash = bcrypt.hashpw(new_password.encode(), bcrypt.gensalt()).decode()
+    except ValueError:
+        abort(400, description="new password must be 8–72 bytes")
+    try:
+        updated = _htpasswd_replace(stored, user, new_hash)
+    except LookupError:
+        abort(404, description=f"user {user!r} not found in admin.pass")
+
+    tmp = None
+    try:
+        PANEL_ADMIN_PASS.parent.mkdir(parents=True, exist_ok=True)
+        # уникальное имя: фиксированный .tmp давал гонку между запросами
+        fd, tmp = tempfile.mkstemp(dir=str(PANEL_ADMIN_PASS.parent),
+                                   prefix=".admin.pass.", suffix=".tmp")
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            os.fchmod(fh.fileno(), 0o600)
+            fh.write(updated)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, PANEL_ADMIN_PASS)
+    except OSError as exc:
+        # путь в тело ответа не отдаём — только в лог
+        app.logger.error("cannot write %s: %s", PANEL_ADMIN_PASS, exc)
+        abort(500, description="cannot write admin.pass")
+    finally:
+        if tmp is not None:
+            try:
+                Path(tmp).unlink()
+            except OSError:
+                pass
+    _auth_cache.clear()
+    _admin_pass_stamp = None
+
+
 # --- Routes ---------------------------------------------------------------
 
 @app.route("/")
@@ -1905,6 +2103,122 @@ def index() -> Response:
 @app.route("/api/status")
 def api_status():
     return jsonify(_status())
+
+
+@app.route("/api/notify")
+def api_notify_get():
+    cfg = _notify_snapshot()
+    channel = _notify_channel(cfg)
+    bot = _bot_cache.get(cfg["token"], (None, 0.0))[0] if cfg["token"] else None
+    return jsonify({
+        "channel": channel,
+        "enabled": channel is not None,
+        "telegram": {"configured": bool(cfg["token"] and cfg["chat"]),
+                     "chat_id": cfg["chat"], "bot": bot},
+        "pending": len(_notify_pending_all()),
+    })
+
+
+@app.route("/api/notify/telegram", methods=["POST"])
+def api_notify_telegram_save():
+    global _notify_test_last
+    _require_local_or_auth()
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        data = {}
+    token = str(data.get("token") or "").strip()
+    chat = str(data.get("chat_id") or "").strip()
+    cfg = _notify_snapshot()
+    if not token and not (cfg["token"] and cfg["chat"]):
+        abort(400, description="bot token is required")
+    if token and not _TG_TOKEN_RE.match(token):
+        abort(400, description="bot token format looks wrong (123456:ABC…)")
+    if not _TG_CHAT_RE.match(chat):
+        abort(400, description="chat_id must be numeric or @channel")
+
+    updates: dict[str, str | None] = {"NAIVEPANEL_TG_CHAT": chat}
+    if token:
+        updates["NAIVEPANEL_TG_TOKEN"] = token
+    warning = None
+    shadowed = [k for k in updates
+                if k in os.environ and k not in _CONF_FILE_KEYS]
+    if shadowed:
+        warning = ("значение задано через окружение — после рестарта "
+                   "оно переопределит сохранённое")
+    _conf_upsert(updates)
+    with _notify_lock:
+        if token:
+            _notify_cfg["token"] = token
+        _notify_cfg["chat"] = chat
+        _notify_test_last = 0.0  # новый канал — тест сразу разрешён
+    _bot_cache.pop(token, None)
+    if cfg["token"]:
+        _bot_cache.pop(cfg["token"], None)
+    bot = _tg_bot_name(token or cfg["token"])
+    app.logger.info("notify: telegram configured by %s", request.remote_addr)
+    return jsonify({"ok": True, "channel": _notify_channel(),
+                    "telegram": {"configured": True, "chat_id": chat,
+                                 "bot": bot},
+                    "warning": warning})
+
+
+@app.route("/api/notify/telegram", methods=["DELETE"])
+def api_notify_telegram_delete():
+    global _notify_test_last
+    _require_local_or_auth()
+    updates: dict[str, str | None] = {"NAIVEPANEL_TG_TOKEN": None,
+                                      "NAIVEPANEL_TG_CHAT": None}
+    shadowed = [k for k in updates
+                if k in os.environ and k not in _CONF_FILE_KEYS]
+    warning = None
+    if shadowed:
+        warning = ("токен задан через окружение — после рестарта он снова "
+                   "включится; уберите его из init-скрипта")
+    _conf_upsert(updates)
+    with _notify_lock:
+        _notify_cfg["token"] = ""
+        _notify_cfg["chat"] = ""
+        _notify_test_last = 0.0  # после удаления тест не должен троттлиться
+    _bot_cache.clear()
+    if _notify_channel() is None:
+        # Telegram был единственным путём доставки — очередь и файл больше
+        # некуда деть. Если настроен webhook, всё остаётся: события доставимы.
+        while True:
+            try:
+                _notify_queue.get_nowait()
+            except queue.Empty:
+                break
+        try:
+            NOTIFY_PENDING.unlink()
+        except OSError:
+            pass
+    app.logger.info("notify: telegram disabled by %s", request.remote_addr)
+    return jsonify({"ok": True, "channel": _notify_channel(),
+                    "warning": warning})
+
+
+_NOTIFY_TEST_MIN = 5.0
+_notify_test_last = 0.0
+
+
+@app.route("/api/notify/test", methods=["POST"])
+def api_notify_test():
+    global _notify_test_last
+    _require_local_or_auth()
+    if _notify_channel() is None:
+        abort(409, description="уведомления не настроены")
+    now = time.monotonic()
+    with _notify_lock:
+        if now - _notify_test_last < _NOTIFY_TEST_MIN:
+            abort(429, description="тестовое сообщение можно отправлять "
+                                   "не чаще одного раза в "
+                                   f"{int(_NOTIFY_TEST_MIN)} секунд")
+        _notify_test_last = now
+    ok, err = _notify_send("test", "NaivePanel: тестовое уведомление",
+                           detail=True)
+    if not ok:
+        abort(502, description=f"delivery failed: {err}")
+    return jsonify({"ok": True})
 
 
 @app.route("/api/configs")
@@ -2261,6 +2575,36 @@ def api_panel_restart():
     return jsonify({"restart": True, "note": "panel restarting in ~1s"}), 202
 
 
+@app.route("/api/password", methods=["POST"])
+def api_password():
+    """Смена пароля текущего Basic-пользователя без SSH и рестарта."""
+    try:
+        stored = PANEL_ADMIN_PASS.read_text(encoding="utf-8")
+    except OSError:
+        abort(409, description="auth is disabled — no admin.pass to update")
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        data = {}
+    current = data.get("current")
+    new = data.get("new")
+    auth = request.authorization
+    user = (auth.username if auth else "") or ""
+    if not user:
+        abort(401, description="authentication required")
+    # str() по объекту/number дал бы «пароль» из repr и 200 — UI-баг молча
+    # поставил бы непригодные креды
+    if not isinstance(current, str) or not isinstance(new, str):
+        abort(400, description="current and new must be strings")
+    if not _htpasswd_verify(stored, user, current):
+        abort(400, description="current password is incorrect")
+    if not 8 <= len(new.encode("utf-8")) <= 72:
+        abort(400, description="new password must be 8–72 bytes")
+    _write_admin_pass(user, new)
+    app.logger.info("password changed: user=%r addr=%s", user,
+                    request.remote_addr)
+    return jsonify({"ok": True})
+
+
 # --- Self-update: проверка и установка обновлений из UI ---------------------
 
 def _http_get(url: str, timeout: float = 6.0) -> str:
@@ -2357,6 +2701,13 @@ def _bind_is_loopback() -> bool:
         return ipaddress.ip_address(host).is_loopback
     except ValueError:
         return False  # нераспознанный адрес считаем публичным (fail-closed)
+
+
+def _require_local_or_auth() -> None:
+    """Секреты/код панели нельзя менять без пароля с внешнего интерфейса."""
+    if not PANEL_ADMIN_PASS.exists() and not _bind_is_loopback():
+        abort(403, description="panel is exposed without a password — "
+                               "set one (install.sh --with-auth) first")
 
 
 def _update_state_read() -> dict[str, Any]:
@@ -2479,9 +2830,7 @@ def api_update_apply():
     (S99naiveproxy) установщик не перезапускает — соединения не рвутся.
     """
     # Обновление подменяет код панели: без пароля — только loopback-bind
-    if not PANEL_ADMIN_PASS.exists() and not _bind_is_loopback():
-        abort(403, description="panel is exposed without a password — set one "
-                               "(install.sh --with-auth) before updating")
+    _require_local_or_auth()
     state = _update_state()
     if state.get("phase") == "running" and not state.get("stale"):
         abort(409, description=f"update to {state.get('target')} already in "
@@ -2888,9 +3237,7 @@ def api_naive_update():
     перезапускает прокси, если тот работал. Отсюда гейт как у /api/update/
     apply: замена root-исполняемого файла в LAN без auth недопустима.
     """
-    if not PANEL_ADMIN_PASS.exists() and not _bind_is_loopback():
-        abort(403, description="panel is exposed without a password — set one "
-                               "(install.sh --with-auth) before updating")
+    _require_local_or_auth()
     st = _naive_state()
     if st.get("phase") == "running" and not st.get("stale"):
         abort(409, description=f"naive update to {st.get('target')} already in "
@@ -3042,9 +3389,7 @@ def api_rollback_post():
     root-бинарника — гейт как у update/apply: без пароля только loopback.
     Откат панели тоже снапшотит текущие файлы — обратим в обе стороны.
     """
-    if not PANEL_ADMIN_PASS.exists() and not _bind_is_loopback():
-        abort(403, description="panel is exposed without a password — set one "
-                               "(install.sh --with-auth) before rolling back")
+    _require_local_or_auth()
     body = request.get_json(silent=True) or {}
     if body.get("binary"):
         st = _naive_state()
@@ -3340,11 +3685,14 @@ if __name__ == "__main__":
     else:
         app.logger.info(
             "monitor (e2e history + failover) disabled by NAIVEPANEL_FAILOVER=0")
-    if NOTIFY_CHANNEL is not None:
-        app.logger.info("notifications enabled: %s", NOTIFY_CHANNEL)
-        threading.Thread(
-            target=_notify_loop, name="naive-notify", daemon=True
-        ).start()
+    channel = _notify_channel()
+    if channel:
+        app.logger.info("notifications enabled: %s", channel)
+    else:
+        app.logger.info("notifications not configured — set up in the panel UI")
+    threading.Thread(
+        target=_notify_loop, name="naive-notify", daemon=True
+    ).start()
     host, port = _parse_bind(PANEL_BIND)
     # host берётся из env/panel.conf: предупреждаем только для unspecified
     # адресов (0.0.0.0 / ::) — фактического bind здесь нет.

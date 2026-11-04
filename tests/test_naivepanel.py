@@ -11,6 +11,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import types
 from pathlib import Path
@@ -288,6 +289,133 @@ def test_auth_success_clears_failure_counter(client, env, app):
         assert client.get("/api/status", headers={"Authorization": f"Basic {bad}"}).status_code == 401
 
 
+# --- смена пароля из панели ---------------------------------------------------
+
+def _basic(user, pw):
+    return {"Authorization": "Basic " + base64.b64encode(
+        f"{user}:{pw}".encode()).decode(), **CSRF}
+
+
+def _pass_file(env, password, user="admin"):
+    bcrypt = pytest.importorskip("bcrypt")
+    return f"{user}:{bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()}\n"
+
+
+def test_password_change_invalidates_old_credentials(client, env):
+    p = env / "admin.pass"
+    p.write_text(_pass_file(env, "oldpass1"))
+    r = client.post("/api/password", json={"current": "oldpass1", "new": "newpass1"},
+                    headers=_basic("admin", "oldpass1"))
+    assert r.status_code == 200
+    assert client.get("/api/status", headers=_basic("admin", "oldpass1")).status_code == 401
+    assert client.get("/api/status", headers=_basic("admin", "newpass1")).status_code == 200
+
+
+def test_password_change_rejects_wrong_current(client, env):
+    (env / "admin.pass").write_text(_pass_file(env, "oldpass1"))
+    r = client.post("/api/password", json={"current": "nope", "new": "newpass1"},
+                    headers=_basic("admin", "oldpass1"))
+    assert r.status_code == 400
+    assert "current" in r.get_json()["error"]
+    assert client.get("/api/status", headers=_basic("admin", "oldpass1")).status_code == 200
+
+
+def test_password_change_rejects_short_new(client, env):
+    (env / "admin.pass").write_text(_pass_file(env, "oldpass1"))
+    r = client.post("/api/password", json={"current": "oldpass1", "new": "short"},
+                    headers=_basic("admin", "oldpass1"))
+    assert r.status_code == 400
+
+
+def test_password_change_rejects_80_byte_new(client, env):
+    # bcrypt не принимает пароли длиннее 72 байт (5.x — ValueError, 4.x молча
+    # обрезает); отклоняем до записи, файл не трогаем
+    p = env / "admin.pass"
+    original = _pass_file(env, "oldpass1")
+    p.write_text(original)
+    r = client.post("/api/password", json={"current": "oldpass1", "new": "x" * 80},
+                    headers=_basic("admin", "oldpass1"))
+    assert r.status_code == 400
+    assert "8–72 bytes" in r.get_json()["error"]
+    assert p.read_text() == original
+
+
+def test_password_change_rejects_non_string_new_object(client, env):
+    # str() по объекту дал бы «пароль» из repr и 200 — UI-баг ставил бы
+    # непригодные креды молча
+    p = env / "admin.pass"
+    original = _pass_file(env, "oldpass1")
+    p.write_text(original)
+    r = client.post("/api/password", json={"current": "oldpass1", "new": {"a": 1}},
+                    headers=_basic("admin", "oldpass1"))
+    assert r.status_code == 400
+    assert p.read_text() == original
+
+
+def test_password_change_rejects_non_string_new_number(client, env):
+    (env / "admin.pass").write_text(_pass_file(env, "oldpass1"))
+    r = client.post("/api/password", json={"current": "oldpass1", "new": 12345678},
+                    headers=_basic("admin", "oldpass1"))
+    assert r.status_code == 400
+
+
+def test_password_change_rejects_non_string_current(client, env):
+    (env / "admin.pass").write_text(_pass_file(env, "oldpass1"))
+    r = client.post("/api/password", json={"current": ["oldpass1"], "new": "newpass1"},
+                    headers=_basic("admin", "oldpass1"))
+    assert r.status_code == 400
+
+
+def test_password_change_preserves_other_users(client, env, app):
+    bcrypt = pytest.importorskip("bcrypt")
+    h = bcrypt.hashpw(b"alicepass", bcrypt.gensalt()).decode()
+    p = env / "admin.pass"
+    p.write_text(f"# keep\nalice:{h}\n" + _pass_file(env, "oldpass1"))
+    r = client.post("/api/password", json={"current": "oldpass1", "new": "newpass1"},
+                    headers=_basic("admin", "oldpass1"))
+    assert r.status_code == 200
+    stored = p.read_text()
+    assert "# keep" in stored and f"alice:{h}" in stored
+    assert client.get("/api/status", headers=_basic("alice", "alicepass")).status_code == 200
+
+
+def test_password_change_write_failure_keeps_original(client, env, monkeypatch):
+    p = env / "admin.pass"
+    original = _pass_file(env, "oldpass1")
+    p.write_text(original)
+    monkeypatch.setattr(os, "replace", lambda *a, **k: (_ for _ in ()).throw(OSError("ro")))
+    r = client.post("/api/password", json={"current": "oldpass1", "new": "newpass1"},
+                    headers=_basic("admin", "oldpass1"))
+    assert r.status_code == 500
+    assert p.read_text() == original
+    # временный файл не остаётся, тело ошибки — обычный JSON без путей
+    assert list(env.glob(".admin.pass.*")) == []
+    body = r.get_json()
+    assert body == {"error": "cannot write admin.pass",
+                    "description": "cannot write admin.pass"}
+
+
+def test_password_change_without_auth_file(client, env):
+    r = client.post("/api/password", json={"current": "x", "new": "newpass1"},
+                    headers=CSRF)
+    assert r.status_code == 409
+
+
+def test_status_reports_auth_state(client, env):
+    assert client.get("/api/status").get_json()["auth"] == {"enabled": False, "user": None}
+    (env / "admin.pass").write_text(_pass_file(env, "s3cret"))
+    d = client.get("/api/status", headers=_basic("admin", "s3cret")).get_json()
+    assert d["auth"] == {"enabled": True, "user": "admin"}
+
+
+def test_status_outside_request_context(app, env):
+    # _status() зовут фоновые потоки (naive-update/rollback): без запроса
+    # request.authorization бросил бы RuntimeError
+    d = app._status()
+    assert d["auth"] == {"enabled": env.joinpath("admin.pass").exists(), "user": None}
+    assert d["auth"]["enabled"] is False
+
+
 # --- вспомогательные функции ------------------------------------------------
 
 def test_split_proxy(app):
@@ -370,6 +498,19 @@ def test_auth_cache_reset_on_admin_pass_change(client, env):
     p.write_text("admin:" + bcrypt.hashpw(b"other", bcrypt.gensalt()).decode() + "\n")
     os.utime(p, ns=(2_000_000_000, 2_000_000_000))
     assert client.get("/api/status", headers={"Authorization": f"Basic {token}"}).status_code == 401
+
+
+# --- замена строки в htpasswd -------------------------------------------------
+
+def test_htpasswd_replace_keeps_comments_and_other_users(app):
+    stored = "# admins\nalice:$2b$oldalice\nadmin:$2b$oldadmin\n"
+    updated = app._htpasswd_replace(stored, "admin", "$2b$newadmin")
+    assert updated == "# admins\nalice:$2b$oldalice\nadmin:$2b$newadmin\n"
+
+
+def test_htpasswd_replace_missing_user(app):
+    with pytest.raises(LookupError):
+        app._htpasswd_replace("admin:$2b$x\n", "bob", "$2b$y")
 
 
 # --- PUT активного пресета / activate ----------------------------------------
@@ -1645,10 +1786,22 @@ def test_ui_has_naive_binary_controls(app):
         assert marker in html, marker
 
 
+# --- UI: смена пароля администратора -------------------------------------------
+
+def test_ui_has_password_change_controls(app):
+    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    for marker in ('id="pwDlg"', 'data-action="pwOpen"', 'id="pwCurrent"',
+                   'id="pwNew"', 'id="pwRepeat"', 'autocomplete="new-password"',
+                   'id="btnPwChange"', 'id="btnPwChange" hidden', 'role="status"',
+                   'TextEncoder', 'authChanged) return'):
+        assert marker in html, marker
+    assert "confirm(" not in html
+    assert 'minlength="8"' not in html
+
+
 # --- E2E-проверка: реальный запрос через listen-прокси --------------------------
 
 import socket
-import threading
 
 
 class _StubServer:
@@ -2517,11 +2670,16 @@ def test_probe_preset_binary_missing(app, monkeypatch):
     assert d["ok"] is False and "не найден" in d["error"]
 
 
-def test_notify_dedupe_and_disabled(app, monkeypatch):
+def _notify_webhook(app, url="https://example.com/hook"):
+    app._notify_cfg.update({"token": "", "chat": "", "url": url})
+
+
+def test_notify_dedupe_and_disabled(app):
     # без канала — тихо
+    app._notify_cfg.update({"token": "", "chat": "", "url": ""})
     app._notify("e", "x")
     assert app._notify_queue.qsize() == 0
-    monkeypatch.setattr(app, "NOTIFY_CHANNEL", "webhook")
+    _notify_webhook(app)
     app._notify("e1", "one")
     app._notify("e1", "spam")                    # дедуп в пределах окна
     assert list(app._notify_queue.queue) == [("e1", "one")]
@@ -2538,8 +2696,7 @@ def test_notify_send_webhook(app, monkeypatch):
         captured["timeout"] = timeout
         return {"rc": 0, "stdout": "", "stderr": ""}
 
-    monkeypatch.setattr(app, "NOTIFY_CHANNEL", "webhook")
-    monkeypatch.setattr(app, "NOTIFY_URL", "https://example.com/hook")
+    _notify_webhook(app)
     monkeypatch.setattr(app, "_run", fake_run)
     app._notify_send("failover_switch", "home → backup")
     cmd = captured["cmd"]
@@ -2550,24 +2707,75 @@ def test_notify_send_webhook(app, monkeypatch):
 
 
 def test_notify_send_curl_failure_logged(app, monkeypatch):
-    monkeypatch.setattr(app, "NOTIFY_CHANNEL", "webhook")
-    monkeypatch.setattr(app, "NOTIFY_URL", "https://example.com/hook")
+    _notify_webhook(app)
     monkeypatch.setattr(app, "_run",
                         lambda cmd, timeout=10: {"rc": 7, "stdout": "",
                                                  "stderr": "refused"})
     app._notify_send("e", "x")   # rc!=0 → warning, не исключение
 
 
-def test_notify_send_failure_does_not_raise(app, monkeypatch):
-    monkeypatch.setattr(app, "NOTIFY_CHANNEL", "webhook")
-    monkeypatch.setattr(app, "NOTIFY_URL", "https://127.0.0.1:1/hook")
+def test_notify_send_failure_does_not_raise(app):
+    _notify_webhook(app, "https://127.0.0.1:1/hook")
     app._notify_send("e", "x")   # недоступный адрес → warning, не исключение
+
+
+def test_notify_send_detail_success(app, monkeypatch):
+    _notify_webhook(app)
+    monkeypatch.setattr(app, "_run", lambda cmd, timeout=10:
+                        {"rc": 0, "stdout": "", "stderr": ""})
+    assert app._notify_send("e", "x", detail=True) == (True, "")
+
+
+def test_notify_send_detail_disabled(app):
+    app._notify_cfg.update({"token": "", "chat": "", "url": ""})
+    assert app._notify_send("e", "x", detail=True) == (
+        False, "уведомления не настроены")
+
+
+def test_notify_send_detail_masks_webhook_url(app, monkeypatch):
+    url = "https://hooks.example.com/services/T000/B000/SECRETVALUE"
+    _notify_webhook(app, url)
+    monkeypatch.setattr(app, "_run", lambda cmd, timeout=10:
+                        {"rc": 7, "stdout": "", "stderr": f"curl: {url}"})
+    ok, err = app._notify_send("e", "x", detail=True)
+    assert ok is False
+    assert "SECRETVALUE" not in err and "***" in err
+
+
+def test_notify_send_detail_masks_telegram_token(app, monkeypatch):
+    token = "123456:abcdefghijklmnopqrstuvwxyz"
+    app._notify_cfg.update({"token": token, "chat": "42", "url": ""})
+    monkeypatch.setattr(app, "_run", lambda cmd, timeout=10:
+                        {"rc": 7, "stdout": "", "stderr": f"curl: {token}"})
+    ok, err = app._notify_send("e", "x", detail=True)
+    assert ok is False
+    assert token not in err and "***" in err
+
+
+def test_notify_channel_prefers_telegram(app):
+    app._notify_cfg.update({"token": "123:abc", "chat": "42",
+                            "url": "https://example.com/hook"})
+    assert app._notify_channel() == "telegram"
+
+
+def test_notify_disabled_is_noop(app):
+    app._notify_cfg.update({"token": "", "chat": "", "url": ""})
+    app._notify("e", "x")
+    assert app._notify_queue.qsize() == 0
+
+
+def test_notify_disabled_drops_queued_event(app):
+    app._notify_cfg.update({"token": "", "chat": "", "url": ""})
+    app._notify_queue.put(("e", "x"))
+    app._notify_tick(timeout=0.01)
+    assert app._notify_queue.qsize() == 0
+    assert app._notify_pending_all() == []
 
 
 def test_status_reports_notify_channel(conf_env):
     conf_env.write_text('NAIVEPANEL_NOTIFY_URL="https://example.com/hook"\n')
     m = _reload()
-    assert m.NOTIFY_CHANNEL == "webhook"
+    assert m._notify_channel() == "webhook"
     d = m.app.test_client().get("/api/status").get_json()
     assert d["notify"] == {"enabled": True, "channel": "webhook", "pending": 0}
 
@@ -2598,8 +2806,7 @@ def test_notify_send_via_alive_proxy(app, monkeypatch):
     app._save_json(app.ACTIVE_CONFIG,
                    {"listen": f"socks://127.0.0.1:{port}", "proxy": "https://u:p@h"})
     captured = []
-    monkeypatch.setattr(app, "NOTIFY_CHANNEL", "webhook")
-    monkeypatch.setattr(app, "NOTIFY_URL", "https://example.com/hook")
+    _notify_webhook(app)
     monkeypatch.setattr(app, "_run", _nt_run_capture(captured, []))
     try:
         assert app._notify_send("e", "x") is True
@@ -2614,8 +2821,7 @@ def test_notify_send_proxy_dead_falls_back_direct(app, monkeypatch):
     app._save_json(app.ACTIVE_CONFIG,
                    {"listen": "socks://127.0.0.1:1", "proxy": "https://u:p@h"})
     captured = []
-    monkeypatch.setattr(app, "NOTIFY_CHANNEL", "webhook")
-    monkeypatch.setattr(app, "NOTIFY_URL", "https://example.com/hook")
+    _notify_webhook(app)
     monkeypatch.setattr(app, "_run", _nt_run_capture(captured, []))
     assert app._notify_send("e", "x") is True
     assert len(captured) == 1 and "-x" not in captured[0]
@@ -2625,8 +2831,7 @@ def test_notify_send_all_dead_returns_false(app, monkeypatch):
     app._save_json(app.ACTIVE_CONFIG,
                    {"listen": "socks://127.0.0.1:1", "proxy": "https://u:p@h"})
     captured = []
-    monkeypatch.setattr(app, "NOTIFY_CHANNEL", "webhook")
-    monkeypatch.setattr(app, "NOTIFY_URL", "https://example.com/hook")
+    _notify_webhook(app)
     monkeypatch.setattr(app, "_run",
                         _nt_run_capture(captured, [{"rc": 7, "stdout": "",
                                                     "stderr": "refused"}]))
@@ -2641,7 +2846,7 @@ def test_notify_pending_append_flush_and_status(app, monkeypatch):
     # доставляем: первый успех, второй неудача → остаётся второй
     results = [{"rc": 0, "stdout": "", "stderr": ""},
                {"rc": 7, "stdout": "", "stderr": "refused"}]
-    monkeypatch.setattr(app, "NOTIFY_CHANNEL", "webhook")
+    _notify_webhook(app)
     monkeypatch.setattr(app, "_run", lambda cmd, timeout=10: results.pop(0))
     app._save_json(app.ACTIVE_CONFIG,
                    {"listen": "socks://127.0.0.1:1", "proxy": "https://u:p@h"})
@@ -2657,6 +2862,325 @@ def test_notify_pending_append_flush_and_status(app, monkeypatch):
         app._notify_pending_append("e", f"t{i}")
     assert len(app._notify_pending_all()) == 50
     assert app._notify_pending_all()[-1]["text"] == "t59"
+
+
+# --- Настройка Telegram из панели --------------------------------------------
+
+def test_ui_has_telegram_controls(app):
+    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    for marker in (
+            'id="tgForm"', 'id="tgToken"', 'id="tgChat"', 'id="tgMsg"',
+            # токен именно замаскирован (type="password" есть и в других полях)
+            'type="password" id="tgToken"',
+            # и не подставляется автозаполнением браузера
+            'id="tgToken" autocomplete="off"',
+            # кнопки теста/отключения скрыты, пока канал не настроен
+            'data-action="tgTest" hidden', 'data-action="tgOff" hidden',
+            # проводка в ACTIONS (inline-обработчики запрещены CSP)
+            'tgTest: () => testTelegram()', 'tgOff: () => offTelegram()',
+            # поллинг статуса не затирает chat_id, пока его правят
+            "document.activeElement !== $('tgChat')",
+            # подсказка ntInfo ведёт в раздел, а не только в panel.conf
+            'Уведомления: настраиваются ниже',
+    ):
+        assert marker in html, marker
+
+
+def test_notify_telegram_save_and_get(conf_env, monkeypatch):
+    conf_env.write_text('# keep me\nNAIVEPANEL_BIND="127.0.0.1:8089"\n')
+    monkeypatch.setenv("NAIVEPANEL_CONF", str(conf_env))
+    m = _reload()
+    # настоящий _tg_bot_name кэширует сам; заглушка повторяет контракт
+    def fake_bot(token):
+        m._bot_cache[token] = ("@testbot", time.monotonic() + 3600)
+        return "@testbot"
+
+    monkeypatch.setattr(m, "_tg_bot_name", fake_bot)
+    c = m.app.test_client()
+    token = "123456:abcdefghijklmnopqrstuvwxyz"
+    r = c.post("/api/notify/telegram", json={"token": token, "chat_id": "42"},
+               headers=CSRF)
+    assert r.status_code == 200
+    stored = conf_env.read_text()
+    assert "# keep me" in stored and 'NAIVEPANEL_BIND="127.0.0.1:8089"' in stored
+    assert f'NAIVEPANEL_TG_TOKEN="{token}"' in stored
+    assert 'NAIVEPANEL_TG_CHAT="42"' in stored
+    assert m._notify_channel() == "telegram"
+
+    d = c.get("/api/notify").get_json()
+    assert token not in json.dumps(d)
+    assert d["telegram"] == {"configured": True, "chat_id": "42",
+                             "bot": "@testbot"}
+
+
+def test_notify_telegram_empty_token_keeps_existing(conf_env, monkeypatch):
+    monkeypatch.setenv("NAIVEPANEL_CONF", str(conf_env))
+    m = _reload()
+    monkeypatch.setattr(m, "_tg_bot_name", lambda token: None)
+    token = "123:abcdefghijklmnopqrstuvwxyz"
+    m._notify_cfg.update({"token": token, "chat": "42", "url": ""})
+    c = m.app.test_client()
+    assert c.post("/api/notify/telegram",
+                  json={"token": "", "chat_id": "-100123456"},
+                  headers=CSRF).status_code == 200
+    assert m._notify_snapshot()["token"] == token
+    assert m._notify_snapshot()["chat"] == "-100123456"
+
+
+def test_notify_telegram_delete_disables_and_clears_pending(conf_env, monkeypatch):
+    conf_env.write_text('NAIVEPANEL_TG_TOKEN="123:abcdefghijklmnopqrstuvwxyz"\n'
+                        'NAIVEPANEL_TG_CHAT="42"\n')
+    monkeypatch.setenv("NAIVEPANEL_CONF", str(conf_env))
+    m = _reload()
+    m._notify_pending_append("e", "stale")
+    m._notify_queue.put(("e", "queued"))
+    c = m.app.test_client()
+    assert c.delete("/api/notify/telegram", headers=CSRF).status_code == 200
+    assert "NAIVEPANEL_TG_TOKEN" not in conf_env.read_text()
+    assert m._notify_channel() is None
+    assert m._notify_pending_all() == []
+    assert m._notify_queue.qsize() == 0
+
+
+def test_notify_telegram_delete_keeps_webhook_pending(conf_env, monkeypatch):
+    conf_env.write_text(
+        'NAIVEPANEL_TG_TOKEN="123456:abcdefghijklmnopqrstuvwxyz"\n'
+        'NAIVEPANEL_TG_CHAT="42"\n'
+        'NAIVEPANEL_NOTIFY_URL="https://example.com/hook"\n')
+    monkeypatch.setenv("NAIVEPANEL_CONF", str(conf_env))
+    m = _reload()
+    m._notify_pending_append("e", "keep")
+    m._notify_queue.put(("e", "keep"))
+    c = m.app.test_client()
+    assert c.delete("/api/notify/telegram", headers=CSRF).status_code == 200
+    assert m._notify_channel() == "webhook"
+    assert m._notify_pending_all() != []
+    assert m._notify_queue.qsize() == 1
+
+
+def test_notify_telegram_save_reports_conf_write_failure(conf_env, monkeypatch):
+    monkeypatch.setenv("NAIVEPANEL_CONF", str(conf_env))
+    m = _reload()
+    monkeypatch.setattr(m.tempfile, "mkstemp",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("ro")))
+    c = m.app.test_client()
+    r = c.post("/api/notify/telegram",
+               json={"token": "123456:abcdefghijklmnopqrstuvwxyz",
+                     "chat_id": "42"}, headers=CSRF)
+    assert r.status_code == 500
+    assert "panel.conf" in r.get_json()["error"]
+    assert m._notify_channel() is None
+
+
+def test_notify_telegram_validation(conf_env, monkeypatch):
+    monkeypatch.setenv("NAIVEPANEL_CONF", str(conf_env))
+    m = _reload()
+    monkeypatch.setattr(m, "_tg_bot_name", lambda token: None)
+    c = m.app.test_client()
+    good = "123456:abcdefghijklmnopqrstuvwxyz"
+    assert c.post("/api/notify/telegram", json={"token": "bad", "chat_id": "42"},
+                  headers=CSRF).status_code == 400
+    assert c.post("/api/notify/telegram",
+                  json={"token": good,
+                        "chat_id": "not a chat"}, headers=CSRF).status_code == 400
+    # арабо-индийские цифры не считаем числом: только ASCII [0-9]
+    assert c.post("/api/notify/telegram",
+                  json={"token": "١٢٣٤٥:abcdefghijklmnopqrstuvwxyz",
+                        "chat_id": "42"}, headers=CSRF).status_code == 400
+    # слишком длинный chat_id не пройдёт
+    assert c.post("/api/notify/telegram",
+                  json={"token": good, "chat_id": "1" * 30},
+                  headers=CSRF).status_code == 400
+    for chat in ("42", "-100123456", "@mychannel"):
+        assert c.post("/api/notify/telegram",
+                      json={"token": good, "chat_id": chat},
+                      headers=CSRF).status_code == 200
+
+
+def test_notify_mutations_blocked_without_auth_off_loopback(client, app, monkeypatch):
+    monkeypatch.setattr(app, "_bind_is_loopback", lambda: False)
+    r = client.post("/api/notify/telegram",
+                    json={"token": "123:abcdefghijklmnopqrstuvwxyz",
+                          "chat_id": "42"}, headers=CSRF)
+    assert r.status_code == 403
+
+
+def _notify_send_stub(calls, result=(True, "")):
+    """Заглушка _notify_send: фиксирует вызов и требует detail=True."""
+    def stub(event, text, detail=False):
+        assert detail is True
+        calls.append(event)
+        return result
+    return stub
+
+
+def test_notify_test_sends_and_rate_limits(app, monkeypatch):
+    app._notify_cfg.update({"token": "123456:abcdefghijklmnopqrstuvwxyz",
+                            "chat": "42", "url": ""})
+    app._notify_test_last = 0.0
+    calls = []
+    monkeypatch.setattr(app, "_notify_send", _notify_send_stub(calls))
+    c = app.app.test_client()
+    assert c.post("/api/notify/test", headers=CSRF).status_code == 200
+    assert calls == ["test"]
+    r = c.post("/api/notify/test", headers=CSRF)
+    assert r.status_code == 429
+    err = r.get_json()["error"]
+    assert "не чаще" in err
+    assert "уже отправлено" not in err
+
+
+def test_notify_test_reports_telegram_error(app, monkeypatch):
+    app._notify_cfg.update({"token": "123456:abcdefghijklmnopqrstuvwxyz",
+                            "chat": "42", "url": ""})
+    app._notify_test_last = 0.0
+    monkeypatch.setattr(app, "_notify_send",
+                        _notify_send_stub([], (False, "chat not found")))
+    c = app.app.test_client()
+    r = c.post("/api/notify/test", headers=CSRF)
+    assert r.status_code == 502
+    assert "chat not found" in r.get_json()["error"]
+    # неудачная доставка тоже сжигает окно: сразу повторять нельзя
+    assert c.post("/api/notify/test", headers=CSRF).status_code == 429
+
+
+def test_notify_test_requires_channel(app):
+    app._notify_cfg.update({"token": "", "chat": "", "url": ""})
+    c = app.app.test_client()
+    assert c.post("/api/notify/test", headers=CSRF).status_code == 409
+
+
+def test_notify_test_blocked_without_auth_off_loopback(client, app, monkeypatch):
+    monkeypatch.setattr(app, "_bind_is_loopback", lambda: False)
+    r = client.post("/api/notify/test", headers=CSRF)
+    assert r.status_code == 403
+
+
+def test_notify_test_throttle_resets_on_reconfigure(conf_env, monkeypatch):
+    token = "123456:abcdefghijklmnopqrstuvwxyz"
+    monkeypatch.setenv("NAIVEPANEL_CONF", str(conf_env))
+    m = _reload()
+    monkeypatch.setattr(m, "_tg_bot_name", lambda token: None)
+    m._notify_cfg.update({"token": token, "chat": "42", "url": ""})
+    m._notify_test_last = 0.0
+    calls = []
+    monkeypatch.setattr(m, "_notify_send", _notify_send_stub(calls))
+    c = m.app.test_client()
+    assert c.post("/api/notify/test", headers=CSRF).status_code == 200
+    assert c.post("/api/notify/test", headers=CSRF).status_code == 429
+    # пересохранение конфига сбрасывает окно → тест сразу разрешён
+    r = c.post("/api/notify/telegram", json={"token": token, "chat_id": "42"},
+               headers=CSRF)
+    assert r.status_code == 200
+    assert c.post("/api/notify/test", headers=CSRF).status_code == 200
+    assert c.post("/api/notify/test", headers=CSRF).status_code == 429
+    # удаление тоже сбрасывает окно; канал возвращаем в runtime напрямую,
+    # чтобы не проходить через save и проверить именно DELETE
+    assert c.delete("/api/notify/telegram", headers=CSRF).status_code == 200
+    m._notify_cfg.update({"token": token, "chat": "42", "url": ""})
+    assert c.post("/api/notify/test", headers=CSRF).status_code == 200
+
+
+def test_notify_save_warns_when_env_wins(conf_env, monkeypatch):
+    monkeypatch.setenv("NAIVEPANEL_CONF", str(conf_env))
+    monkeypatch.setenv("NAIVEPANEL_TG_TOKEN", "999:fromenvironment0000000000")
+    m = _reload()
+    monkeypatch.setattr(m, "_tg_bot_name", lambda token: None)
+    c = m.app.test_client()
+    r = c.post("/api/notify/telegram",
+               json={"token": "123456:abcdefghijklmnopqrstuvwxyz",
+                     "chat_id": "42"}, headers=CSRF)
+    assert r.status_code == 200
+    assert r.get_json()["warning"]
+
+
+def test_notify_conf_upsert_removes_duplicate_keys(conf_env, monkeypatch):
+    conf_env.write_text('NAIVEPANEL_TG_TOKEN="old1"\n'
+                        'NAIVEPANEL_TG_TOKEN="old2"\n')
+    monkeypatch.setenv("NAIVEPANEL_CONF", str(conf_env))
+    m = _reload()
+    token = "123456:abcdefghijklmnopqrstuvwxyz"
+    r = m.app.test_client().post("/api/notify/telegram",
+                                 json={"token": token, "chat_id": "42"},
+                                 headers=CSRF)
+    assert r.status_code == 200
+    stored = conf_env.read_text()
+    assert stored.count("NAIVEPANEL_TG_TOKEN") == 1
+    assert token in stored and "old1" not in stored and "old2" not in stored
+
+
+def test_notify_conf_upsert_delete_removes_duplicates(conf_env, monkeypatch):
+    conf_env.write_text('NAIVEPANEL_TG_TOKEN="old1"\n'
+                        'NAIVEPANEL_TG_TOKEN="old2"\n')
+    monkeypatch.setenv("NAIVEPANEL_CONF", str(conf_env))
+    m = _reload()
+    m._conf_upsert({"NAIVEPANEL_TG_TOKEN": None})
+    assert "NAIVEPANEL_TG_TOKEN" not in conf_env.read_text()
+
+
+def test_notify_telegram_save_sets_0600(conf_env, monkeypatch):
+    conf_env.write_text('NAIVEPANEL_BIND="127.0.0.1:8089"\n')
+    conf_env.chmod(0o644)
+    monkeypatch.setenv("NAIVEPANEL_CONF", str(conf_env))
+    m = _reload()
+    monkeypatch.setattr(m, "_tg_bot_name", lambda token: None)
+    r = m.app.test_client().post(
+        "/api/notify/telegram",
+        json={"token": "123456:abcdefghijklmnopqrstuvwxyz", "chat_id": "42"},
+        headers=CSRF)
+    assert r.status_code == 200
+    assert (conf_env.stat().st_mode & 0o777) == 0o600
+
+
+def test_notify_telegram_delete_warns_when_env_wins(conf_env, monkeypatch):
+    monkeypatch.setenv("NAIVEPANEL_CONF", str(conf_env))
+    monkeypatch.setenv("NAIVEPANEL_TG_TOKEN", "999:fromenvironment0000000000")
+    m = _reload()
+    r = m.app.test_client().delete("/api/notify/telegram", headers=CSRF)
+    assert r.status_code == 200
+    assert r.get_json()["warning"]
+    monkeypatch.delenv("NAIVEPANEL_TG_TOKEN")
+    m = _reload()
+    r = m.app.test_client().delete("/api/notify/telegram", headers=CSRF)
+    assert r.get_json()["warning"] is None
+
+
+def test_conf_upsert_concurrent_saves_use_unique_temps(conf_env, monkeypatch):
+    conf_env.write_text('NAIVEPANEL_BIND="127.0.0.1:8089"\n')
+    monkeypatch.setenv("NAIVEPANEL_CONF", str(conf_env))
+    m = _reload()
+    barrier = threading.Barrier(2, timeout=10)
+    real_replace = os.replace
+
+    def synced_replace(src, dst):
+        barrier.wait()  # оба потока уже записали свой temp
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(m.os, "replace", synced_replace)
+    errors = []
+
+    def save(key):
+        try:
+            m._conf_upsert({key: "1"})
+        except Exception as exc:  # noqa: BLE001 — тест ловит любой сбой
+            errors.append(exc)
+
+    threads = [threading.Thread(target=save, args=(k,))
+               for k in ("NAIVEPANEL_TG_TOKEN", "NAIVEPANEL_TG_CHAT")]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=15)
+    assert errors == []
+    assert not list(conf_env.parent.glob(".panel.conf.*"))
+
+
+def test_tg_bot_name_non_dict_result(app, monkeypatch):
+    for raw in ('{"result": []}', "[]", "null"):
+        monkeypatch.setattr(app, "_http_get",
+                            lambda url, timeout=5, _r=raw: _r)
+        app._bot_cache.clear()
+        assert app._tg_bot_name("123456:abcdefghijklmnopqrstuvwxyz") is None
 
 
 # --- Rollback: откат панели и бинарника из бэкапов ----------------------------

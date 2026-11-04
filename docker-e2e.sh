@@ -16,7 +16,7 @@
 set -eu
 
 REPO_DIR=$(cd "$(dirname "$0")" && pwd)
-REF=v0.15.0
+REF=v0.16.0
 BASE_IMAGE="${BASE_IMAGE:-debian:bookworm-slim}"
 AUTH_FLAG=""
 MODE_FLAGS="--yes"
@@ -83,6 +83,8 @@ DOCKER
 echo "==> building image (base: $BASE_IMAGE)"
 docker build --build-arg BASE_IMAGE="$BASE_IMAGE" -t naivepanel-e2e "$WORK" >/dev/null
 
+if [ -n "$AUTH_FLAG" ]; then PW_EXPECT=401; else PW_EXPECT=409; fi
+
 cat > "$WORK/entrypoint.sh" <<EOF
 set -e
 python3 /srv/server.py &
@@ -113,6 +115,10 @@ fi
 echo "get raw: \$(curl -s http://127.0.0.1:8089/api/configs/home)"
 echo "csrf_no_header=\$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8089/api/service/stop) (expect 403)"
 echo "csrf_with_header=\$(curl -s \$H -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8089/api/service/stop) (expect 200)"
+echo "password_no_auth=\$(curl -s -o /dev/null -w '%{http_code}' \$H \\
+  -H 'Content-Type: application/json' -X POST \\
+  -d '{"current":"x","new":"12345678"}' \\
+  http://127.0.0.1:8089/api/password) (expect $PW_EXPECT)"
 
 echo "==> API hardening checks (list no-store + masking, scheme allowlist, server)"
 # список не должен светить пароль upstream и обязан быть no-store
