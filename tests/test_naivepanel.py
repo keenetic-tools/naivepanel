@@ -535,7 +535,7 @@ _LAN_SENSITIVE = [
 
 
 def test_lan_without_auth_rejects_sensitive_routes(client, app, monkeypatch):
-    monkeypatch.setattr(app, "_bind_is_loopback", lambda: False)
+    monkeypatch.setattr(app.cfg, "_bind_is_loopback", lambda: False)
     for method, path in _LAN_SENSITIVE:
         r = getattr(client, method)(path, headers=CSRF, json={})
         assert r.status_code == 403, (method, path, r.status_code)
@@ -546,7 +546,7 @@ def test_lan_with_password_allows_requests(client, app, monkeypatch):
     bcrypt = pytest.importorskip("bcrypt")
     h = bcrypt.hashpw(b"s3cret", bcrypt.gensalt()).decode()
     app.PANEL_ADMIN_PASS.write_text(f"admin:{h}\n", encoding="utf-8")
-    monkeypatch.setattr(app, "_bind_is_loopback", lambda: False)
+    monkeypatch.setattr(app.cfg, "_bind_is_loopback", lambda: False)
     token = base64.b64encode(b"admin:s3cret").decode()
     r = client.get("/api/configs", headers={**CSRF, "Authorization": f"Basic {token}"})
     assert r.status_code == 200
@@ -1867,7 +1867,7 @@ def test_apply_wrapper_records_installer_exit_code(client, app, env, monkeypatch
 
 
 def test_apply_refuses_exposed_panel_without_password(client, app, monkeypatch):
-    app.PANEL_BIND = "192.168.1.1:8089"  # admin.pass не существует (fixture)
+    app.cfg.PANEL_BIND = "192.168.1.1:8089"  # admin.pass не существует (fixture)
     monkeypatch.setattr(app, "_latest_release",
                         lambda: {"tag": "v9.9.9", "notes": "", "url": ""})
     r = client.post("/api/update/apply", headers=CSRF)
@@ -1879,7 +1879,7 @@ def test_apply_with_password_allowed_on_lan_bind(client, app, env, monkeypatch):
     bcrypt = pytest.importorskip("bcrypt")
     h = bcrypt.hashpw(b"s3cret", bcrypt.gensalt()).decode()
     app.PANEL_ADMIN_PASS.write_text(f"admin:{h}\n", encoding="utf-8")
-    app.PANEL_BIND = "192.168.1.1:8089"  # не loopback, но auth включён — можно
+    app.cfg.PANEL_BIND = "192.168.1.1:8089"  # не loopback, но auth включён — можно
     _apply_stub(env, monkeypatch, app)
     token = base64.b64encode(b"admin:s3cret").decode()
     r = client.post("/api/update/apply", headers={**CSRF, "Authorization": f"Basic {token}"})
@@ -2029,10 +2029,10 @@ def test_update_state_marks_failed_when_installer_dead(app):
 def test_bind_is_loopback_variants(app):
     assert app._bind_is_loopback() is True            # дефолт 127.0.0.1:8089
     for bind in ("localhost:8089", "[::1]:8089", "127.0.0.1:8089"):
-        app.PANEL_BIND = bind
+        app.cfg.PANEL_BIND = bind
         assert app._bind_is_loopback() is True, bind
     for bind in ("0.0.0.0:8089", "192.168.1.1:8089"):
-        app.PANEL_BIND = bind
+        app.cfg.PANEL_BIND = bind
         assert app._bind_is_loopback() is False, bind
 
 
@@ -2347,7 +2347,7 @@ def test_naive_check_failsoft_and_cache(client, app, env, monkeypatch):
 
 def test_naive_update_refuses_exposed_panel_without_password(client, app, env, monkeypatch):
     m = _naive_env_reload(env, monkeypatch)
-    m.PANEL_BIND = "192.168.1.1:8089"
+    m.cfg.PANEL_BIND = "192.168.1.1:8089"
     _naive_rel(monkeypatch, m)
     r = m.app.test_client().post("/api/naive/update", headers=CSRF)
     assert r.status_code == 403
@@ -4099,7 +4099,7 @@ def test_notify_telegram_validation(conf_env, monkeypatch):
 
 
 def test_notify_mutations_blocked_without_auth_off_loopback(client, app, monkeypatch):
-    monkeypatch.setattr(app, "_bind_is_loopback", lambda: False)
+    monkeypatch.setattr(app.cfg, "_bind_is_loopback", lambda: False)
     r = client.post("/api/notify/telegram",
                     json={"token": "123:abcdefghijklmnopqrstuvwxyz",
                           "chat_id": "42"}, headers=CSRF)
@@ -4152,7 +4152,7 @@ def test_notify_test_requires_channel(app):
 
 
 def test_notify_test_blocked_without_auth_off_loopback(client, app, monkeypatch):
-    monkeypatch.setattr(app, "_bind_is_loopback", lambda: False)
+    monkeypatch.setattr(app.cfg, "_bind_is_loopback", lambda: False)
     r = client.post("/api/notify/test", headers=CSRF)
     assert r.status_code == 403
 
@@ -4411,7 +4411,7 @@ def test_rollback_panel_503_without_panel_init(client, app, monkeypatch):
 
 def test_rollback_refuses_exposed_panel_without_password(client, app, monkeypatch):
     _rb_make_backup(app, "v0.9.0")
-    app.PANEL_BIND = "192.168.1.1:8089"  # admin.pass не существует (fixture)
+    app.cfg.PANEL_BIND = "192.168.1.1:8089"  # admin.pass не существует (fixture)
     r = client.post("/api/rollback", json={"panel": "v0.9.0"}, headers=CSRF)
     assert r.status_code == 403
     assert "password" in r.get_json()["error"]
@@ -4746,7 +4746,7 @@ def _no_waitress(monkeypatch):
 def test_serve_refuses_werkzeug_on_lan_without_waitress(app, monkeypatch):
     # Werkzeug dev-сервер в LAN — авария конфигурации, а не fallback
     _no_waitress(monkeypatch)
-    monkeypatch.setattr(app, "_bind_is_loopback", lambda: False)
+    monkeypatch.setattr(app.cfg, "_bind_is_loopback", lambda: False)
     monkeypatch.delenv("NAIVEPANEL_DEV_SERVER", raising=False)
     with pytest.raises(SystemExit):
         app._serve(app.app, "192.168.1.1", 8089)
@@ -4757,12 +4757,12 @@ def test_serve_werkzeug_fallback_allowed_on_loopback_and_override(app, monkeypat
     calls = []
     monkeypatch.setattr(app.app, "run", lambda **k: calls.append(k))
     # loopback — законный dev-режим
-    monkeypatch.setattr(app, "_bind_is_loopback", lambda: True)
+    monkeypatch.setattr(app.cfg, "_bind_is_loopback", lambda: True)
     app._serve(app.app, "127.0.0.1", 8089)
     assert calls, "loopback fallback не сработал"
     # явный override и в LAN
     calls.clear()
-    monkeypatch.setattr(app, "_bind_is_loopback", lambda: False)
+    monkeypatch.setattr(app.cfg, "_bind_is_loopback", lambda: False)
     monkeypatch.setenv("NAIVEPANEL_DEV_SERVER", "1")
     app._serve(app.app, "192.168.1.1", 8089)
     assert calls, "NAIVEPANEL_DEV_SERVER=1 override не сработал"
@@ -4881,3 +4881,43 @@ def test_rollback_cleanup_rejects_bad_keep(client, app):
     for bad in ("all", -1, 1.5, True):
         r = client.post("/api/rollback/cleanup", json={"keep": bad}, headers=CSRF)
         assert r.status_code == 400, bad
+
+
+# --- ARCH-01: поэтапное разделение backend (Task 15) ---------------------------
+
+def test_panel_package_config_extraction(app, env, monkeypatch):
+    # шаг 1: конфигурация — panel/config.py; naivepanel.py — compatibility-
+    # модуль; reload(naivepanel) пересобирает конфиг (env перечитывается)
+    import panel.config as cfg
+    assert cfg is app.cfg, "cfg-модуль должен быть тем же объектом"
+    assert cfg.APP_VERSION == app.APP_VERSION
+    assert cfg.CONF_D == app.CONF_D
+    monkeypatch.setenv("NAIVEPROXY_DIR", str(env / "proxy-reloaded"))
+    m = _reload()
+    assert m.NAIVEPROXY_DIR == env / "proxy-reloaded"
+    assert cfg.NAIVEPROXY_DIR == m.NAIVEPROXY_DIR, "config не пересобрался"
+
+
+def test_backup_and_restore_include_panel_package(app, env):
+    # бэкап/откат обязаны знать о пакете: пропавший panel/config.py после
+    # отката панели = нерабочая установка
+    pkg = app.PANEL_DIR / "panel"
+    pkg.mkdir(parents=True, exist_ok=True)
+    (pkg / "config.py").write_text("# current config", encoding="utf-8")
+    backup = app._backup_panel_files()
+    assert (backup / "panel" / "config.py").read_text() == "# current config"
+    # симулируем «обновление», затёршее пакет, и откат
+    (pkg / "config.py").write_text("# new version", encoding="utf-8")
+    src = backup / "panel" / "config.py"
+    tmp = (pkg / "config.py").with_name("config.py.restore")
+    import shutil as _sh
+    _sh.copy2(src, tmp)
+    os.replace(tmp, pkg / "config.py")
+    assert (pkg / "config.py").read_text() == "# current config"
+
+
+def test_install_sh_ships_panel_package(app):
+    src = (APP_DIR / "install.sh").read_text(encoding="utf-8")
+    assert 'PANEL_PKG="__init__.py config.py"' in src, "installer не качает пакет"
+    assert '"$BASE/panel/$f"' in src, "нет загрузки файлов пакета"
+    assert 'rm -rf "$PANEL_DIR/panel"' in src, "пакет не заменяется целиком"

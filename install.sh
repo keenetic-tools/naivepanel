@@ -497,6 +497,12 @@ mkdir -p "$STAGE/templates"
 fetch "$BASE/templates/index.html"    >"$STAGE/templates/index.html" || die "templates/index.html"
 fetch "$BASE/S99naivepanel"           >"$STAGE/S99naivepanel"       || die "S99naivepanel"
 fetch "$BASE/S99naiveproxy"           >"$STAGE/S99naiveproxy"       || die "S99naiveproxy"
+# backend-пакет panel/ (ARCH-01): каждый модуль — отдельный файл релиза
+PANEL_PKG="__init__.py config.py"
+mkdir -p "$STAGE/panel"
+for f in $PANEL_PKG; do
+    fetch "$BASE/panel/$f" >"$STAGE/panel/$f" || die "panel/$f"
+done
 
 # --- verify checksums: fail-closed (SEC-03) ---------------------------------
 # Пропускать проверку нельзя: SHA256SUMS — единственный integrity-барьер
@@ -542,6 +548,13 @@ mkdir -p "$PANEL_DIR/templates" "$NAIVEPROXY_DIR/conf.d"
 
 putfile "$STAGE/naivepanel.py" "$PANEL_DIR/naivepanel.py" 0644
 putfile "$STAGE/templates/index.html" "$PANEL_DIR/templates/index.html" 0644
+# пакет меняем целиком: файл, удалённый из релиза, не должен оставаться
+# на месте после апгрейда (смешение версий пакета)
+rm -rf "$PANEL_DIR/panel"
+mkdir -p "$PANEL_DIR/panel"
+for f in $PANEL_PKG; do
+    putfile "$STAGE/panel/$f" "$PANEL_DIR/panel/$f" 0644
+done
 putfile "$STAGE/S99naivepanel" "$INIT_DIR/S99naivepanel" 0755
 
 if [ "$NO_NAIVE_INIT" = 1 ]; then
