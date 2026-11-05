@@ -212,6 +212,10 @@ mkdir -p /opt/etc/init.d
 # имитируем протухший S99naiveproxy (как после апгрейда v0.4.0 с pre-0.2.0):
 printf '#!/bin/sh\nDAEMON_OPTS=/opt/etc/naiveproxy/config.json\n[ -f /opt/etc/naiveproxy/config.json ] || DAEMON_OPTS=\n' > /opt/etc/init.d/S99naiveproxy
 printf 'OTHER_VAR="keep"\nNAIVEPANEL_BIND="10.9.9.9:1234"\n' > /opt/etc/init.d/rc.conf
+# SEC-01 preflight: явный LAN-bind без пароля установщик отвергает; для
+# позитивного апгрейд-сценария (flag wins) создаём admin.pass — префлайт
+# проверяет его существование
+printf 'admin:dummy-for-preflight\n' > /opt/etc/naive/panel/admin.pass
 curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/$REF/install.sh | sh -s -- --yes --bind 192.168.1.1:8089
 if grep -q '^NAIVEPANEL_BIND="192.168.1.1:8089"' /opt/etc/naive/panel/panel.conf \
    && ! grep -q 'NAIVEPANEL' /opt/etc/init.d/rc.conf \
@@ -220,6 +224,15 @@ if grep -q '^NAIVEPANEL_BIND="192.168.1.1:8089"' /opt/etc/naive/panel/panel.conf
 else
   echo "FAIL: panel.conf migration"; cat /opt/etc/naive/panel/panel.conf /opt/etc/init.d/rc.conf; exit 1
 fi
+# а без пароля тот же флаг обязан валить установку (fail-closed)
+rm -f /opt/etc/naive/panel/admin.pass
+if curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/$REF/install.sh \
+     | sh -s -- --yes --bind 192.168.1.1:8089 >/tmp/bind-preflight.log 2>&1; then
+  echo "FAIL: LAN bind without password accepted"; exit 1
+fi
+grep -q "exposes the panel" /tmp/bind-preflight.log \
+  && echo "SEC-01 preflight: OK (dies on LAN bind without password)" \
+  || { echo "FAIL: unexpected install failure"; cat /tmp/bind-preflight.log; exit 1; }
 if grep -q '/opt/etc/naive/proxy/config.json' /opt/etc/init.d/S99naiveproxy \
    && ! grep -q '/opt/etc/naiveproxy' /opt/etc/init.d/S99naiveproxy; then
   echo "stale S99naiveproxy replaced: OK"
