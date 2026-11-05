@@ -156,6 +156,20 @@ done
 if [ -n "$BIND" ]; then
     echo "$BIND" | grep -Eq '^\[?[A-Za-z0-9.:-]+\]?:[0-9]+$' \
         || die "--bind: expected HOST:PORT (e.g. 192.168.1.1:8089), got '$BIND'"
+    # fail-closed preflight (SEC-01): явный LAN-bind без пароля открывает
+    # пресеты с паролями всему LAN. Обход — задать пароль (--with-auth) или
+    # отредактировать panel.conf вручную. Апгрейд без флага --bind не
+    # проверяем: существующие установки не должны ломаться.
+    # Проверка best-effort (полная — ipaddress в самом панеле): 127/8,
+    # localhost и ::1 считаем loopback.
+    if [ "$WITH_AUTH" != 1 ] && [ ! -f "$PANEL_DIR/admin.pass" ]; then
+        bind_host=$(printf '%s' "$BIND" | sed 's/:[0-9]*$//; s/^\[//; s/\]$//')
+        case "$bind_host" in
+            localhost|127.*|::1) ;;
+            *) die "--bind $BIND exposes the panel to LAN without a password:
+       rerun with --with-auth (recommended) or set a password first" ;;
+        esac
+    fi
 fi
 if [ -n "$HOSTS" ]; then
     echo "$HOSTS" | grep -Eq '^(\[?[A-Za-z0-9.:-]+\]?(:[0-9]+)?)(,\[?[A-Za-z0-9.:-]+\]?(:[0-9]+)?)*$' \
@@ -484,10 +498,37 @@ fetch "$BASE/templates/index.html"    >"$STAGE/templates/index.html" || die "tem
 fetch "$BASE/S99naivepanel"           >"$STAGE/S99naivepanel"       || die "S99naivepanel"
 fetch "$BASE/S99naiveproxy"           >"$STAGE/S99naiveproxy"       || die "S99naiveproxy"
 
+# --- verify checksums: fail-closed (SEC-03) ---------------------------------
+# Пропускать проверку нельзя: SHA256SUMS — единственный integrity-барьер
+# до внедрения подписи релизов (план, Task 8b). Нет sha256sum — верифицируем
+# python3 (панель без него в любом случае не работает); нет и его — умираем.
 if command -v sha256sum >/dev/null 2>&1; then
     ( cd "$STAGE" && sha256sum -c SHA256SUMS ) || die "checksum verification failed"
+elif [ -x "$PYTHON" ]; then
+    ( cd "$STAGE" && "$PYTHON" -c '
+import hashlib, sys
+ok = True
+for line in open("SHA256SUMS", encoding="utf-8"):
+    line = line.strip()
+    if not line:
+        continue
+    expected, _, name = line.partition(" ")
+    name = name.lstrip("*").strip()
+    try:
+        actual = hashlib.sha256(open(name, "rb").read()).hexdigest()
+    except OSError:
+        print(name + ": FAILED open or read")
+        ok = False
+        continue
+    if actual != expected.lower():
+        print(name + ": FAILED")
+        ok = False
+    else:
+        print(name + ": OK")
+sys.exit(0 if ok else 1)
+' ) || die "checksum verification failed"
 else
-    warn "sha256sum not found — skipping checksum verification"
+    die "neither sha256sum nor python3: cannot verify SHA256SUMS"
 fi
 
 # --- install files ---------------------------------------------------------
@@ -631,8 +672,15 @@ if [ ! -f "$PANEL_CONF" ]; then
 #NAIVEPANEL_TG_CHAT=""
 #NAIVEPANEL_NOTIFY_URL=""
 EOF
-    chmod 0644 "$PANEL_CONF"
+    chmod 0600 "$PANEL_CONF"
     info "created $PANEL_CONF (settings template — uncomment what you need)"
+else
+    # апгрейд с версий до v0.18.0: conf создавался 0644, а внутри могут
+    # быть токены уведомлений — закрываем group/other
+    if [ "$(stat -c %a "$PANEL_CONF" 2>/dev/null || echo 600)" != "600" ]; then
+        chmod 0600 "$PANEL_CONF" 2>/dev/null \
+            && info "panel.conf: chmod 0600 (notification tokens are private)"
+    fi
 fi
 
 # legacy: перенести NAIVEPANEL_BIND/HOSTS из rc.conf (v0.4.0 и раньше писали

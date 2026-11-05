@@ -27,11 +27,26 @@ PYTHON=/opt/bin/python3
 [ -x "$PYTHON" ] || PYTHON=/opt/bin/python
 [ -x "$PYTHON" ] || PYTHON=$(command -v python3 || echo python3)
 
+# --- PID identity (SEC-05) ---------------------------------------------------
+# comm у панели — python3, как и у любого другого python-процесса роутера:
+# сверяем cmdline на naivepanel.py. Нечитаемый /proc считаем своим —
+# ложный «работает» безопаснее ложного «остановлен».
+pid_is_ours() {
+    p="$1"
+    [ -r "/proc/$p/cmdline" ] || return 0
+    grep -aq "naivepanel\.py" "/proc/$p/cmdline" 2>/dev/null
+}
+
 running() {
     [ -f "$PIDFILE" ] || return 1
     local pid
     pid=$(cat "$PIDFILE" 2>/dev/null) || return 1
-    kill -0 "$pid" 2>/dev/null
+    kill -0 "$pid" 2>/dev/null || return 1
+    if ! pid_is_ours "$pid"; then
+        echo "stale pidfile: pid=$pid is not $PROG (pid reuse?) — ignoring"
+        return 1
+    fi
+    return 0
 }
 
 # грубая ротация при старте: пока сервис работает, лог аппендится без
@@ -86,7 +101,19 @@ stop() {
         kill -0 "$pid" 2>/dev/null || break
         sleep 1
     done
-    kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null
+    if kill -0 "$pid" 2>/dev/null; then
+        echo "force-killing $PROG (pid=$pid)"
+        kill -KILL "$pid" 2>/dev/null
+        for _ in 1 2 3; do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 1
+        done
+    fi
+    if kill -0 "$pid" 2>/dev/null; then
+        # пережил KILL — pidfile не убираем: «остановлено» было бы ложью
+        echo "pid=$pid survived KILL — NOT stopping cleanly; investigate manually"
+        return 1
+    fi
     rm -f "$PIDFILE"
     return 0
 }

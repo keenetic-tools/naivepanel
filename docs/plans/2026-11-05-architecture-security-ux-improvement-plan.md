@@ -10,10 +10,12 @@
 
 **Tech Stack:** Python 3.10+, Flask, Waitress, vanilla HTML/CSS/JS, pytest, Ruff, Bandit, ShellCheck, Docker/Entware E2E, GitHub Actions.
 
-**Статус (2026-11-05):** Tasks 1–4 реализованы (ожидают релиза v0.17.2).
-Task 8 сужен решением от 2026-11-05 до непропускаемой integrity-проверки
-(checksum + безопасная распаковка); подпись релизов и trust-модель для
-naive-assets выделены в Task 8b и отложены до отдельного обсуждения.
+**Статус (2026-11-05):** Tasks 1–10 реализованы (релиз v0.18.0). Task 8
+реализован с уточнением: распаковка осталась системному `tar` (зависимость
+xz не меняется), валидация members — stdlib `tarfile` с fallback на
+`tar -tf` (только имена) для Entware-сборок без `python3-lzma`. Подпись
+релизов и trust-модель для naive-assets выделены в Task 8b и отложены
+до отдельного обсуждения.
 
 ---
 
@@ -616,8 +618,11 @@ Panel-files (`install.sh`):
 
 Naive-binary (`naivepanel.py`):
 
-- shell `tar -xJf` заменить на stdlib `tarfile` с предварительной проверкой
-  каждого member (Python 3.10: без `filter="data"` — он появился позже):
+- распаковка остаётся системному `tar` (не добавляем зависимость от
+  `python3-lzma`, которая есть не во всех Entware-сборках python3);
+  перед распаковкой — валидация всех members: основной путь stdlib
+  `tarfile` (Python 3.10: без `filter="data"` — появился позже), fallback
+  без lzma — имена из `tar -tf` (path traversal отсекается, типы — нет):
 
 ```python
 for member in archive.getmembers():

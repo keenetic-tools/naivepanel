@@ -110,8 +110,24 @@ code=\$(curl -s -o /tmp/create.json -w '%{http_code}' \$H -H 'Content-Type: appl
   http://127.0.0.1:8089/api/configs)
 echo "create=\$code (expect 201)"
 if curl -s http://127.0.0.1:8089/api/configs/home | grep -q '"password"'; then
-  echo "FAIL: password leaked via GET"; exit 1
+  echo "FAIL: password key leaked via GET"; exit 1
 fi
+# сам секрет не встречается нигде в теле: ни raw, ни percent-encoded
+if curl -s http://127.0.0.1:8089/api/configs/home | grep -q 'p@ss:word\|p%40ss%3Aword'; then
+  echo "FAIL: upstream password value leaked via GET"; exit 1
+fi
+# SEC-02: quic full-URI тоже write-only + одиночный GET no-store
+code=\$(curl -s -o /dev/null -w '%{http_code}' \$H -H 'Content-Type: application/json' \
+  -d '{"name":"qc","listen":"127.0.0.1:1081","upstream":"quic://u:quics3cret@proxy.example.com:443","username":"","password":""}' \
+  http://127.0.0.1:8089/api/configs)
+echo "create quic=\$code (expect 201)"
+[ "\$code" = "201" ] || { echo "FAIL: quic preset not created"; exit 1; }
+if curl -s http://127.0.0.1:8089/api/configs/qc | grep -q 'quics3cret'; then
+  echo "FAIL: quic password leaked via GET"; exit 1
+fi
+curl -s -D - -o /dev/null http://127.0.0.1:8089/api/configs/home | tr -d '\r' \
+  | grep -qi '^Cache-Control: no-store' \
+  || { echo "FAIL: single GET missing no-store"; exit 1; }
 echo "get raw: \$(curl -s http://127.0.0.1:8089/api/configs/home)"
 echo "csrf_no_header=\$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8089/api/service/stop) (expect 403)"
 echo "csrf_with_header=\$(curl -s \$H -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8089/api/service/stop) (expect 200)"
@@ -138,6 +154,25 @@ echo "scheme reject=\$bad (expect 400)"
 [ "\$bad" = "400" ] || { echo "FAIL: file:// scheme accepted"; cat /tmp/bad.json; exit 1; }
 # сервер: waitress, если установился, иначе Werkzeug — оба допустимы
 echo "server: \$(curl -sI http://127.0.0.1:8089/api/status | tr -d '\r' | sed -n 's/^[Ss]erver: //p')"
+
+echo "==> SEC-04/05: panel.conf mode + stale-pid safety"
+pc_mode=\$(stat -c %a /opt/etc/naive/panel/panel.conf 2>/dev/null || echo '?')
+echo "panel.conf mode: \$pc_mode (expect 600)"
+[ "\$pc_mode" = "600" ] || { echo "FAIL: panel.conf is \$pc_mode, not 0600"; exit 1; }
+# протухший pidfile: чужой процесс под pid naive — stop не должен его убить
+sleep 300 &
+foreign=\$!
+echo "\$foreign" > /opt/var/run/naiveproxy.pid
+/opt/etc/init.d/S99naiveproxy stop >/tmp/stale-stop.log 2>&1
+if kill -0 "\$foreign" 2>/dev/null; then
+  echo "foreign process survived stale-pid stop: OK"
+else
+  echo "FAIL: S99naiveproxy stop killed a foreign pid"; exit 1
+fi
+kill "\$foreign" 2>/dev/null || true
+grep -qi "stale" /tmp/stale-stop.log \
+  && echo "stale-pid message: OK" \
+  || { echo "FAIL: no stale-pid message in stop output"; cat /tmp/stale-stop.log; exit 1; }
 
 echo "==> naive binary: auto-install via install.sh (real GitHub API + asset)"
 # контейнер aarch64 (Apple/ARM хост), cpuinfo не от Cortex → aarch64_generic;

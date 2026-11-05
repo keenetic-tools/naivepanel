@@ -25,12 +25,19 @@ import socket
 import ssl  # E2E-проверка: TLS через туннель прокси, только системные CA
 # subprocess вызывается только с фиксированными argv-списками (shell=False)
 import subprocess  # nosec B404
+import tarfile
 import tempfile
 import threading
 import time
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, unquote, urlsplit
+
+try:  # не весь Entware-минималистичный python3 несёт lzma
+    import lzma  # noqa: F401
+    _HAS_LZMA = True
+except ImportError:
+    _HAS_LZMA = False
 
 from flask import (Flask, Response, abort, g, has_request_context, jsonify,
                    make_response, render_template, request)
@@ -299,6 +306,23 @@ _ALLOWED_PROXY_SCHEMES = ("https://", "http://", "quic://")
 # такой пресет нельзя было бы получить через GET (роутинг отдаёт файл)
 RESERVED_NAMES = frozenset({"export", "import"})
 
+# Дорогие операции (TCP-коннект probe, туннель E2E, внешние update-check)
+# держат worker-поток секунды. Залп таких запросов исчерпал бы все потоки
+# waitress — и панель молчала бы даже на /api/status. Лимит обязан быть
+# МЕНЬШЕ пула потоков (иначе запросы просто сериализует сам waitress, а
+# дешёвые роуты стоят в общей очереди); сверх лимита — немедленный 429.
+_EXPENSIVE_LIMIT = max(1, min(4, WAITRESS_THREADS - 2))
+_EXPENSIVE_SEM = threading.BoundedSemaphore(_EXPENSIVE_LIMIT)
+# Коалесцирование параллельных update-check'ов: один внешний резолв на
+# залп; ждавшие получают только что заполненный кэш (и force тоже — его
+# смысл «свежее, чем TTL», а не «обязательно лично сходить»).
+_UPDATE_FETCH_LOCK = threading.Lock()
+_NAIVE_FETCH_LOCK = threading.Lock()
+# Границы внешних HTTP-запросов метаданных: зависший коннект не должен
+# съедать весь таймаут, безразмерный ответ — память.
+_HTTP_CONNECT_TIMEOUT = 5
+_HTTP_MAX_BYTES = 2 * 1024 * 1024
+
 APP_VERSION = "0.17.1"
 
 
@@ -356,14 +380,27 @@ def _load_json(path: Path) -> dict[str, Any]:
 
 
 def _save_json(path: Path, data: dict[str, Any]) -> None:
-    """Atomic write + chmod 0600 — пресеты тоже могут содержать креденшалы."""
+    """Atomic write + chmod 0600 — пресеты тоже могут содержать креденшалы.
+
+    tmp уникален (mkstemp в каталоге target): общий `<name>.tmp` делал
+    параллельные записи одного файла гонкой — replace первого потока удалял
+    tmp из-под второго. Уникальность устраняет гонку файлов; порядок
+    «кто последний, тот и прав» сериализуется caller-lock'ами (REL-02).
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with tmp.open("w", encoding="utf-8") as fh:
-        json.dump(data, fh, indent=2, sort_keys=False)
-        fh.write("\n")
-    os.chmod(tmp, 0o600)
-    tmp.replace(path)
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            os.fchmod(fh.fileno(), 0o600)
+            json.dump(data, fh, indent=2, sort_keys=False)
+            fh.write("\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
     # os.replace сохраняет режим tmp-файла, но на overlay FS перестрахуемся
     os.chmod(path, 0o600)
 
@@ -388,14 +425,15 @@ def _active_name() -> str | None:
 def _split_proxy(proxy: str) -> tuple[str, str, str | None]:
     """Разбирает proxy-URI на (upstream, username, password).
 
-    Зеркально _build_payload: тот собирает строго `https://user:pass@host`
-    (креденшалы percent-encoded), поэтому тут пароль выделяется от последнего
-    `@` (легаси-конфиги с raw `@` в пароле тоже читаются), username — до первого
-    `:` в кредах, затем оба unquote. Если URI не https:// или кредов нет —
+    Все поддерживаемые схемы (https/http/quic) несут креды одинаково:
+    `scheme://user:pass@host`. Пароль выделяется от последнего `@`
+    (легаси-конфиги с raw `@` в пароле тоже читаются), username — до первого
+    `:` в кредах, затем оба unquote. Схема вне allowlist или кредов нет —
     upstream возвращается целиком, password=None (кредов не выделить).
     """
-    if proxy.startswith("https://"):
-        rest = proxy[len("https://"):]
+    idx = proxy.find("://")
+    if idx != -1 and proxy[:idx].lower() in ("https", "http", "quic"):
+        rest = proxy[idx + 3:]
         at = rest.rfind("@")
         if at != -1:
             creds, host = rest[:at], rest[at + 1:]
@@ -413,6 +451,10 @@ def _for_edit(cfg: dict[str, Any]) -> dict[str, Any]:
     не возвращается вовсе: пустое поле в форме означает «оставить прежний».
     """
     upstream, username, _ = _split_proxy(cfg.get("proxy") or "")
+    if "@" in upstream and "://" in upstream:
+        # нестандартная схема с кредами не разобрана _split_proxy —
+        # маскируем userinfo на выходе (SEC-02, defense-in-depth)
+        upstream = _mask_creds(upstream)
     out = {k: v for k, v in cfg.items() if k != "proxy"}
     out["upstream"] = upstream
     out["username"] = username
@@ -546,6 +588,57 @@ def _build_payload(data: dict[str, Any], old_proxy: str | None = None) -> dict[s
     return cfg
 
 
+_LISTEN_SCHEMES = ("socks", "socks5", "http")
+_LISTEN_MAX = 8  # sanity: реальных listen-адресов у пресета 1–3
+
+
+def _listen_problem(uri: str) -> str | None:
+    """Один listen-адрес → текст проблемы или None.
+
+    Серверная валидация не полагается на HTML-pattern: `file://`/`quic://`
+    в listen, userinfo, path/query или порт вне 1..65535 бинарник naive
+    либо отвергнет в рантайме (пресет активирован, рабочий прокси упал),
+    либо истолкует неожиданно. Порт опционален (умолчания бинарника:
+    1080/socks, 8080/http).
+    """
+    raw = (uri or "").strip()
+    if not raw:
+        return "пустой адрес"
+    if len(raw) > 200:
+        return f"слишком длинный адрес ({len(raw)} симв.)"
+    rest = raw
+    if "://" in raw:
+        scheme, _, rest = raw.partition("://")
+        if scheme.lower() not in _LISTEN_SCHEMES:
+            return f"схема {scheme}:// не поддерживается (разрешены socks/socks5/http)"
+        if not rest:
+            return "нет адреса после схемы"
+    if "@" in rest:
+        return "userinfo в listen не поддерживается"
+    if any(c in rest for c in "/?#"):
+        return "path/query/fragment в listen не поддерживается"
+    if rest.startswith("["):  # IPv6: [::1]:1080 или [::1]
+        end = rest.find("]")
+        if end == -1:
+            return "незакрытая скобка IPv6-адреса"
+        host, tail = rest[: end + 1], rest[end + 1:]
+        if tail and not tail.startswith(":"):
+            return f"мусор после IPv6-адреса: {tail!r}"
+        port_str = tail[1:]
+    else:
+        host, sep, port_str = rest.rpartition(":")
+        if not sep:  # голый host без порта
+            host, port_str = rest, ""
+    if not re.search(r"[A-Za-z0-9]", host):
+        return "пустой или некорректный host"
+    if port_str:
+        if not port_str.isdigit():
+            return f"порт не число: {port_str!r}"
+        if not 1 <= int(port_str) <= 65535:
+            return f"порт вне диапазона 1..65535: {port_str}"
+    return None
+
+
 def _validate_cfg(cfg: dict[str, Any], name: str) -> None:
     """Схема хранимого формата перед activate/PUT/импортом (400 при ошибке).
 
@@ -557,11 +650,23 @@ def _validate_cfg(cfg: dict[str, Any], name: str) -> None:
     """
     errors: list[str] = []
     listen = cfg.get("listen")
+    listen_items: list[str]
     if isinstance(listen, list):
         if not listen or any(not isinstance(l, str) or not l.strip() for l in listen):
             errors.append("listen: нужны непустые строки")
-    elif not (isinstance(listen, str) and listen.strip()):
+        elif len(listen) > _LISTEN_MAX:
+            errors.append(f"listen: не больше {_LISTEN_MAX} адресов")
+        listen_items = [l for l in listen if isinstance(l, str)]
+    elif isinstance(listen, str) and listen.strip():
+        listen_items = [listen]
+    else:
+        listen_items = []
         errors.append("listen обязателен (строка или массив строк)")
+    for l in listen_items:
+        problem = _listen_problem(l)
+        if problem:
+            errors.append(f"listen {l!r}: {problem}")
+            break  # адресов немного; одной понятной ошибки достаточно
     proxy = cfg.get("proxy")
     if not (isinstance(proxy, str) and proxy.strip()):
         errors.append("proxy обязателен")
@@ -1390,7 +1495,8 @@ class _Watchdog:
             return {"event": "tripped"}
         self._restarts.append(now)
         self.count += 1
-        res = _service("start")
+        with _SERVICE_LOCK:
+            res = _service("start")
         return {"event": "restarted", "rc": res.get("rc"),
                 "stderr": res.get("stderr")}
 
@@ -1877,6 +1983,25 @@ def _enforce_host_allowlist():
     abort(403, description="host not allowed (see NAIVEPANEL_HOSTS)")
 
 
+# --- fail-closed: LAN-bind без пароля (SEC-01) -------------------------------
+# _require_auth без admin.pass пропускает всех («только 127.0.0.1, публично
+# не торчим») — но это верно лишь при loopback-bind. Если панель привязана к
+# LAN-интерфейсу без пароля, открыты ВСЕ маршруты: список/экспорт пресетов с
+# паролями, service/panel restart, update. Один централизованный guard до
+# CSRF/auth надёжнее проверок в каждом handler; _require_local_or_auth()
+# остаётся на критичных роутах как defense-in-depth.
+
+def _panel_is_exposed_without_auth() -> bool:
+    return not PANEL_ADMIN_PASS.exists() and not _bind_is_loopback()
+
+
+@app.before_request
+def _reject_unauthenticated_exposure():
+    if _panel_is_exposed_without_auth():
+        abort(403, description="panel is exposed without a password — "
+                               "set one (install.sh --with-auth) first")
+
+
 # --- CSRF -------------------------------------------------------------------
 # Basic-креды браузер прикладывает к кросс-сайтовым запросам автоматически,
 # поэтому сама по себе auth от CSRF не защищает. POST без тела — «simple
@@ -2240,7 +2365,10 @@ def api_configs_get(name: str):
     if not NAME_RE.match(name):
         abort(400, description="invalid name")
     cfg = _load_json(CONF_D / f"{name}.json")
-    return jsonify(_for_edit(cfg))
+    resp = jsonify(_for_edit(cfg))
+    # username и структура ответа не для кеша (SEC-02)
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 @app.route("/api/configs", methods=["POST"])
@@ -2277,8 +2405,7 @@ def api_configs_update(name: str):
     if _active_name() == name:
         # Активный пресет = работающий конфиг: применяем сразу, как activate,
         # иначе «Сохранено» врало бы — файл обновлён, а naive работает старым.
-        _write_active(name, cfg)
-        restart = _service("restart") if INIT_SCRIPT.exists() else {"rc": None, "note": "no init script"}
+        restart = _apply_active(name, cfg)
     return jsonify({"name": name, "updated": True, "restart": restart})
 
 
@@ -2316,11 +2443,49 @@ def api_configs_delete(name: str):
     return jsonify({"name": name, "deleted": True})
 
 
-# Активация из двух мест: API (ручной клик) и фейловер-монитор (авто).
-# Лок страхует от гонки «пользователь активирует A в тот момент, когда
-# монитор переключает на B»: два параллельных stop/start init-скрипта
-# на медленном роутере могли бы перехлёстнуться.
-_ACTIVATE_LOCK = threading.Lock()
+# Активация из двух мест: API (ручной клик) и фейловер-монитор (авто); плюс
+# PUT активного пресета, ручные service start/stop/restart и рестарты после
+# обновления/отката бинарника. Один лок сериализует их все: параллельные
+# stop/start init-скрипта на медленном роутере перехлёстываются, а два
+# писателя config.json/.active оставляют файлы, врущие о состоянии сервиса.
+_SERVICE_LOCK = threading.Lock()
+
+
+def _apply_active(name: str, cfg: dict[str, Any]) -> dict[str, Any]:
+    """config.json/.active + рестарт под _SERVICE_LOCK, с откатом при фейле.
+
+    Рестарт с новым конфигом упал (rc != 0) → файлы не должны врать, будто
+    конфиг применён: восстанавливаем прежний config.json/.active и пробуем
+    вернуть сервис на старом конфиге. Неудача отката не скрывается —
+    результат помечается degraded, обе ошибки видны вызывающему/UI.
+    """
+    with _SERVICE_LOCK:
+        prev_name = _active_name()
+        prev_cfg = None
+        if prev_name is not None:
+            try:
+                prev_cfg = json.loads(ACTIVE_CONFIG.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                prev_cfg = None
+        _write_active(name, cfg)
+        restart = _service("restart") if INIT_SCRIPT.exists() \
+            else {"rc": None, "note": "no init script"}
+        if restart.get("rc") not in (None, 0):
+            restart = dict(restart)
+            restart["degraded"] = True
+            if prev_cfg is not None and prev_name is not None:
+                _write_active(prev_name, prev_cfg)
+                restart["rollback"] = _service("restart") \
+                    if INIT_SCRIPT.exists() else {"rc": None, "note": "no init script"}
+            else:
+                # до активации ничего не работало — не оставляем ссылки на
+                # неприменённый конфиг
+                ACTIVE_CONFIG.unlink(missing_ok=True)
+                ACTIVE_POINTER.unlink(missing_ok=True)
+            app.logger.warning(
+                "activate %s degraded: restart rc=%s, restored=%s",
+                name, restart.get("rc"), prev_name)
+        return restart
 
 
 def _activate_preset(name: str) -> dict[str, Any]:
@@ -2336,9 +2501,7 @@ def _activate_preset(name: str) -> dict[str, Any]:
         abort(404, description=f"preset {name!r} not found")
     cfg = _load_json(src)
     _validate_cfg(cfg, name)  # битый конфиг не должен ронять рабочий прокси
-    with _ACTIVATE_LOCK:
-        _write_active(name, cfg)
-        restart = _service("restart") if INIT_SCRIPT.exists() else {"rc": None, "note": "no init script"}
+    restart = _apply_active(name, cfg)
     return {"name": name, "active": True, "restart": restart}
 
 
@@ -2528,6 +2691,8 @@ def api_probe():
     if not ep:
         abort(400, description="upstream required (host[:port] or URI)")
     host, port = ep
+    if not _EXPENSIVE_SEM.acquire(blocking=False):
+        abort(429, description="too many concurrent checks, try later")
     t0 = time.monotonic()
     try:
         with socket.create_connection(ep, timeout=3.0):
@@ -2536,13 +2701,16 @@ def api_probe():
                         "ms": round((time.monotonic() - t0) * 1000)})
     except OSError as exc:  # refused/timeout/DNS — не ошибка панели
         return jsonify({"host": host, "port": port, "error": str(exc)})
+    finally:
+        _EXPENSIVE_SEM.release()
 
 
 @app.route("/api/service/<action>", methods=["POST"])
 def api_service(action: str):
     if action not in {"start", "stop", "restart"}:
         abort(400, description="action must be start|stop|restart")
-    return jsonify(_service(action))
+    with _SERVICE_LOCK:
+        return jsonify(_service(action))
 
 
 @app.route("/api/e2e", methods=["POST"])
@@ -2559,7 +2727,12 @@ def api_e2e():
         listen = _active_listen()
         if not listen:
             abort(400, description="no active preset with listen: activate a preset first")
-    resp = jsonify(_proxy_e2e_check(listen))
+    if not _EXPENSIVE_SEM.acquire(blocking=False):
+        abort(429, description="too many concurrent checks, try later")
+    try:
+        resp = jsonify(_proxy_e2e_check(listen))
+    finally:
+        _EXPENSIVE_SEM.release()
     resp.headers["Cache-Control"] = "no-store"  # результат живой, не кешируем
     return resp
 
@@ -2731,7 +2904,10 @@ def _http_get(url: str, timeout: float = 6.0) -> str:
     это штатный отказ, а не авария.
     """
     last = ""
-    for cmd in (["curl", "-fsSL", "--max-time", str(int(timeout)), url],
+    for cmd in (["curl", "-fsSL",
+                 "--connect-timeout", str(_HTTP_CONNECT_TIMEOUT),
+                 "--max-time", str(int(timeout)),
+                 "--max-filesize", str(_HTTP_MAX_BYTES), url],
                 ["wget", "-qO-", "-T", str(int(timeout)), url]):
         try:
             # cmd — фиксированный шаблон, url передаётся argv-элементом
@@ -2833,10 +3009,20 @@ def _update_state_read() -> dict[str, Any]:
         return {}
 
 
+# Резервирование запуска update-операций: резолв релиза и скачивание идут
+# по сети секунды и выполняются ВНЕ лока; сам запуск (re-check state →
+# spawn → запись «running») — под локом. Без этого два параллельных запроса
+# на медленной сети проходят гейт до первой записи «running» и поднимают
+# два установщика/воркера над одними файлами.
+_UPDATE_LAUNCH_LOCK = threading.Lock()        # panel apply + panel rollback
+_NAIVE_UPDATE_LAUNCH_LOCK = threading.Lock()  # naive update + naive rollback
+
+
 def _update_state_write(st: dict[str, Any]) -> None:
     try:
-        UPDATE_STATE.parent.mkdir(parents=True, exist_ok=True)
-        UPDATE_STATE.write_text(json.dumps(st) + "\n", encoding="utf-8")
+        # атомарно (rename): неатомарный write_text оставлял читателю пустой
+        # файл, ридер возвращал {} — панель сочла бы апдейт завершённым
+        _save_json(UPDATE_STATE, st)
     except OSError as exc:  # state не критичен: обновление переживёт и без него
         app.logger.warning("cannot write %s: %s", UPDATE_STATE, exc)
 
@@ -2906,31 +3092,49 @@ def api_update_check():
     тихой строкой, а не ошибкой.
     """
     force = request.args.get("force") in ("1", "true")
-    now = time.monotonic()
+    arrived = time.monotonic()
     if not force and _update_check_cache:
-        if now - _update_check_cache["at"] < _update_check_cache.get("ttl", _UPDATE_CHECK_TTL):
+        if arrived - _update_check_cache["at"] < _update_check_cache.get("ttl", _UPDATE_CHECK_TTL):
             out = dict(_update_check_cache["data"])
             out["cached"] = True
             return jsonify(out)
-    checked = time.strftime("%Y-%m-%dT%H:%M:%S%z")
-    try:
-        rel = _latest_release()
-    except RuntimeError as exc:
-        out = {"current": APP_VERSION, "latest": None, "available": False,
-               "error": str(exc), "checked_at": checked}
-        _update_check_cache.update({"at": now, "ttl": _UPDATE_ERR_TTL, "data": out})
-        return jsonify(out)
-    latest = rel["tag"].lstrip("vV")
-    out = {
-        "current": APP_VERSION,
-        "latest": latest,
-        "available": _ver_key(latest) > _ver_key(APP_VERSION),
-        "notes": rel["notes"],
-        "url": rel["url"],
-        "checked_at": checked,
-    }
-    _update_check_cache.update({"at": now, "ttl": _UPDATE_CHECK_TTL, "data": out})
-    return jsonify(out)
+    with _UPDATE_FETCH_LOCK:
+        # кэш, заполненный ПОСЛЕ нашего прихода, — результат соседа по
+        # залпу: берём его, второй внешний ход не нужен (в т.ч. для force —
+        # его смысл «свежее, чем у меня», а не «обязательно лично сходить»;
+        # сольный force после свежего чека ходит в сеть как раньше)
+        if _update_check_cache and _update_check_cache["at"] >= arrived:
+            out = dict(_update_check_cache["data"])
+            out["cached"] = True
+            return jsonify(out)
+        if not _EXPENSIVE_SEM.acquire(blocking=False):
+            abort(429, description="too many concurrent checks, try later")
+        try:
+            checked = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+            try:
+                rel = _latest_release()
+            except RuntimeError as exc:
+                out = {"current": APP_VERSION, "latest": None, "available": False,
+                       "error": str(exc), "checked_at": checked}
+                # at = момент заполнения, не входа в лок: сосед по залпу,
+                # пришедший позже входа, должен увидеть at >= своего прихода
+                _update_check_cache.update({"at": time.monotonic(),
+                                            "ttl": _UPDATE_ERR_TTL, "data": out})
+                return jsonify(out)
+            latest = rel["tag"].lstrip("vV")
+            out = {
+                "current": APP_VERSION,
+                "latest": latest,
+                "available": _ver_key(latest) > _ver_key(APP_VERSION),
+                "notes": rel["notes"],
+                "url": rel["url"],
+                "checked_at": checked,
+            }
+            _update_check_cache.update({"at": time.monotonic(),
+                                        "ttl": _UPDATE_CHECK_TTL, "data": out})
+            return jsonify(out)
+        finally:
+            _EXPENSIVE_SEM.release()
 
 
 @app.route("/api/update/apply", methods=["POST"])
@@ -2946,10 +3150,9 @@ def api_update_apply():
     """
     # Обновление подменяет код панели: без пароля — только loopback-bind
     _require_local_or_auth()
-    state = _update_state()
-    if state.get("phase") == "running" and not state.get("stale"):
-        abort(409, description=f"update to {state.get('target')} already in "
-                               f"progress — installer log: {UPDATE_LOG}")
+    # сетевая фаза (резолв + скачивание install.sh) — до лока: секунды
+    # ожидания не должны блокировать конкурентный запрос, который после
+    # re-check под локом получит честный 409
     try:
         rel = _latest_release()
     except RuntimeError as exc:
@@ -2960,53 +3163,61 @@ def api_update_apply():
                               timeout=30.0)
     except RuntimeError as exc:
         abort(502, description=f"cannot download install.sh@{tag}: {exc}")
-    try:
-        PANEL_DIR.mkdir(parents=True, exist_ok=True)
-        # бэкап заменяемых файлов — для отката из UI после неудачного апдейта
-        _backup_panel_files()
-        stage = PANEL_DIR / ".update-install.sh"
-        stage.write_text(installer, encoding="utf-8")
-        os.chmod(stage, 0o700)
-        UPDATE_LOG.parent.mkdir(parents=True, exist_ok=True)
-        # Пролог панелью, а не установщиком: реальный кейс (v0.9.0, роутер) —
-        # ребёнок умер до первой строки скрипта (OOM при exec) и лог остался
-        # пустым, ничего не отличалось от «лог не создан». Теперь пустой лог
-        # после пролога сам по себе диагноз.
-        UPDATE_LOG.write_text(
-            f"== self-update {APP_VERSION} -> {tag}, "
-            f"spawn {time.strftime('%Y-%m-%d %H:%M:%S')}\n",
-            encoding="utf-8")
-    except OSError as exc:
-        abort(500, description=f"cannot prepare update: {exc}")
-    # Команда фиксированная, а tag и пути передаются ЧЕРЕЗ ОКРУЖЕНИЕ
-    # (NP_STAGE/NP_TAG/NP_LOG), не argv после -c: busybox на Keenetic
-    # (Entware) не передаёт позиционные аргументы после `sh -c 'строка'`
-    # — реальные $1..$3 оказываются пустыми, и v0.9.0–v0.9.1 умирали
-    # молча, не сумев открыть `>>""` (кейс тихой смерти self-update).
-    # Обёртка без exec дожидается установщика и дописывает его exit-код
-    # в лог: мгновенная смерть перестаёт быть невидимой. --from-update:
-    # python/flask уже подняты самим фактом работы панели — установщик
-    # пропускает их проверки и не форкает python на тесной памяти.
-    env = {**os.environ,
-           "NP_STAGE": str(stage), "NP_TAG": tag, "NP_LOG": str(UPDATE_LOG)}
-    try:
-        proc = subprocess.Popen(  # nosec B603
-            ["/bin/sh", "-c",
-             '/bin/sh "$NP_STAGE" --yes --from-update --ref "$NP_TAG" '
-             '>>"$NP_LOG" 2>&1; '
-             'rc=$?; echo "installer exit code: $rc" >>"$NP_LOG"'],
-            env=env,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
-    except OSError as exc:
-        # v0.7.0 писал state до спавна: ошибка fork/exec (ENOMEM на тесной
-        # памяти роутера) оставляла «running» без процесса и с пустым логом
-        abort(500, description=f"cannot spawn installer: {exc}")
-    # pid в state: умерший установщик распознаётся при следующем же запросе,
-    # а не через 15 минут (_update_state помечает такой state «failed»)
-    _update_state_write({"phase": "running", "target": tag,
-                         "started": time.time(), "pid": proc.pid})
+    with _UPDATE_LAUNCH_LOCK:
+        state = _update_state()
+        if state.get("phase") == "running" and not state.get("stale"):
+            abort(409, description=f"update to {state.get('target')} already in "
+                                   f"progress — installer log: {UPDATE_LOG}")
+        try:
+            PANEL_DIR.mkdir(parents=True, exist_ok=True)
+            # бэкап заменяемых файлов — для отката из UI после неудачного апдейта
+            _backup_panel_files()
+            stage = PANEL_DIR / ".update-install.sh"
+            stage.write_text(installer, encoding="utf-8")
+            os.chmod(stage, 0o700)
+            UPDATE_LOG.parent.mkdir(parents=True, exist_ok=True)
+            # Пролог панелью, а не установщиком: реальный кейс (v0.9.0, роутер) —
+            # ребёнок умер до первой строки скрипта (OOM при exec) и лог остался
+            # пустым, ничего не отличалось от «лог не создан». Теперь пустой лог
+            # после пролога сам по себе диагноз.
+            UPDATE_LOG.write_text(
+                f"== self-update {APP_VERSION} -> {tag}, "
+                f"spawn {time.strftime('%Y-%m-%d %H:%M:%S')}\n",
+                encoding="utf-8")
+        except OSError as exc:
+            abort(500, description=f"cannot prepare update: {exc}")
+        # Команда фиксированная, а tag и пути передаются ЧЕРЕЗ ОКРУЖЕНИЕ
+        # (NP_STAGE/NP_TAG/NP_LOG), не argv после -c: busybox на Keenetic
+        # (Entware) не передаёт позиционные аргументы после `sh -c 'строка'`
+        # — реальные $1..$3 оказываются пустыми, и v0.9.0–v0.9.1 умирали
+        # молча, не сумев открыть `>>""` (кейс тихой смерти self-update).
+        # Обёртка без exec дожидается установщика и дописывает его exit-код
+        # в лог: мгновенная смерть перестаёт быть невидимой. --from-update:
+        # python/flask уже подняты самим фактом работы панели — установщик
+        # пропускает их проверки и не форкает python на тесной памяти.
+        env = {**os.environ,
+               "NP_STAGE": str(stage), "NP_TAG": tag, "NP_LOG": str(UPDATE_LOG)}
+        try:
+            proc = subprocess.Popen(  # nosec B603
+                ["/bin/sh", "-c",
+                 '/bin/sh "$NP_STAGE" --yes --from-update --ref "$NP_TAG" '
+                 '>>"$NP_LOG" 2>&1; '
+                 'rc=$?; echo "installer exit code: $rc" >>"$NP_LOG"'],
+                env=env,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except OSError as exc:
+            # спавн не удался — не оставляем «ничего не происходило»:
+            # фиксируем failed в той же критической секции
+            _update_state_write({"phase": "failed", "target": tag,
+                                 "finished": time.time(),
+                                 "error": f"cannot spawn installer: {exc}"})
+            abort(500, description=f"cannot spawn installer: {exc}")
+        # pid в state: умерший установщик распознаётся при следующем же запросе,
+        # а не через 15 минут (_update_state помечает такой state «failed»)
+        _update_state_write({"phase": "running", "target": tag,
+                             "started": time.time(), "pid": proc.pid})
     app.logger.warning("self-update to %s triggered by %s", tag, request.remote_addr)
     return jsonify({"started": True, "target": tag, "current": APP_VERSION,
                     "log": str(UPDATE_LOG)}), 202
@@ -3193,7 +3404,8 @@ def _naive_state_read() -> dict[str, Any]:
 def _naive_state_write(st: dict[str, Any]) -> None:
     try:
         NAIVEPROXY_DIR.mkdir(parents=True, exist_ok=True)
-        NAIVE_UPDATE_STATE.write_text(json.dumps(st) + "\n", encoding="utf-8")
+        # атомарно, как _update_state_write — по той же причине
+        _save_json(NAIVE_UPDATE_STATE, st)
     except OSError as exc:  # state не критичен: обновление переживёт и без него
         app.logger.warning("cannot write %s: %s", NAIVE_UPDATE_STATE, exc)
 
@@ -3218,6 +3430,37 @@ def _naive_log(msg: str) -> None:
             fh.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
     except OSError:
         pass  # лог не критичен
+
+
+def _validate_tar_members(tgz: Path) -> None:
+    """Проверка ВСЕХ members архива до распаковки (SEC-03).
+
+    Артефакт приходит из внешнего релиза: member с absolute path/`..` или
+    symlink/hardlink мог бы писать вне stage. Основной путь — stdlib
+    tarfile (одинаковая семантика на всех платформах); без python3-lzma
+    (минимальные Entware-сборки) — хотя бы имена из `tar -tf`: path
+    traversal отсекаем, типы members — нет. Распаковка в обоих случаях
+    остаётся системному tar (зависимость xz не меняется).
+    """
+    if _HAS_LZMA:
+        with tarfile.open(tgz, "r:xz") as archive:
+            for member in archive.getmembers():
+                member_path = Path(member.name)
+                if member_path.is_absolute() or ".." in member_path.parts:
+                    raise RuntimeError(f"unsafe archive path: {member.name!r}")
+                if member.issym() or member.islnk() \
+                        or not (member.isfile() or member.isdir()):
+                    raise RuntimeError(f"unsupported archive member: {member.name!r}")
+        return
+    r = subprocess.run(["tar", "-tf", str(tgz)], capture_output=True,
+                       text=True, timeout=60)  # nosec B603
+    if r.returncode != 0:
+        raise RuntimeError("cannot list archive (tar/xz missing?): "
+                           + (r.stderr.strip() or f"rc={r.returncode}"))
+    for name in r.stdout.splitlines():
+        member_path = Path(name)
+        if member_path.is_absolute() or ".." in member_path.parts:
+            raise RuntimeError(f"unsafe archive path: {name!r}")
 
 
 def _naive_update_worker() -> None:
@@ -3245,6 +3488,7 @@ def _naive_update_worker() -> None:
         tgz = stage / "naive.tar.xz"
         _naive_log(f"downloading {url}")
         _http_download(url, tgz)
+        _validate_tar_members(tgz)  # до распаковки: вне stage писать нельзя
         r = subprocess.run(["tar", "-xJf", str(tgz), "-C", str(stage)],
                            capture_output=True, text=True, timeout=120)  # nosec B603
         if r.returncode != 0:
@@ -3286,13 +3530,16 @@ def _naive_update_worker() -> None:
         shutil.rmtree(stage, ignore_errors=True)
         _naive_log(f"installed {tag} -> {NAIVE_BIN}")
         restarted = False
+        restart_rc = None
         if was_active and INIT_SCRIPT.exists():
-            restarted = True
-            rst = _service("restart")
-            _naive_log(f"service restart rc={rst['rc']}")
+            with _SERVICE_LOCK:
+                rst = _service("restart")
+            restart_rc = rst["rc"]
+            restarted = restart_rc == 0  # как в rollback: rc==0 или честный провал
+            _naive_log(f"service restart rc={restart_rc}")
         _naive_state_write({"phase": "done", "target": tag,
                             "finished": time.time(), "version": new_ver,
-                            "restarted": restarted})
+                            "restarted": restarted, "restart_rc": restart_rc})
         app.logger.info("naive binary updated to %s (%s)", tag, name)
     except Exception as exc:  # любая ошибка воркера — в state и лог, не в панель
         _naive_log(f"failed: {exc}")
@@ -3313,35 +3560,49 @@ def api_naive_check():
     — 200 с error и available=False, как у /api/update/check.
     """
     force = request.args.get("force") in ("1", "true")
-    now = time.monotonic()
+    arrived = time.monotonic()
     if not force and _naive_check_cache:
-        if now - _naive_check_cache["at"] < _naive_check_cache.get("ttl", _NAIVE_CHECK_TTL):
+        if arrived - _naive_check_cache["at"] < _naive_check_cache.get("ttl", _NAIVE_CHECK_TTL):
             out = dict(_naive_check_cache["data"])
             out["cached"] = True
             return jsonify(out)
-    checked = time.strftime("%Y-%m-%dT%H:%M:%S%z")
-    version = _naive_bin_version()
-    tag = _naive_read(NAIVE_TAG)
-    out: dict[str, Any] = {
-        "version": version,
-        "tag": tag,
-        "path": str(NAIVE_BIN) if NAIVE_BIN.exists() else None,
-        "target": _naive_read(NAIVE_BUILD) or _naive_detect_target(),
-        "checked_at": checked,
-    }
-    try:
-        rel = _naive_release()
-    except (RuntimeError, ValueError) as exc:
-        out.update({"latest": None, "available": False, "error": str(exc)})
-        _naive_check_cache.update({"at": now, "ttl": _NAIVE_ERR_TTL, "data": out})
-        return jsonify(out)
-    latest = rel["tag"]
-    cur = _naive_ver_key(tag) if tag else (_naive_ver_key(version) if version else None)
-    out.update({"latest": latest,
-                "available": cur is None or _naive_ver_key(latest) > cur,
-                "notes": rel["notes"], "url": rel["url"]})
-    _naive_check_cache.update({"at": now, "ttl": _NAIVE_CHECK_TTL, "data": out})
-    return jsonify(out)
+    with _NAIVE_FETCH_LOCK:
+        # коалесцирование, как у /api/update/check (см. _UPDATE_FETCH_LOCK)
+        if _naive_check_cache and _naive_check_cache["at"] >= arrived:
+            out = dict(_naive_check_cache["data"])
+            out["cached"] = True
+            return jsonify(out)
+        if not _EXPENSIVE_SEM.acquire(blocking=False):
+            abort(429, description="too many concurrent checks, try later")
+        try:
+            checked = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+            version = _naive_bin_version()
+            tag = _naive_read(NAIVE_TAG)
+            out: dict[str, Any] = {
+                "version": version,
+                "tag": tag,
+                "path": str(NAIVE_BIN) if NAIVE_BIN.exists() else None,
+                "target": _naive_read(NAIVE_BUILD) or _naive_detect_target(),
+                "checked_at": checked,
+            }
+            try:
+                rel = _naive_release()
+            except (RuntimeError, ValueError) as exc:
+                out.update({"latest": None, "available": False, "error": str(exc)})
+                # at = момент заполнения (см. /api/update/check)
+                _naive_check_cache.update({"at": time.monotonic(),
+                                           "ttl": _NAIVE_ERR_TTL, "data": out})
+                return jsonify(out)
+            latest = rel["tag"]
+            cur = _naive_ver_key(tag) if tag else (_naive_ver_key(version) if version else None)
+            out.update({"latest": latest,
+                        "available": cur is None or _naive_ver_key(latest) > cur,
+                        "notes": rel["notes"], "url": rel["url"]})
+            _naive_check_cache.update({"at": time.monotonic(),
+                                       "ttl": _NAIVE_CHECK_TTL, "data": out})
+            return jsonify(out)
+        finally:
+            _EXPENSIVE_SEM.release()
 
 
 @app.route("/api/naive/update", methods=["POST"])
@@ -3353,25 +3614,35 @@ def api_naive_update():
     apply: замена root-исполняемого файла в LAN без auth недопустима.
     """
     _require_local_or_auth()
-    st = _naive_state()
-    if st.get("phase") == "running" and not st.get("stale"):
-        abort(409, description=f"naive update to {st.get('target')} already in "
-                               f"progress — log: {NAIVE_UPDATE_LOG}")
+    # резолв релиза — по сети, до лока (см. _NAIVE_UPDATE_LAUNCH_LOCK)
     try:
         rel = _naive_release()
     except (RuntimeError, ValueError) as exc:
         abort(502, description=str(exc))
     tag = rel["tag"]
-    try:
-        NAIVE_UPDATE_LOG.parent.mkdir(parents=True, exist_ok=True)
-        NAIVE_UPDATE_LOG.write_text(
-            f"== naive binary update -> {tag}, "
-            f"{time.strftime('%Y-%m-%d %H:%M:%S')}\n", encoding="utf-8")
-    except OSError:
-        pass  # лог не критичен
-    _naive_state_write({"phase": "running", "target": tag, "started": time.time()})
-    threading.Thread(target=_naive_update_worker, name="naive-update",
-                     daemon=True).start()
+    with _NAIVE_UPDATE_LAUNCH_LOCK:
+        st = _naive_state()
+        if st.get("phase") == "running" and not st.get("stale"):
+            abort(409, description=f"naive update to {st.get('target')} already "
+                                   f"in progress — log: {NAIVE_UPDATE_LOG}")
+        try:
+            NAIVE_UPDATE_LOG.parent.mkdir(parents=True, exist_ok=True)
+            NAIVE_UPDATE_LOG.write_text(
+                f"== naive binary update -> {tag}, "
+                f"{time.strftime('%Y-%m-%d %H:%M:%S')}\n", encoding="utf-8")
+        except OSError:
+            pass  # лог не критичен
+        _naive_state_write({"phase": "running", "target": tag,
+                            "started": time.time()})
+        try:
+            threading.Thread(target=_naive_update_worker, name="naive-update",
+                             daemon=True).start()
+        except RuntimeError as exc:
+            # поток не создался — не висеть «running» до тайм-аута stale
+            _naive_state_write({"phase": "failed", "target": tag,
+                                "finished": time.time(),
+                                "error": f"cannot start worker: {exc}"})
+            abort(500, description=f"cannot start update worker: {exc}")
     app.logger.warning("naive binary update to %s triggered by %s",
                        tag, request.remote_addr)
     return jsonify({"started": True, "target": tag, "log": str(NAIVE_UPDATE_LOG)}), 202
@@ -3483,17 +3754,21 @@ def _rollback_binary():
         abort(500, description=f"cannot restore binary: {exc}")
     _naive_log(f"rollback -> {prev_tag or new_ver}")
     restarted = False
+    restart_rc = None
     if was_active and INIT_SCRIPT.exists():
-        restarted = True
-        rst = _service("restart")
-        _naive_log(f"service restart rc={rst['rc']}")
+        with _SERVICE_LOCK:
+            rst = _service("restart")
+        restart_rc = rst["rc"]
+        restarted = restart_rc == 0  # «перезапущен» = только при rc==0 (REL-05)
+        _naive_log(f"service restart rc={restart_rc}")
     _naive_state_write({"phase": "done", "target": prev_tag or new_ver,
                         "finished": time.time(), "version": new_ver,
-                        "restarted": restarted, "rollback": True})
+                        "restarted": restarted, "restart_rc": restart_rc,
+                        "rollback": True})
     app.logger.warning("naive binary rolled back to %s by %s",
                        prev_tag or new_ver, request.remote_addr)
     return jsonify({"restored": prev_tag or new_ver, "version": new_ver,
-                    "restarted": restarted})
+                    "restarted": restarted, "restart_rc": restart_rc})
 
 
 @app.route("/api/rollback", methods=["POST"])
@@ -3507,11 +3782,14 @@ def api_rollback_post():
     _require_local_or_auth()
     body = request.get_json(silent=True) or {}
     if body.get("binary"):
-        st = _naive_state()
-        if st.get("phase") == "running" and not st.get("stale"):
-            abort(409, description=f"naive update to {st.get('target')} already in "
-                                   f"progress — log: {NAIVE_UPDATE_LOG}")
-        return _rollback_binary()
+        # откат бинарника синхронный: гейт + сама операция — под тем же
+        # локом, что и запуск naive-update воркера (state у них общий)
+        with _NAIVE_UPDATE_LAUNCH_LOCK:
+            st = _naive_state()
+            if st.get("phase") == "running" and not st.get("stale"):
+                abort(409, description=f"naive update to {st.get('target')} already "
+                                       f"in progress — log: {NAIVE_UPDATE_LOG}")
+            return _rollback_binary()
     version = str(body.get("panel") or "")
     if not _TAG_RE.match(version):
         abort(400, description="bad version name — expected vX.Y.Z")
@@ -3521,52 +3799,57 @@ def api_rollback_post():
     if not (backup / "naivepanel.py").is_file():
         abort(404, description=f"no usable backup {version} "
                                f"(need naivepanel.py inside)")
-    state = _update_state()
-    if state.get("phase") == "running" and not state.get("stale"):
-        abort(409, description=f"update to {state.get('target')} already in "
-                               f"progress — installer log: {UPDATE_LOG}")
-    if not PANEL_INIT.exists():
-        abort(503, description=f"{PANEL_INIT} not found")
-    try:
-        _backup_panel_files()   # откат обратим: текущая версия — тоже в бэкап
-        restored = []
-        for dst in PANEL_UPDATE_FILES:
-            src = backup / dst.name
-            if not src.is_file():
-                continue
-            # через tmp+rename: середина файла не мелькает на диске, а живущий
-            # в памяти процесс вообще ничего не замечает до рестарта
-            tmp = dst.with_name(dst.name + ".restore")
-            shutil.copy2(src, tmp)
-            os.replace(tmp, dst)
-            restored.append(dst.name)
-        if "naivepanel.py" not in restored:  # проверено выше, но после копий — надёжнее
-            abort(500, description="restore produced no naivepanel.py")
-        UPDATE_LOG.parent.mkdir(parents=True, exist_ok=True)
-        UPDATE_LOG.write_text(
-            f"== rollback {APP_VERSION} -> {version}, "
-            f"spawn {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
-            f"restored: {', '.join(restored)}\n",
-            encoding="utf-8")
-    except OSError as exc:
-        abort(500, description=f"cannot restore files: {exc}")
-    # перезапуск — тот же отсоединённый spawn, что /api/panel/restart:
-    # путь через env (NP_INIT), не позиционные аргументы busybox
-    env = {**os.environ, "NP_INIT": str(PANEL_INIT)}
-    try:
-        proc = subprocess.Popen(  # nosec B603
-            ["/bin/sh", "-c", 'sleep 1; exec /bin/sh "$NP_INIT" restart'],
-            env=env,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
-    except OSError as exc:
-        abort(500, description=f"cannot spawn restarter: {exc}")
-    # state переиспользуем от update: поднятая старая панель увидит цель,
-    # равную своей версии, и закроет «running» как «done»
-    _update_state_write({"phase": "running", "target": version,
-                         "started": time.time(), "pid": proc.pid,
-                         "rollback": True})
+    with _UPDATE_LAUNCH_LOCK:
+        # state общий с update/apply: re-check под локом (см. _UPDATE_LAUNCH_LOCK)
+        state = _update_state()
+        if state.get("phase") == "running" and not state.get("stale"):
+            abort(409, description=f"update to {state.get('target')} already in "
+                                   f"progress — installer log: {UPDATE_LOG}")
+        if not PANEL_INIT.exists():
+            abort(503, description=f"{PANEL_INIT} not found")
+        try:
+            _backup_panel_files()   # откат обратим: текущая версия — тоже в бэкап
+            restored = []
+            for dst in PANEL_UPDATE_FILES:
+                src = backup / dst.name
+                if not src.is_file():
+                    continue
+                # через tmp+rename: середина файла не мелькает на диске, а живущий
+                # в памяти процесс вообще ничего не замечает до рестарта
+                tmp = dst.with_name(dst.name + ".restore")
+                shutil.copy2(src, tmp)
+                os.replace(tmp, dst)
+                restored.append(dst.name)
+            if "naivepanel.py" not in restored:  # проверено выше, но после копий — надёжнее
+                abort(500, description="restore produced no naivepanel.py")
+            UPDATE_LOG.parent.mkdir(parents=True, exist_ok=True)
+            UPDATE_LOG.write_text(
+                f"== rollback {APP_VERSION} -> {version}, "
+                f"spawn {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"restored: {', '.join(restored)}\n",
+                encoding="utf-8")
+        except OSError as exc:
+            abort(500, description=f"cannot restore files: {exc}")
+        # перезапуск — тот же отсоединённый spawn, что /api/panel/restart:
+        # путь через env (NP_INIT), не позиционные аргументы busybox
+        env = {**os.environ, "NP_INIT": str(PANEL_INIT)}
+        try:
+            proc = subprocess.Popen(  # nosec B603
+                ["/bin/sh", "-c", 'sleep 1; exec /bin/sh "$NP_INIT" restart'],
+                env=env,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except OSError as exc:
+            _update_state_write({"phase": "failed", "target": version,
+                                 "finished": time.time(),
+                                 "error": f"cannot spawn restarter: {exc}"})
+            abort(500, description=f"cannot spawn restarter: {exc}")
+        # state переиспользуем от update: поднятая старая панель увидит цель,
+        # равную своей версии, и закроет «running» как «done»
+        _update_state_write({"phase": "running", "target": version,
+                             "started": time.time(), "pid": proc.pid,
+                             "rollback": True})
     app.logger.warning("rollback to %s triggered by %s", version,
                        request.remote_addr)
     return jsonify({"started": True, "target": version,
@@ -3729,6 +4012,14 @@ def _serve(application: Flask, host: str, port: int) -> None:
     try:
         from waitress import serve as waitress_serve  # type: ignore
     except ImportError:
+        if not _bind_is_loopback() and os.environ.get("NAIVEPANEL_DEV_SERVER") != "1":
+            # Werkzeug dev-сервер в LAN — авария конфигурации, а не fallback:
+            # он не для прод-нагрузки (SEC-06). Явный override — для отладки.
+            app.logger.error(
+                "refusing to serve on %s:%s via Werkzeug dev server: "
+                "install waitress (opkg install python3-waitress) or set "
+                "NAIVEPANEL_DEV_SERVER=1 to override explicitly", host, port)
+            raise SystemExit(2)
         app.logger.warning(
             "waitress not installed — falling back to Werkzeug dev server; "
             "install python3-waitress (opkg) or `pip install waitress`"

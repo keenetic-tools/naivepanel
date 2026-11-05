@@ -73,7 +73,10 @@ HTML page — no CDN, no build step. MIT-licensed.
   обновления/откат. Средние экраны — две колонки, телефон — одна с тем же
   порядком «главное сверху».
 - Обновление бинарника naive из UI (v0.11): автодетект openwrt-таргета,
-  установка через install.sh, бейдж доступной версии (см. ниже).
+  установка через install.sh, бейдж доступной версии (см. ниже). Тарболл
+  проверяется до распаковки (members без `..`/absolute path/symlink),
+  рестарт после установки — честный: `restart_rc` в state отличает
+  «бинарник заменён» от «сервис поднят».
 - Откат версий из UI (v0.15): панель и бинарник возвращаются на сохранённый
   бэкап одной кнопкой — без SSH; список версий с размерами, чистка бэкапов
   (по одному или «оставить только последнюю»).
@@ -84,15 +87,15 @@ HTML page — no CDN, no build step. MIT-licensed.
 |-------|------|------------|
 | `GET` | `/api/status` | `{active, current, init_present, init_script, pid, uptime, version, watchdog, failover}` |
 | `GET` | `/api/configs` | список пресетов `{name, active, listen, proxy, username}`; `proxy` замаскирован (`https://user:***@host`), ответ `no-store` |
-| `GET` | `/api/configs/<name>` | полный JSON-конфиг пресета |
+| `GET` | `/api/configs/<name>` | полный JSON-конфиг пресета **без пароля** (upstream/username разобраны из proxy-URI для любой схемы https/http/quic, ответ `no-store`) |
 | `POST` | `/api/configs` | создать пресет |
-| `PUT` | `/api/configs/<name>` | обновить (если активный — propagate в `config.json` **и restart**; ответ содержит `restart:{rc,...}`) |
+| `PUT` | `/api/configs/<name>` | обновить (если активный — propagate в `config.json` **и restart**; ответ содержит `restart:{rc,...}`, при `rc!=0` — `degraded:true` и откат прежнего конфига) |
 | `DELETE` | `/api/configs/<name>` | удалить (если не активный) |
 | `POST` | `/api/configs/<name>/activate` | сделать активным + restart (конфиг **валидируется** — битый не роняет рабочий прокси) |
 | `POST` | `/api/configs/<name>/duplicate` | копия пресета server-side, **включая пароль** |
 | `GET` | `/api/configs/export` | все пресеты одним JSON-файлом (attachment; содержит пароли!); в файл всегда входит блок `failover` (необязателен только при импорте) |
 | `POST` | `/api/configs/import` | импорт из файла export-формата; существующие не перезаписываются, битые отклоняются; блок `failover` применяется только к пустой цепочке и только если все имена есть — иначе `failover:{applied:false,reason}` |
-| `POST` | `/api/probe` | TCP-доступность upstream с роутера (`{upstream}` → `{ms}` или `{error}`) |
+| `POST` | `/api/probe` | TCP-доступность upstream с роутера (`{upstream}` → `{ms}` или `{error}`); при перегрузке — 429 |
 | `POST` | `/api/e2e` | реальный запрос через listen активного пресета (или явный `{listen}`): туннель до echo-хоста + GET → `{ok, ms, exit_ip}` или `{ok:false, error}` |
 | `GET` | `/api/e2e/history?last=120` | история периодических проверок монитора: `{entries:[{t,ok,ms}], stats:{availability, avg_ms, window_s}}` (спарклайн в статус-карте) |
 | `GET`/`PUT`/`DELETE` | `/api/failover` | цепочка автофейловера: `PUT {"enabled":true,"chain":["home","backup"],"auto_return":true}` — имена валидируются, цепочка проверяется и при `enabled:false`, а без `chain` при `enabled:false` сохраняется текущая; `enabled` — строго JSON-булево (`"true"` → 400); `DELETE` остаётся для совместимости API; ответ — конфиг + состояние монитора (`monitor`, `chain_max`, `fails`, `switches`, `returns`, `return_watch`, `last_ok`, …) |
@@ -649,6 +652,13 @@ NAIVEPANEL_HOSTS="192.168.1.1:8089,router.local:8089"
 # 3. Файрвол Keenetic: порт 8089 только с твоих устройств; guest-сегмент — закрыт.
 ```
 
+Шаг 1 не опционален: начиная с v0.17.2 панель с LAN-bind и без `admin.pass`
+отвечает **403 на любой запрос** (fail-closed) — открытый в LAN список пресетов
+с паролями считаем аварией, а не конфигурацией. `install.sh` с явным флагом
+`--bind` на не-loopback адрес без пароля (`--with-auth` или существующий
+`admin.pass`) завершается с ошибкой. Обход для экстренных случаев — временно
+прописать `NAIVEPANEL_BIND` в `panel.conf` вручную и вернуть пароль сразу после.
+
 Остаточный риск — открытый HTTP: пароль Basic auth можно перехватить активным
 MITM в LAN (ARP-spoofing, скомпрометированное устройство). Для доверенной
 домашней сети это обычно приемлемо; если в сегменте есть недоверенные
@@ -671,7 +681,10 @@ NaivePanel собирает минимальный JSON, совместимый 
 
 Поле `listen` поддерживает несколько адресов — тогда это массив. В UI их вводят
 по одному на строку (или через запятую); один адрес сохраняется как строка
-(компактнее), несколько — как массив:
+(компактнее), несколько — как массив. Адрес = `[scheme://]host[:port]`:
+разрешены схемы `socks://`, `socks5://`, `http://` (без схемы — `socks://`),
+порт 1–65535 или умолчание бинарника (1080/8080); userinfo и path/query
+не допускаются, `quic://` — схема upstream-поля, не listen.
 
 ```json
 {
@@ -693,7 +706,19 @@ NaivePanel собирает минимальный JSON, совместимый 
 
 - Bind по умолчанию только `127.0.0.1`; LAN-bind — по чеклисту
   «Доступ из LAN без reverse proxy».
-- `config.json`, `.active`, `*.json` в `conf.d/` — `chmod 0600`.
+- **Fail-closed LAN-bind (с v0.17.2):** если `admin.pass` отсутствует, а bind
+  адрес не loopback — любой запрос получает 403 (панель без пароля не должна
+  торчать в сети). Loopback без пароля остаётся законным режимом локальной
+  разработки.
+- `config.json`, `.active`, `*.json` в `conf.d/`, `panel.conf` — `chmod 0600`.
+- **Дорогие операции ограничены** (с v0.18.0): probe/E2E/update-check — не
+  больше 4 одновременно, сверх — немедленный `429` без ожидания (залп не
+  исчерпывает worker-потоки waitress); параллельные update-check
+  коалесцируются в один внешний запрос.
+- **Non-loopback без waitress панель не обслуживает**: Werkzeug dev-сервер
+  в LAN — отказ на старте (код 2). Поставь `python3-waitress` или укажи
+  `NAIVEPANEL_DEV_SERVER=1` для явного dev-режима. Внешние HTTP-запросы
+  панели ограничены `--connect-timeout 5` и `--max-filesize 2МБ`.
 - Если есть `/opt/etc/naive/panel/admin.pass` — **каждый** запрос требует HTTP Basic
   auth (bcrypt, формат htpasswd `user:$2y$…`). Без пакета `python3-bcrypt` в
   Entware auth fail-closed (401 на любой запрос + ошибка в лог).
@@ -706,6 +731,10 @@ NaivePanel собирает минимальный JSON, совместимый 
   маркер DNS-rebinding. Поэтому reverse proxy со своим именем требует явного
   `NAIVEPANEL_HOSTS`.
 - Активация пресета валидирует имя: `^[a-zA-Z0-9_\-.]{1,64}$` (нет path-traversal).
+- **Listen-адреса валидируются** перед create/PUT/activate/импортом (с
+  v0.17.2): схемы `socks/socks5/http`, обязательный host, порт 1–65535 или
+  умолчание, без userinfo/path/query — `file://`, `quic://` и битые порты
+  отклоняются до записи и активации (не роняют рабочий прокси).
 - **Схема конфига валидируется** перед activate/PUT/импортом: непустые
   `listen`/`proxy`, URI со схемой, диапазон `insecure-concurrency` 1..4 — битый
   (например, руками отредактированный) пресет не перезапишет рабочий `config.json`.
@@ -733,7 +762,8 @@ NaivePanel собирает минимальный JSON, совместимый 
   список `GET /api/configs` тоже `no-store` и маскирует пароли
   (`https://user:***@host`).
 - Пароли upstream через API не возвращаются: `GET /api/configs/<name>` отдаёт
-  upstream/username разобранными, но без пароля; пустое поле пароля в форме
+  upstream/username разобранными, но без пароля — для **всех** схем
+  (`https/http/quic`, с v0.17.2); пустое поле пароля в форме
   при сохранении означает «оставить прежний». Креденшалы в proxy-URI
   percent-encode'ятся (`@ : /` и т.п. в пароле не ломают URI).
 - **Исключение — export**: `GET /api/configs/export` сознательно содержит

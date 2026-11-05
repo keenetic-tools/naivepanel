@@ -83,7 +83,14 @@ def _reload():
     return naivepanel
 
 
-def test_conf_file_applies_bind_and_hosts(conf_env):
+def test_conf_file_applies_bind_and_hosts(conf_env, env):
+    # LAN-bind без пароля с v0.17.2 fail-closed (SEC-01), поэтому Host-
+    # allowlist проверяем при включённом auth — иначе первый же 403 был бы
+    # неоднозначен (host? экспозиция?)
+    bcrypt = pytest.importorskip("bcrypt")
+    h = bcrypt.hashpw(b"s3cret", bcrypt.gensalt()).decode()
+    (env / "admin.pass").write_text(f"admin:{h}\n")
+    auth = {"Authorization": "Basic " + base64.b64encode(b"admin:s3cret").decode()}
     conf_env.write_text(
         'NAIVEPANEL_BIND="192.168.1.1:8099"\n'
         'NAIVEPANEL_HOSTS="np.lan:8099,192.168.1.1:8099"\n'
@@ -92,8 +99,8 @@ def test_conf_file_applies_bind_and_hosts(conf_env):
     assert m.PANEL_BIND == "192.168.1.1:8099"
     assert "np.lan:8099" in m.ALLOWED_HOSTS
     c = m.app.test_client()
-    assert c.get("/api/status", headers={"Host": "np.lan:8099"}).status_code == 200
-    assert c.get("/api/status", headers={"Host": "evil.com"}).status_code == 403
+    assert c.get("/api/status", headers={"Host": "np.lan:8099", **auth}).status_code == 200
+    assert c.get("/api/status", headers={"Host": "evil.com", **auth}).status_code == 403
 
 
 def test_conf_env_overrides_file(conf_env, monkeypatch):
@@ -421,12 +428,49 @@ def test_status_outside_request_context(app, env):
 def test_split_proxy(app):
     assert app._split_proxy("https://user:p@ss:word@host.example") == \
         ("host.example", "user", "p@ss:word")
+    # все поддерживаемые схемы разбираются одинаково (SEC-02: раньше
+    # http/quic возвращались целиком, с паролем внутри)
     assert app._split_proxy("quic://user:secret@host:443") == \
-        ("quic://user:secret@host:443", "", None)
+        ("host:443", "user", "secret")
+    assert app._split_proxy("http://user:secret@host:8080") == \
+        ("host:8080", "user", "secret")
+    assert app._split_proxy("QUIC://user:secret@host:443") == \
+        ("host:443", "user", "secret")
+    # percent-encoded креды декодируются, IPv6-скобки сохраняются
+    assert app._split_proxy("quic://user:p%40ss@[2001:db8::1]:443") == \
+        ("[2001:db8::1]:443", "user", "p@ss")
     # кредов нет — URI возвращается целиком (такое значение хранится,
     # только если upstream пришёл как полный URL без кредов)
     assert app._split_proxy("https://host.example") == \
         ("https://host.example", "", None)
+    assert app._split_proxy("quic://host:443") == \
+        ("quic://host:443", "", None)
+
+
+@pytest.mark.parametrize("scheme", ["https", "http", "quic", "QUIC"])
+def test_get_never_returns_full_uri_password(client, scheme):
+    # SEC-02: GET одного конфига не отдаёт пароль ни для одной схемы —
+    # раньше http/quic уходили целиком; ответ ещё и no-store
+    secret = "topsecret"
+    r, _ = _create(client,
+                   upstream=f"{scheme}://user:{secret}@proxy.example:443",
+                   username="", password="")
+    assert r.status_code == 201
+    r = client.get("/api/configs/home")
+    assert r.status_code == 200
+    assert secret not in r.get_data(as_text=True)
+    assert r.headers["Cache-Control"] == "no-store"
+    d = r.get_json()
+    assert d["upstream"] == "proxy.example:443"
+    assert d["username"] == "user"
+
+
+def test_for_edit_masks_unparsed_userinfo(app):
+    # defense-in-depth: даже нераспознанная схема с кредами не должна
+    # покидать _for_edit с userinfo внутри
+    out = app._for_edit({"listen": "socks://127.0.0.1:1080",
+                         "proxy": "weird://user:pw@host:1"})
+    assert "pw" not in out["upstream"]
 
 
 def test_normalize_listen_variants(app):
@@ -467,6 +511,50 @@ def test_parse_bind_variants(app):
     assert app._parse_bind("localhost") == ("localhost", 8089)
     assert app._parse_bind(":9000") == ("127.0.0.1", 9000)
     assert app._parse_bind("192.168.1.1:80") == ("192.168.1.1", 80)
+
+
+# --- LAN-bind без пароля: fail closed (SEC-01) --------------------------------
+
+# панель без admin.pass, привязанная к не-loopback интерфейсу, не должна
+# отвечать ни данными, ни мутациями: configs/export содержат пароли,
+# service/panel restart и update меняют систему
+_LAN_SENSITIVE = [
+    ("get", "/"),
+    ("get", "/api/status"),
+    ("get", "/api/configs"),
+    ("get", "/api/configs/export"),
+    ("get", "/api/configs/home"),
+    ("post", "/api/configs"),
+    ("post", "/api/configs/import"),
+    ("post", "/api/service/restart"),
+    ("post", "/api/panel/restart"),
+    ("post", "/api/password"),
+    ("post", "/api/update/apply"),
+    ("post", "/api/naive/update"),
+]
+
+
+def test_lan_without_auth_rejects_sensitive_routes(client, app, monkeypatch):
+    monkeypatch.setattr(app, "_bind_is_loopback", lambda: False)
+    for method, path in _LAN_SENSITIVE:
+        r = getattr(client, method)(path, headers=CSRF, json={})
+        assert r.status_code == 403, (method, path, r.status_code)
+
+
+def test_lan_with_password_allows_requests(client, app, monkeypatch):
+    # auth включён → LAN-bind легален, guard не должен переусердствовать
+    bcrypt = pytest.importorskip("bcrypt")
+    h = bcrypt.hashpw(b"s3cret", bcrypt.gensalt()).decode()
+    app.PANEL_ADMIN_PASS.write_text(f"admin:{h}\n", encoding="utf-8")
+    monkeypatch.setattr(app, "_bind_is_loopback", lambda: False)
+    token = base64.b64encode(b"admin:s3cret").decode()
+    r = client.get("/api/configs", headers={**CSRF, "Authorization": f"Basic {token}"})
+    assert r.status_code == 200
+
+
+def test_loopback_without_password_still_allows_dev_workflow(client, app):
+    # дефолтный bind 127.0.0.1 — локальная работа без пароля остаётся легальной
+    assert client.get("/api/status").status_code == 200
 
 
 # --- auth-кэш -----------------------------------------------------------------
@@ -546,6 +634,145 @@ def test_put_inactive_preset_has_no_restart(client, app):
     })
     assert r.status_code == 200
     assert r.get_json()["restart"] is None
+
+
+# --- сериализация service-операций (REL-02) -----------------------------------
+
+def _concurrency_probe(app, monkeypatch, rc=0):
+    """Заглушка _service: считает одновременные входы (окно 50мс)."""
+    guard = threading.Lock()
+    state = {"depth": 0, "max": 0, "calls": []}
+
+    def fake(action):
+        with guard:
+            state["depth"] += 1
+            state["max"] = max(state["max"], state["depth"])
+            state["calls"].append(action)
+        time.sleep(0.05)  # даём второму звонящему шанс войти без лока
+        with guard:
+            state["depth"] -= 1
+        return {"rc": rc}
+
+    monkeypatch.setattr(app, "_service", fake)
+    return state
+
+
+def _run_concurrently(*targets):
+    barrier = threading.Barrier(len(targets), timeout=10)
+    errors = []
+
+    def wrapped(fn):
+        def run():
+            try:
+                barrier.wait()
+                fn()
+            except Exception as exc:  # noqa: BLE001 - любой сбой = провал теста
+                errors.append(f"{type(exc).__name__}: {exc}")
+        return run
+
+    threads = [threading.Thread(target=wrapped(fn)) for fn in targets]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=15)
+    assert not any(t.is_alive() for t in threads), "service op thread hung"
+    assert errors == []
+
+
+def test_put_active_and_activate_are_serialized(client, app, env, monkeypatch):
+    # PUT активного пресета входил в _service без лока и мог перехлёстнуться
+    # с activate другого пресета — оба писали config.json и крутили init
+    stub, _ = _stub_init(env)
+    app.INIT_SCRIPT = stub
+    state = _concurrency_probe(app, monkeypatch)
+    _create(client, name="home")
+    _create(client, name="backup")
+    client.post("/api/configs/home/activate", headers=CSRF)
+
+    def put_home():
+        app.app.test_client().put("/api/configs/home", headers=CSRF, json={
+            "name": "home", "listen": "127.0.0.1:1081",
+            "upstream": "proxy.example.com", "username": "user"})
+
+    def activate_backup():
+        app.app.test_client().post("/api/configs/backup/activate", headers=CSRF)
+
+    _run_concurrently(put_home, activate_backup)
+    assert state["max"] == 1, "service-операции выполнились параллельно"
+
+
+def test_service_restart_and_activate_are_serialized(client, app, env, monkeypatch):
+    stub, _ = _stub_init(env)
+    app.INIT_SCRIPT = stub
+    state = _concurrency_probe(app, monkeypatch)
+    _create(client, name="home")
+    _create(client, name="backup")
+
+    def restart():
+        app.app.test_client().post("/api/service/restart", headers=CSRF)
+
+    def activate_backup():
+        app.app.test_client().post("/api/configs/backup/activate", headers=CSRF)
+
+    _run_concurrently(restart, activate_backup)
+    assert state["max"] == 1, "service-операции выполнились параллельно"
+
+
+def test_activate_failed_restart_restores_previous(client, app, env, monkeypatch):
+    # рестарт с новым конфигом упал → файлы не должны врать, будто конфиг
+    # применён: восстанавливаем прежний config.json/.active и пытаемся
+    # вернуть сервис на старом конфиге
+    stub, _ = _stub_init(env)
+    app.INIT_SCRIPT = stub
+    _create(client, name="home")
+    assert client.post("/api/configs/home/activate", headers=CSRF).status_code == 200
+    monkeypatch.setattr(app, "_service", lambda action: {"rc": 3, "stderr": "boom"})
+    _create(client, name="backup")
+    r = client.post("/api/configs/backup/activate", headers=CSRF)
+    assert r.status_code == 200
+    restart = r.get_json()["restart"]
+    assert restart["rc"] == 3
+    assert restart["degraded"] is True
+    assert restart["rollback"]["rc"] == 3  # откат тоже не смог — не скрываем
+    assert app._active_name() == "home"
+    assert json.loads(app.ACTIVE_CONFIG.read_text())["listen"] == \
+        "socks://127.0.0.1:1080"  # прежний конфиг возвращён
+
+
+def test_put_active_failed_restart_restores_previous(client, app, env, monkeypatch):
+    stub, _ = _stub_init(env)
+    app.INIT_SCRIPT = stub
+    _create(client, name="home")
+    assert client.post("/api/configs/home/activate", headers=CSRF).status_code == 200
+    monkeypatch.setattr(app, "_service", lambda action: {"rc": 3, "stderr": "boom"})
+    r = client.put("/api/configs/home", headers=CSRF, json={
+        "name": "home", "listen": "127.0.0.1:1082",
+        "upstream": "proxy.example.com", "username": "user"})
+    assert r.status_code == 200
+    restart = r.get_json()["restart"]
+    assert restart["rc"] == 3
+    assert restart["degraded"] is True
+    # сам пресет сохранён (правки юзера не теряем), но активный конфиг — прежний
+    assert json.loads((app.CONF_D / "home.json").read_text())["listen"] == \
+        "socks://127.0.0.1:1082"
+    assert json.loads(app.ACTIVE_CONFIG.read_text())["listen"] == \
+        "socks://127.0.0.1:1080"
+    assert app._active_name() == "home"
+
+
+def test_activate_failed_restart_first_activation_cleans_state(client, app, env,
+                                                               monkeypatch):
+    # до активации ничего не работало → после failed-рестарта не оставляем
+    # config.json/.active, указывающих на неприменённый конфиг
+    stub, _ = _stub_init(env)
+    app.INIT_SCRIPT = stub
+    monkeypatch.setattr(app, "_service", lambda action: {"rc": 3, "stderr": "boom"})
+    _create(client, name="home")
+    r = client.post("/api/configs/home/activate", headers=CSRF)
+    assert r.status_code == 200
+    assert r.get_json()["restart"]["degraded"] is True
+    assert not app.ACTIVE_CONFIG.exists()
+    assert app._active_name() is None
 
 
 def test_panel_restart_spawns_init(client, app, env):
@@ -716,6 +943,23 @@ def test_ui_has_no_inline_event_handlers(app):
     assert not re.search(r"\son[a-z]+\s*=", html), "inline-обработчики блокирует nonce-CSP"
 
 
+def test_ui_svc_message_reflects_rc(app):
+    # REL-05: svc() показывал «Сервис перезапущен» даже при rc!=0
+    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    m = re.search(r"async function svc\(action\) \{.*?\n\}", html, re.S)
+    assert m, "svc() не найден в index.html"
+    body = m.group(0)
+    assert "restartFailed" in body, "svc() обязан проверять rc ответа"
+    assert "stderr" in body, "текст ошибки сервиса должен попадать в toast"
+
+
+def test_ui_naive_update_distinguishes_restart_failure(app):
+    # «бинарник заменён» и «рестарт удался» — разные события; UI обязан
+    # различать их по restart_rc
+    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    assert "restart_rc" in html, "UI не различает failed restart после смены бинарника"
+
+
 def test_csp_has_no_external_origins(client):
     csp = client.get("/").headers["Content-Security-Policy"]
     for src in csp.split(";"):
@@ -851,6 +1095,65 @@ def test_validate_cfg_ranges_and_types(app):
                 {"log": 42}, {"extra-headers": []}]:
         with pytest.raises(Exception):
             app._validate_cfg({**good, **bad}, "bad")
+
+
+# --- listen-валидация на write-путях (REL-04) ---------------------------------
+
+@pytest.mark.parametrize("listen", [
+    "file:///tmp/socket",             # схема вне socks/socks5/http
+    "quic://127.0.0.1:1080",          # quic — схема upstream, не listen
+    "socks://:1080",                  # пустой host
+    "socks://127.0.0.1:0",            # порт 0
+    "socks://127.0.0.1:65536",        # порт за пределами диапазона
+    "http://user:pw@127.0.0.1:8080",  # userinfo в listen не имеет смысла
+    "http://127.0.0.1:8080/path?q=1", # path/query в listen
+    "socks://host:notaport",          # порт не число
+    "socks://",                       # нет адреса после схемы
+])
+def test_create_rejects_invalid_listen(client, app, listen):
+    r, _ = _create(client, listen=listen)
+    assert r.status_code == 400, listen
+    assert "listen" in r.get_json()["error"]
+    assert not (app.CONF_D / "home.json").exists()  # ничего не сохранили
+
+
+@pytest.mark.parametrize("listen", [
+    "127.0.0.1:1080",             # голый host:port → нормализуется в socks://
+    "socks://127.0.0.1:1080",
+    "socks5://127.0.0.1:1080",
+    "http://127.0.0.1:8080",
+    "socks://[::1]:1080",
+    "socks://127.0.0.1",          # порт не указан — умолчание бинарника 1080
+])
+def test_create_accepts_supported_listen(client, listen):
+    r, _ = _create(client, listen=listen)
+    assert r.status_code == 201, listen
+
+
+def test_activate_and_import_reject_invalid_listen(client, app):
+    # битой listen не пройти ни через активацию, ни через импорт
+    app._ensure_dirs()
+    (app.CONF_D / "badlisten.json").write_text(
+        '{"listen": "file:///tmp/x", "proxy": "https://h"}')
+    assert client.post("/api/configs/badlisten/activate",
+                       headers=CSRF).status_code == 400
+    body = {"presets": {
+        "x": {"listen": "quic://1.2.3.4:1080", "proxy": "https://h"},
+        "good": {"listen": "127.0.0.1:1080", "proxy": "https://h"},
+    }}
+    d = client.post("/api/configs/import", headers=CSRF, json=body).get_json()
+    assert d["imported"] == ["good"]
+    reasons = {s["name"]: s["reason"] for s in d["skipped"]}
+    assert "listen" in reasons["x"]
+
+
+def test_validate_cfg_listen_list_entries(app):
+    good = {"listen": ["socks://127.0.0.1:1080", "http://127.0.0.1:8080"],
+            "proxy": "https://h"}
+    app._validate_cfg(good, "ok")
+    with pytest.raises(Exception):
+        app._validate_cfg(
+            {**good, "listen": ["socks://127.0.0.1:1080", "file:///x"]}, "bad")
 
 
 # --- export / import --------------------------------------------------------------
@@ -1352,8 +1655,11 @@ def test_apply_spawn_failure_is_visible_and_leaves_no_state(client, app, env, mo
     r = client.post("/api/update/apply", headers=CSRF)
     assert r.status_code == 500
     assert "cannot spawn installer" in r.get_json()["error"]
-    # state не должен остаться «running» без процесса (ловушка v0.7.0)
-    assert not app.UPDATE_STATE.exists()
+    # state не висит «running» без процесса (ловушка v0.7.0): с REL-03
+    # фейл фиксируется явно — failed с причиной, а не пустотой
+    st = json.loads(app.UPDATE_STATE.read_text())
+    assert st["phase"] == "failed"
+    assert "cannot spawn installer" in st["error"]
 
 
 def test_apply_wrapper_records_installer_exit_code(client, app, env, monkeypatch):
@@ -1411,6 +1717,101 @@ def test_apply_502_when_install_sh_fails(client, app, env, monkeypatch):
         raise AssertionError(url)
     monkeypatch.setattr(app, "_http_get", no_install)
     assert client.post("/api/update/apply", headers=CSRF).status_code == 502
+
+
+# --- сериализация запуска update workers (REL-03) ------------------------------
+
+def test_apply_concurrent_single_installer(client, app, env, monkeypatch):
+    # резолв релиза и скачивание install.sh длятся секунды: оба запроса
+    # проходят гейт state до того, как первый запишет «running», → два
+    # установщика. Замедляем сетевую фазу и сталкиваем запросы барьером.
+    panel = env / "panel"
+    (panel / "templates").mkdir(parents=True, exist_ok=True)
+    (panel / "naivepanel.py").write_text("# old panel code")
+    monkeypatch.setattr(app, "_latest_release",
+                        lambda: {"tag": "v9.9.9", "notes": "", "url": ""})
+
+    def slow_install(url, timeout=6.0):
+        time.sleep(0.15)  # окно гонки: оба запроса в сети одновременно
+        return "#!/bin/sh\nexit 0\n"
+
+    monkeypatch.setattr(app, "_http_get", slow_install)
+    popens = []
+
+    class _Proc:
+        pid = os.getpid()  # живой: reconciler не должен закрыть «running»
+
+    def fake_popen(*a, **k):
+        popens.append(1)
+        return _Proc()
+
+    monkeypatch.setattr(app.subprocess, "Popen", fake_popen)
+    statuses = []
+
+    def apply():
+        c = app.app.test_client()
+        statuses.append(c.post("/api/update/apply", headers=CSRF).status_code)
+
+    _run_concurrently(apply, apply)
+    assert statuses.count(202) == 1, statuses
+    assert statuses.count(409) == 1, statuses
+    assert len(popens) == 1
+
+
+def test_naive_update_concurrent_single_worker(client, app, monkeypatch):
+    def slow_release():
+        time.sleep(0.15)  # окно гонки: оба запроса в резолве одновременно
+        return {"tag": "v123.0.0", "assets": []}
+
+    monkeypatch.setattr(app, "_naive_release", slow_release)
+    workers = []
+    monkeypatch.setattr(app, "_naive_update_worker",
+                        lambda: workers.append(1))
+    statuses = []
+
+    def upd():
+        c = app.app.test_client()
+        statuses.append(c.post("/api/naive/update", headers=CSRF).status_code)
+
+    _run_concurrently(upd, upd)
+    assert statuses.count(202) == 1, statuses
+    assert statuses.count(409) == 1, statuses
+    assert len(workers) == 1
+
+
+def _state_partial_read_case(app, write, read, first):
+    write(first)
+    stop = threading.Event()
+    empty_reads = []
+
+    def reader():
+        while not stop.is_set():
+            if read() == {}:
+                empty_reads.append(True)
+                return
+
+    t = threading.Thread(target=reader)
+    t.start()
+    for i in range(400):
+        write({"phase": "running", "i": i, "pad": "x" * 512})
+    stop.set()
+    t.join(timeout=5)
+    assert not t.is_alive(), "state reader hung"
+    assert empty_reads == [], "читатель увидел пустой/частичный state"
+
+
+def test_update_state_concurrent_reads_never_see_partial(app):
+    # write_text (truncate → write) оставлял читателю пустой файл; ридер
+    # возвращал {} — панель сочла бы апдейт завершённым и запустила второй
+    _state_partial_read_case(app, app._update_state_write,
+                             app._update_state_read,
+                             {"phase": "running", "i": 0})
+
+
+def test_naive_state_concurrent_reads_never_see_partial(app):
+    _state_partial_read_case(app, app._naive_state_write,
+                             app._naive_state_read,
+                             {"phase": "running", "i": 0})
 
 
 # --- self-update: state и лог ------------------------------------------------------
@@ -2949,6 +3350,55 @@ def test_failover_concurrent_puts_are_serialized(app, monkeypatch):
     assert set(raw) == {"enabled", "chain", "auto_return"}
 
 
+# --- atomic writes: уникальные tmp под конкурентную запись (REL-01) ----------
+
+def test_save_json_concurrent_same_target(app, env, monkeypatch):
+    # общий <name>.tmp превращал две параллельные записи одного target в
+    # гонку: replace первого потока удалял tmp из-под второго →
+    # FileNotFoundError. Barrier перед replace сталкивает потоки в этом
+    # окне детерминированно.
+    target = env / "state" / "shared.json"
+    real_replace = os.replace
+    barrier = threading.Barrier(2, timeout=5)
+
+    def replace_at_barrier(src, dst):
+        barrier.wait()
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", replace_at_barrier)
+    errors = []
+
+    def worker(value):
+        try:
+            app._save_json(target, {"value": value})
+        except Exception as exc:  # noqa: BLE001 - любой сбой = провал теста
+            errors.append(f"{type(exc).__name__}: {exc}")
+
+    threads = [threading.Thread(target=worker, args=(v,)) for v in (1, 2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+    assert not any(t.is_alive() for t in threads), "writer thread hung"
+    assert errors == []
+    assert json.loads(target.read_text())["value"] in (1, 2)
+    # tmp-файлов не осталось, права — секретные 0600
+    assert sorted(p.name for p in target.parent.iterdir()) == ["shared.json"]
+    assert target.stat().st_mode & 0o777 == 0o600
+
+
+def test_save_json_replace_failure_keeps_target_and_tmp_clean(app, env, monkeypatch):
+    # ошибка до replace: прежний файл нетронут, мусорный tmp убран
+    target = env / "state" / "cfg.json"
+    app._save_json(target, {"value": "old"})
+    monkeypatch.setattr(
+        os, "replace", lambda *a: (_ for _ in ()).throw(OSError("ro fs")))
+    with pytest.raises(OSError):
+        app._save_json(target, {"value": "new"})
+    assert json.loads(target.read_text())["value"] == "old"
+    assert sorted(p.name for p in target.parent.iterdir()) == ["cfg.json"]
+
+
 def test_delete_preset_rewrites_failover_chain_on_disk(client, app):
     _create(client, name="home")
     _create(client, name="backup")
@@ -3825,6 +4275,332 @@ def test_rollback_binary_restores_previous(client, env, monkeypatch):
     assert marker.read_text().strip() == "restart"
     st = m._naive_state_read()
     assert st["phase"] == "done" and st["rollback"] is True
+
+
+def test_rollback_binary_failed_restart_not_reported_as_restarted(client, env,
+                                                                  monkeypatch):
+    # бинарник заменён, но рестарт упал: restarted=true врал бы, что всё ок
+    m = _rb_naive_setup(env, monkeypatch, prev_tag="v113.0.5672.3-1")
+    stub = env / "rb-fail-init.sh"
+    stub.write_text('#!/bin/sh\necho "boom" >&2\nexit 7\n')
+    stub.chmod(0o755)
+    monkeypatch.setattr(m, "INIT_SCRIPT", stub)
+    m.PID_FILE.parent.mkdir(parents=True, exist_ok=True)
+    m.PID_FILE.write_text(str(os.getpid()))
+    monkeypatch.setattr(m, "_pid_is_naive", lambda pid: True)
+
+    r = m.app.test_client().post("/api/rollback", json={"binary": True},
+                                 headers=CSRF)
+    assert r.status_code == 200, r.get_json()
+    body = r.get_json()
+    assert body["restarted"] is False  # рестарт упал — не выдаём за успех
+    assert body["restart_rc"] == 7     # бинарник-то заменён: rc виден явно
+    assert m._naive_bin_version() == "113.0.5672.3"
+    st = m._naive_state_read()
+    assert st["phase"] == "done"       # замена бинарника состоялась
+    assert st["restarted"] is False
+    assert st["restart_rc"] == 7
+
+
+# --- integrity обновлений: tar members + непропускаемый checksum (SEC-03) ------
+
+def _evil_tarball(path: Path, evil) -> None:
+    """Нормальный naive-тарболл + один вредоносный member."""
+    import io
+    import tarfile
+    data = b"#!/bin/sh\necho 'naive 154.0.8037.49'\n"
+    with tarfile.open(path, "w:xz") as tf:
+        info = tarfile.TarInfo("naiveproxy-v154.0.8037.49-2-openwrt-x86_64/naive")
+        info.mode = 0o755
+        info.size = len(data)
+        tf.addfile(info, io.BytesIO(data))
+        tf.addfile(evil)
+
+
+def test_naive_update_rejects_unsafe_tar_members(client, app, env, monkeypatch):
+    import tarfile
+    escape = tarfile.TarInfo("../escaped")       # size 0 — для проверки пути хватит
+    absolute = tarfile.TarInfo("/etc/absolute-pwn")
+    symlink = tarfile.TarInfo("naiveproxy-v154/link")
+    symlink.type = tarfile.SYMTYPE
+    symlink.linkname = "/etc/passwd"
+    cases = [
+        (escape, "unsafe archive path"),
+        (absolute, "unsafe archive path"),
+        (symlink, "unsupported archive member"),
+    ]
+    for evil, want in cases:
+        m = _naive_env_reload(env, monkeypatch)
+        old = env / "naive"
+        old.write_text('#!/bin/sh\necho "naive 113.0.5672.3"\n')
+        old.chmod(0o755)
+        m.NAIVE_TAG.write_text("v113.0.5672.3-1\n")
+        m.NAIVE_BUILD.write_text("x86_64\n")
+        _evil_tarball(env / "evil.tar.xz", evil)
+        url, stop = _serve_tarball(env / "evil.tar.xz")
+        try:
+            _naive_rel(monkeypatch, m,
+                       assets=(("naiveproxy-v154.0.8037.49-2-openwrt-x86_64.tar.xz",
+                                url),))
+            assert m.app.test_client().post("/api/naive/update",
+                                            headers=CSRF).status_code == 202
+            st = _naive_done(m)
+        finally:
+            stop()
+        assert st["phase"] == "failed", st
+        assert want in st["error"], st["error"]
+        # вне stage ничего не создано, рабочий бинарник не тронут
+        assert not (env / "escaped").exists()
+        assert not (env / "etc").exists()
+        assert m._naive_bin_version() == "113.0.5672.3"
+
+
+def test_install_sh_checksum_cannot_be_skipped(app):
+    # ветка «sha256sum not found — skipping» открывала установку без
+    # integrity-проверки: обязана исчезнуть (fail-closed)
+    src = (APP_DIR / "install.sh").read_text(encoding="utf-8")
+    assert "skipping checksum verification" not in src
+    assert "cannot verify SHA256SUMS" in src
+
+
+# --- права panel.conf + PID identity в init-скриптах (SEC-04/05) ---------------
+
+def test_install_sh_creates_private_panel_conf(app):
+    # в panel.conf живут токены уведомлений: свежий файл не должен получать
+    # group/other-readable 0644
+    src = (APP_DIR / "install.sh").read_text(encoding="utf-8")
+    assert 'chmod 0644 "$PANEL_CONF"' not in src
+    m = re.search(r'chmod (\d+) "\$PANEL_CONF"', src)
+    assert m, "chmod panel.conf не найден в install.sh"
+    assert int(m.group(1), 8) & 0o077 == 0, "panel.conf: биты group/other должны быть сняты"
+
+
+def test_notify_conf_upsert_keeps_private_mode(conf_env, monkeypatch):
+    # Telegram save/delete не должен открывать panel.conf миру
+    monkeypatch.setenv("NAIVEPANEL_CONF", str(conf_env))
+    m = _reload()
+    m._conf_upsert({"NAIVEPANEL_TG_TOKEN": "123456:abcdefghijklmnopqrstuvwxyz"})
+    assert m.PANEL_CONF.stat().st_mode & 0o777 == 0o600
+    m._conf_upsert({"NAIVEPANEL_TG_TOKEN": None})
+    assert m.PANEL_CONF.stat().st_mode & 0o777 == 0o600
+
+
+def _init_src(name: str) -> str:
+    return (APP_DIR / name).read_text(encoding="utf-8")
+
+
+def test_s99naiveproxy_checks_pid_identity(app):
+    # kill -0 подтверждает лишь существование процесса: переиспользованный
+    # pid нельзя TERM/KILL — сверяем comm через /proc
+    src = _init_src("S99naiveproxy")
+    assert "pid_is_ours" in src, "нет проверки identity pid"
+    m = re.search(r"pid_is_ours\(\) \{(.*?)\n\}", src, re.S)
+    assert m, "pid_is_ours() не найден"
+    body = m.group(1)
+    assert "/proc" in body and "naiveproxy" in body
+    # running() обязан отвергать чужой pid
+    m = re.search(r"running\(\) \{(.*?)\n\}", src, re.S)
+    assert m and "pid_is_ours" in m.group(1), "running() не проверяет identity"
+
+
+def test_s99naivepanel_checks_pid_identity(app):
+    # comm у панели — python3: сверяем cmdline на naivepanel.py
+    src = _init_src("S99naivepanel")
+    assert "pid_is_ours" in src, "нет проверки identity pid"
+    m = re.search(r"pid_is_ours\(\) \{(.*?)\n\}", src, re.S)
+    assert m, "pid_is_ours() не найден"
+    body = m.group(1)
+    # в grep-паттерне точка экранирована: naivepanel\.py
+    assert "cmdline" in body and "naivepanel\\.py" in body
+    m = re.search(r"running\(\) \{(.*?)\n\}", src, re.S)
+    assert m and "pid_is_ours" in m.group(1), "running() не проверяет identity"
+
+
+def test_init_scripts_stop_does_not_hide_survivor(app):
+    # процесс пережил TERM и KILL (D-state) — pidfile нельзя молча удалять,
+    # будто всё остановлено
+    for name in ("S99naiveproxy", "S99naivepanel"):
+        src = _init_src(name)
+        assert "survived" in src, f"{name}: stop не детектит выживший после KILL процесс"
+
+
+# --- дорогие операции: одновременность и внешние ходы (SEC-06) ------------------
+
+def test_expensive_limit_leaves_threads_for_cheap_routes(app):
+    # семафор, равный пулу потоков waitress, ничего не защищает: дешёвые
+    # роуты (статус/лог) обязаны всегда находить свободный поток
+    assert app._EXPENSIVE_LIMIT <= app.WAITRESS_THREADS - 1
+
+
+def test_probe_concurrency_limit_returns_429(client, app, monkeypatch):
+    # залп probe держал по worker-потоку на каждый TCP-коннект (3с таймаут)
+    # — waitress исчерпывался и /api/status отваливался. Сверх лимита — 429.
+    monkeypatch.setattr(app, "_EXPENSIVE_SEM", threading.BoundedSemaphore(1))
+    release = threading.Event()
+
+    def slow_connect(ep, timeout=None):
+        release.wait(timeout=5)
+        raise OSError("blocked in test")
+
+    monkeypatch.setattr(app.socket, "create_connection", slow_connect)
+    results = []
+
+    def probe():
+        c = app.app.test_client()
+        results.append(c.post("/api/probe", headers=CSRF,
+                              json={"upstream": "p.example"}).status_code)
+
+    t = threading.Thread(target=probe)
+    t.start()
+    time.sleep(0.15)  # первый запрос занял единственный слот
+    c2 = app.app.test_client()
+    r = c2.post("/api/probe", headers=CSRF, json={"upstream": "p.example"})
+    assert r.status_code == 429
+    release.set()
+    t.join(timeout=5)
+    assert not t.is_alive()
+    assert results == [200]  # слот не потерян: первый отработал штатно
+
+
+def test_e2e_concurrency_limit_returns_429(client, app, monkeypatch):
+    monkeypatch.setattr(app, "_EXPENSIVE_SEM", threading.BoundedSemaphore(1))
+    release = threading.Event()
+
+    def slow_check(listen):
+        release.wait(timeout=5)
+        return {"ok": False, "error": "blocked in test"}
+
+    monkeypatch.setattr(app, "_proxy_e2e_check", slow_check)
+    _create(client)
+    client.post("/api/configs/home/activate", headers=CSRF)
+    t = threading.Thread(
+        target=lambda: app.app.test_client().post("/api/e2e", headers=CSRF, json={}))
+    t.start()
+    time.sleep(0.15)
+    r = app.app.test_client().post("/api/e2e", headers=CSRF, json={})
+    assert r.status_code == 429
+    release.set()
+    t.join(timeout=5)
+    assert not t.is_alive()
+
+
+def test_update_check_force_storm_is_coalesced(client, app, monkeypatch):
+    # параллельные force=1 не должны превращаться в залп внешних запросов
+    app._update_check_cache.clear()
+    calls = []
+    release = threading.Event()
+
+    def slow_release():
+        release.wait(timeout=5)
+        calls.append(1)
+        return {"tag": "v9.9.9", "notes": "", "url": ""}
+
+    monkeypatch.setattr(app, "_latest_release", slow_release)
+    out = []
+
+    def check():
+        c = app.app.test_client()
+        r = c.get("/api/update/check?force=1")
+        out.append((r.status_code, r.get_json().get("cached")))
+
+    t = threading.Thread(target=check)
+    t.start()
+    time.sleep(0.15)  # первый уже в фазе внешнего резолва
+    check()           # второй force при живом первом
+    release.set()
+    t.join(timeout=5)
+    assert not t.is_alive()
+    assert len(out) == 2
+    assert [s for s, _ in out] == [200, 200]
+    # порядок возврата потоков не фиксирован: важно, что один сходил в сеть,
+    # второй взял его результат из кэша
+    assert sorted(f is True for _, f in out) == [False, True]
+    assert len(calls) == 1
+
+
+def test_update_check_429_when_saturated(client, app, monkeypatch):
+    app._update_check_cache.clear()
+    monkeypatch.setattr(app, "_EXPENSIVE_SEM", threading.BoundedSemaphore(0))
+    monkeypatch.setattr(app, "_latest_release",
+                        lambda: {"tag": "v9.9.9", "notes": "", "url": ""})
+    r = client.get("/api/update/check?force=1")
+    assert r.status_code == 429
+
+
+def test_http_get_bounds_connect_time_and_size(app, monkeypatch):
+    # без --connect-timeout зависший коннект съедал весь --max-time, без
+    # --max-filesize безразмерный ответ оставался в памяти
+    cmds = []
+
+    class _R:
+        returncode = 1
+        stdout = ""
+
+    def fake_run(cmd, **k):
+        cmds.append(cmd)
+        return _R()
+
+    monkeypatch.setattr(app.subprocess, "run", fake_run)
+    with pytest.raises(RuntimeError):
+        app._http_get("https://example.invalid/x")
+    assert any("--connect-timeout" in c and "--max-filesize" in c for c in cmds), cmds
+
+
+def _no_waitress(monkeypatch):
+    import builtins
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "waitress":
+            raise ImportError(name)
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+
+
+def test_serve_refuses_werkzeug_on_lan_without_waitress(app, monkeypatch):
+    # Werkzeug dev-сервер в LAN — авария конфигурации, а не fallback
+    _no_waitress(monkeypatch)
+    monkeypatch.setattr(app, "_bind_is_loopback", lambda: False)
+    monkeypatch.delenv("NAIVEPANEL_DEV_SERVER", raising=False)
+    with pytest.raises(SystemExit):
+        app._serve(app.app, "192.168.1.1", 8089)
+
+
+def test_serve_werkzeug_fallback_allowed_on_loopback_and_override(app, monkeypatch):
+    _no_waitress(monkeypatch)
+    calls = []
+    monkeypatch.setattr(app.app, "run", lambda **k: calls.append(k))
+    # loopback — законный dev-режим
+    monkeypatch.setattr(app, "_bind_is_loopback", lambda: True)
+    app._serve(app.app, "127.0.0.1", 8089)
+    assert calls, "loopback fallback не сработал"
+    # явный override и в LAN
+    calls.clear()
+    monkeypatch.setattr(app, "_bind_is_loopback", lambda: False)
+    monkeypatch.setenv("NAIVEPANEL_DEV_SERVER", "1")
+    app._serve(app.app, "192.168.1.1", 8089)
+    assert calls, "NAIVEPANEL_DEV_SERVER=1 override не сработал"
+
+
+def test_install_sh_python_fallback_verifier(tmp_path):
+    # извлечённый из install.sh python3-фолбэк: корректные суммы → rc 0,
+    # подменённый файл → rc 1 (регрессионная защита самого текста скрипта)
+    import hashlib
+    src = (APP_DIR / "install.sh").read_text(encoding="utf-8")
+    m = re.search(r"-c '\s*(import hashlib.*?)'", src, re.S)
+    assert m, "python3 fallback verifier не найден в install.sh"
+    code = m.group(1)
+    (tmp_path / "f.txt").write_text("hello")
+    digest = hashlib.sha256(b"hello").hexdigest()
+    (tmp_path / "SHA256SUMS").write_text(f"{digest}  f.txt\n")
+    r = subprocess.run([sys.executable, "-c", code], cwd=tmp_path,
+                       capture_output=True)
+    assert r.returncode == 0, r.stderr
+    (tmp_path / "f.txt").write_text("tampered")
+    r = subprocess.run([sys.executable, "-c", code], cwd=tmp_path,
+                       capture_output=True)
+    assert r.returncode == 1
 
 
 def test_rollback_binary_without_tag_clears_naive_tag(client, env, monkeypatch):

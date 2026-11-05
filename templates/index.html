@@ -285,10 +285,12 @@
       <textarea id="f_listen" rows="2" placeholder="127.0.0.1:1080&#10;http://127.0.0.1:8080" style="min-height:48px"></textarea>
       <div style="font-size:11px;color:var(--mut);margin-top:4px">
         По одному на строку или через запятую. Без схемы добавляется
-        <code style="color:var(--acc)">socks://</code>;
-        <code style="color:var(--acc)">http://</code> /
-        <code style="color:var(--acc)">quic://</code> сохраняются как есть.
-        2+ адресов → массив в JSON.
+        <code style="color:var(--acc)">socks://</code>; разрешены схемы
+        <code style="color:var(--acc)">socks://</code>,
+        <code style="color:var(--acc)">socks5://</code>,
+        <code style="color:var(--acc)">http://</code> (порт 1–65535,
+        без path). <code style="color:var(--acc)">quic://</code> — это схема
+        upstream, не listen. 2+ адресов → массив в JSON.
       </div>
 
       <label for="f_upstream">Upstream URL (https://host или полный proxy URL)</label>
@@ -1217,8 +1219,18 @@ async function del(name) {
 
 const SVC_VERBS = {start:'запущен', stop:'остановлен', restart:'перезапущен'};
 async function svc(action) {
-  try { await jpost('/api/service/'+action, null); flash('Сервис '+(SVC_VERBS[action]||action), true); await refreshAll(); }
-  catch (e) { flash(e.message, false); }
+  const buttons = Array.from(document.querySelectorAll('[data-action="svc"]'));
+  buttons.forEach(b => { b.disabled = true; });
+  try {
+    const d = await jpost('/api/service/'+action, null);
+    // rc!==0 — команда упала: сообщение про успех без проверки врало (REL-05)
+    const failed = restartFailed(d);
+    flash('Сервис ' + (SVC_VERBS[action] || action)
+          + (failed ? ' — НЕ удался: ' + (d.stderr || d.stdout || ('rc=' + d.rc)) : ''),
+          !failed);
+    await refreshAll();
+  } catch (e) { flash(e.message, false); }
+  finally { buttons.forEach(b => { b.disabled = false; }); }
 }
 
 async function panelRestart() {
@@ -1432,7 +1444,13 @@ async function updateNaive() {
       const phase = st.state && st.state.phase;
       if (phase === 'done') {
         $('updMsg').textContent = 'Бинарник обновлён: ' + (st.state.version || st.state.target || '');
-        flash('Бинарник naive обновлён' + (st.state.restarted ? ' — сервис перезапущен' : ''), true);
+        // бинарник заменён, но рестарт мог упасть — это не успех (REL-05)
+        const rrc = st.state.restart_rc;
+        if (typeof rrc === 'number' && rrc !== 0) {
+          flash('Бинарник обновлён, но рестарт НЕ удался (rc=' + rrc + ') — проверьте статус сервиса', false);
+        } else {
+          flash('Бинарник naive обновлён' + (st.state.restarted ? ' — сервис перезапущен' : ''), true);
+        }
         $('updDlg').close();
         await checkNaive(true);
         await refreshAll();
@@ -1571,8 +1589,15 @@ async function rollbackBinary() {
   let d;
   try { d = await jpost('/api/rollback', {binary: true}); }
   catch (e) { flash('Откат бинарника не удался: ' + e.message, false); return; }
-  flash('Бинарник откачен на ' + (d.restored || '?')
-        + (d.restarted ? ' — сервис перезапущен' : ''), true);
+  // рестарт после отката мог упасть — не выдаём за успех (REL-05)
+  const rrc = d.restart_rc;
+  if (typeof rrc === 'number' && rrc !== 0) {
+    flash('Бинарник откачен на ' + (d.restored || '?')
+          + ', но рестарт НЕ удался (rc=' + rrc + ') — проверьте сервис', false);
+  } else {
+    flash('Бинарник откачен на ' + (d.restored || '?')
+          + (d.restarted ? ' — сервис перезапущен' : ''), true);
+  }
   await loadRollback();
   await checkNaive(true);
   await refreshAll();
