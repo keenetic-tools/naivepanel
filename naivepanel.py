@@ -323,7 +323,7 @@ _NAIVE_FETCH_LOCK = threading.Lock()
 _HTTP_CONNECT_TIMEOUT = 5
 _HTTP_MAX_BYTES = 2 * 1024 * 1024
 
-APP_VERSION = "0.19.0"
+APP_VERSION = "0.20.0"
 
 
 def _ensure_dirs() -> None:
