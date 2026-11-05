@@ -22,14 +22,16 @@
     --shadow-1:0 1px 2px rgba(0,0,0,.25);
     --shadow-2:0 2px 6px rgba(0,0,0,.35), 0 10px 28px rgba(0,0,0,.30); }
   :root[data-theme="light"] { color-scheme:light;
-    --bg:#f4f5f7; --fg:#1c2128; --mut:#69707a; --acc:#0e8a5f; --err:#c43e3e; --warn:#8a6a1d;
+    /* --acc #0b7a53: 5.35:1 на белом (WCAG AA для normal text; прежний
+       #0e8a5f давал 4.36:1 — не проходил на бейджах/ссылках/галочках) */
+    --bg:#f4f5f7; --fg:#1c2128; --mut:#69707a; --acc:#0b7a53; --err:#c43e3e; --warn:#8a6a1d;
     --btn-fg:#ffffff; --card:#ffffff; --border:#d6dae0; --border-sel:#9aa3ad;
     --sel-bg:rgba(0,0,0,.04); --hov:rgba(0,0,0,.06);
-    --acc-tint:rgba(14,138,95,.08); --badge-bg:rgba(14,138,95,.14); --mut-tint:rgba(105,112,122,.14);
+    --acc-tint:rgba(11,122,83,.08); --badge-bg:rgba(11,122,83,.14); --mut-tint:rgba(105,112,122,.14);
     --input-bg:#ffffff; --log-bg:#fbfcfd; --log-fg:#24292f;
-    --bg-glow:rgba(14,138,95,.05); --bg-glow2:rgba(58,106,255,.05);
+    --bg-glow:rgba(11,122,83,.05); --bg-glow2:rgba(58,106,255,.05);
     --hdr-bg:#ffffff; --hdr-blur:rgba(255,255,255,.72);
-    --dot-halo:rgba(14,138,95,.15);
+    --dot-halo:rgba(11,122,83,.15);
     --shadow-1:0 1px 2px rgba(24,33,40,.06);
     --shadow-2:0 2px 6px rgba(24,33,40,.07), 0 10px 28px rgba(24,33,40,.10); }
   * { box-sizing:border-box; }
@@ -162,7 +164,8 @@
   a.btn { display:inline-block; padding:7px 13px; border-radius:8px; text-decoration:none;
           font:inherit; font-weight:600; }
   a.btn:hover { border-color:var(--acc); background:var(--hov); }
-  button:focus-visible, input:focus-visible, textarea:focus-visible, summary:focus-visible, a:focus-visible {
+  button:focus-visible, input:focus-visible, textarea:focus-visible, summary:focus-visible,
+  a:focus-visible, pre.log:focus-visible {
     outline:2px solid var(--acc); outline-offset:1px; }
   label { display:block; font-size:12px; color:var(--mut); margin-top:12px; }
   input,textarea { width:100%; padding:8px 11px; background:var(--input-bg); color:var(--fg);
@@ -189,6 +192,11 @@
   @keyframes toast-in { from { opacity:0; transform:translateY(6px); } to { opacity:1; transform:none; } }
   .toast.ok { border-color:var(--acc); color:var(--acc); }
   .toast.err { border-color:var(--err); color:var(--err); }
+  /* мини-крест закрытия тоста: закрывается и с клавиатуры (UX-03) */
+  .toast-x { background:none; border:none; color:inherit; opacity:.6; cursor:pointer;
+             padding:0 2px; margin-left:8px; font-size:12px; font-weight:400;
+             box-shadow:none; }
+  .toast-x:hover { opacity:1; filter:none; box-shadow:none; background:none; }
   dialog { border:1px solid var(--border); border-radius:12px; background:var(--card);
            color:var(--fg); padding:18px; max-width:min(420px, calc(100vw - 32px));
            box-shadow:var(--shadow-2); }
@@ -209,6 +217,21 @@
      а пользователь видит toast (двойной вывод был бы шумным). */
   .sr-only { position:absolute; width:1px; height:1px; margin:-1px; overflow:hidden;
              clip:rect(0 0 0 0); white-space:nowrap; }
+  /* Телефон (≤800px): пальцы вместо мыши — цели ≥44px; поля 16px, иначе
+     iOS приближает страницу при фокусе (UX-02). Блок обязан идти ПОСЛЕ
+     базовых input/button правил — cascade. */
+  @media (max-width:800px) {
+    input, textarea, select { font-size:16px; }
+    button { min-height:44px; }
+    ul.presets .act, ul.presets .del, .iconbtn { min-height:44px; min-width:44px; }
+    /* кликабельные подписи-чекбоксы: строка целиком — цель, но и высоту
+       держим пальцеприемлемой */
+    label.chk { min-height:44px; }
+    ul.presets .acts { flex-wrap:wrap; justify-content:flex-end; }
+    /* мини-крест закрытия тоста — исключение: сам тост остаётся большой
+       кликабельной/тапабельной целью */
+    .toast-x { min-height:0; min-width:0; }
+  }
 </style>
 <script nonce="{{ csp_nonce }}">
   // Тема применяется до первой отрисовки — без вспышки неправильных цветов.
@@ -263,11 +286,11 @@
       <button class="ghost" data-action="foAll" id="btnFoAll"
               title="Добавить все пресеты в цепочку (не больше 8)">Все в цепочку</button>
     </div>
-    <label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--mut);margin-top:10px;cursor:pointer">
+    <label class="chk" style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--mut);margin-top:10px;cursor:pointer">
       <input type="checkbox" id="foEnabled" aria-label="Автофейловер включён" disabled>
       автофейловер включён
     </label>
-    <label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--mut);margin-top:6px;cursor:pointer">
+    <label class="chk" style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--mut);margin-top:6px;cursor:pointer">
       <input type="checkbox" id="foAuto" aria-label="Возвращать на основной" disabled>
       возвращать на основной
     </label>
@@ -295,7 +318,7 @@
 
       <label for="f_upstream">Upstream URL (https://host или полный proxy URL)</label>
       <div style="display:flex;gap:8px">
-        <input id="f_upstream" placeholder="https://proxy.example.com" autocomplete="off" spellcheck="false" style="flex:1">
+        <input id="f_upstream" aria-describedby="upHint" placeholder="https://proxy.example.com" autocomplete="off" spellcheck="false" style="flex:1">
         <button type="button" class="ghost" id="btnProbe" data-action="probe"
                 title="TCP-доступность upstream с роутера (без TLS и кредов, таймаут 3с)">пинг</button>
       </div>
@@ -344,7 +367,7 @@
       <button class="ghost iconbtn" id="btnSrcPanel" data-action="logSrc" data-arg="panel"
               aria-pressed="false" title="naivepanel.log — события самой панели: безопасность, обновление, обслуживание">панель</button>
     </div>
-    <pre class="log" id="log">…</pre>
+    <pre class="log" id="log" tabindex="0" role="log" aria-label="Лог панели (последние записи)">…</pre>
     <div class="actions">
       <button class="ghost" data-action="loadLog">Обновить</button>
       <button class="ghost" id="btnLogFilter" data-action="logFilter" aria-pressed="false">Только ошибки</button>
@@ -470,6 +493,8 @@
 const $ = (id) => document.getElementById(id);
 let current = null; // выбранный пресет (имя) или null
 let dirty = false;  // есть несохранённые правки в редакторе
+let selectSeq = 0;  // монотонный токен выбора: поздний ответ A не пишет форму, когда выбран B
+let saving = false; // guard от повторного входа (Ctrl+S во время активного PUT)
 let authChanged = false; // пароль сменён: поллинг старыми кредами не шлём
 
 const CSRF = {'X-Requested-With': 'naivepanel'}; // мутации без него сервер отбивает 403
@@ -516,7 +541,15 @@ function flash(msg, ok, ms) {
   const t = document.createElement('div');
   t.className = 'toast ' + (ok ? 'ok' : 'err');
   t.textContent = msg;
-  t.onclick = () => t.remove();
+  // закрывается и с клавиатуры: настоящая кнопка, а не только клик по тосту
+  const x = document.createElement('button');
+  x.className = 'toast-x';
+  x.type = 'button';
+  x.setAttribute('aria-label', 'Закрыть уведомление');
+  x.textContent = '✕';
+  t.appendChild(x);
+  t.onclick = (e) => { if (e.target === t) t.remove(); };  // клик по тексту тоже закрывает
+  x.onclick = () => t.remove();
   box.appendChild(t);
   while (box.children.length > 4) box.firstChild.remove();
   setTimeout(() => t.remove(), ms || (ok ? 5000 : 9000));
@@ -530,13 +563,20 @@ function effTheme() {
   if (t) return t;
   return matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
 }
+function setThemeBtn(theme) {
+  const b = $('themeToggle');
+  b.textContent = theme === 'light' ? '☾' : '☀';
+  // доступное имя отражает целевое состояние, а не текущее (UX-03)
+  b.setAttribute('aria-label',
+    theme === 'light' ? 'Переключить на тёмную тему' : 'Переключить на светлую тему');
+}
 function toggleTheme() {
   const next = effTheme() === 'light' ? 'dark' : 'light';
   document.documentElement.dataset.theme = next;
   try { localStorage.setItem(THEME_KEY, next); } catch (e) { /* private mode */ }
-  $('themeToggle').textContent = next === 'light' ? '☾' : '☀';
+  setThemeBtn(next);
 }
-$('themeToggle').textContent = effTheme() === 'light' ? '☾' : '☀';
+setThemeBtn(effTheme());
 
 // Следим за системной темой, пока пользователь не зафиксировал выбор.
 matchMedia('(prefers-color-scheme: light)').addEventListener('change', (e) => {
@@ -544,7 +584,7 @@ matchMedia('(prefers-color-scheme: light)').addEventListener('change', (e) => {
   try { stored = localStorage.getItem(THEME_KEY); } catch (err) { /* private mode */ }
   if (!stored) {
     document.documentElement.dataset.theme = e.matches ? 'light' : 'dark';
-    $('themeToggle').textContent = e.matches ? '☾' : '☀';
+    setThemeBtn(effTheme());
   }
 });
 
@@ -855,9 +895,11 @@ function escapeHtml(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;'
 
 async function selectPreset(name) {
   if (name !== current && !(await maybeDiscard())) return;
+  const seq = ++selectSeq;
   current = name;
   try {
     const cfg = await jget('/api/configs/'+encodeURIComponent(name));
+    if (seq !== selectSeq) return; // выбрали другой пресет, пока шли данные
     const listen = Array.isArray(cfg.listen) ? cfg.listen.join('\n') : (cfg.listen || '');
     $('editorTitleText').textContent = 'Редактор — '+name;
     $('editor').style.display = 'block';
@@ -982,10 +1024,17 @@ function drawSpark(d) {
   }
   const st = d.stats || {};
   const win = st.window_s ? fmtSpan(st.window_s) : '';
+  const last = es[n - 1];
+  // текстовый эквивалент полосок для скринридера (UX-03): не только цвет
+  const summary = 'E2E-история: '+n+' проверок'
+    + (st.availability != null ? ', успешных '+st.availability+'%' : '')
+    + (st.avg_ms != null ? ', в среднем '+st.avg_ms+'мс' : '')
+    + ', последняя — '+(last.ok ? 'успешна' : 'сбой');
   box.innerHTML = '<svg viewBox="0 0 100 16" preserveAspectRatio="none" aria-hidden="true">'+bars+'</svg>'
     + '<span class="cap">E2E '+(st.availability != null ? st.availability+'%' : '')
     + (st.avg_ms != null ? ' · в среднем '+st.avg_ms+'мс' : '')
-    + (win ? ' · '+win : '')+'</span>';
+    + (win ? ' · '+win : '')+'</span>'
+    + '<span class="sr-only">'+summary+'</span>';
   box.title = 'последние '+n+' проверок монитора: зелёный — прокси работает, красный — сбой (подробности — лог панели)';
 }
 function fmtSpan(s) {
@@ -1160,6 +1209,8 @@ function applyMsg(base, rst) {
 
 async function save(ev) {
   if (ev) ev.preventDefault();
+  if (saving) return; // Ctrl+S во время активного PUT не создаёт второй запрос
+  saving = true;
   const btn = $('btnSave');
   const payload = formPayload();
   btn.disabled = true; btn.textContent = 'Сохранение…';
@@ -1177,7 +1228,7 @@ async function save(ev) {
     dirty = false;
     await refreshAll();
   } catch (e) { flash(e.message, false); }
-  finally { btn.disabled = false; btn.textContent = 'Сохранить'; }
+  finally { saving = false; btn.disabled = false; btn.textContent = 'Сохранить'; }
 }
 
 function formPayload() {
@@ -1282,7 +1333,7 @@ function renderUpdate(err) {
     return;
   }
   if (upd.error) { // GitHub недоступен с роутера — штатный случай, тихая строка
-    info.textContent = 'обновления: не удалось проверить ('+escapeHtml(upd.error)+')';
+    info.textContent = 'обновления: не удалось проверить ('+upd.error+')';
     return;
   }
   if (upd.available) {
@@ -1389,7 +1440,7 @@ function renderNaive(err) {
     return;
   }
   if (nv.error) { // GitHub недоступен — тихая строка, как у обновлений панели
-    info.textContent = 'бинарник: не удалось проверить (' + escapeHtml(nv.error) + ')';
+    info.textContent = 'бинарник: не удалось проверить (' + nv.error + ')';
     return;
   }
   const tgt = nv.target ? ' · ' + escapeHtml(nv.target) : '';
@@ -1753,7 +1804,9 @@ $('editor').addEventListener('input', () => { dirty = true; });
 const UP_OK = /^(https?:\/\/|quic:\/\/)[A-Za-z0-9._~%!$&'()*+,;=:@\/?#\-\[\]]+$|^[A-Za-z0-9.\-\[\]:]+$/;
 function validateUpstream() {
   const v = $('f_upstream').value.trim();
-  $('upHint').classList.toggle('show', v.length > 0 && !UP_OK.test(v));
+  const bad = v.length > 0 && !UP_OK.test(v);
+  $('upHint').classList.toggle('show', bad);
+  $('f_upstream').setAttribute('aria-invalid', bad ? 'true' : 'false');
 }
 $('f_upstream').addEventListener('input', validateUpstream);
 window.addEventListener('beforeunload', (e) => { if (dirty) { e.preventDefault(); e.returnValue = ''; } });

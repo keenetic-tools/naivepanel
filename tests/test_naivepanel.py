@@ -960,6 +960,108 @@ def test_ui_naive_update_distinguishes_restart_failure(app):
     assert "restart_rc" in html, "UI не различает failed restart после смены бинарника"
 
 
+# --- UX: контраст, touch targets, доступность, гонки запросов (Tasks 11–13) ----
+
+def _wcag_contrast(hex_fg: str, hex_bg: str = "ffffff") -> float:
+    """Контраст WCAG 2.x по относительной яркости (контракт-тест токена)."""
+    def lum(h: str) -> float:
+        r, g, b = (int(h[i:i + 2], 16) / 255 for i in (0, 2, 4))
+        lin = [c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+               for c in (r, g, b)]
+        return 0.2126 * lin[0] + 0.7152 * lin[1] + 0.0722 * lin[2]
+    l1, l2 = sorted((lum(hex_fg), lum(hex_bg)), reverse=True)
+    return (l1 + 0.05) / (l2 + 0.05)
+
+
+def test_light_accent_meets_wcag_aa(app):
+    # UX-01: светлый --acc #0e8a5f давал 4.36:1 на белом — текст на бейджах,
+    # ссылки, галочки. Токен обязан держать AA для normal text
+    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    m = re.search(r'\[data-theme="light"\][^{]*\{[^}]*?--acc:#([0-9a-fA-F]{6})', html)
+    assert m, "light --acc не найден"
+    assert _wcag_contrast(m.group(1)) >= 4.5, _wcag_contrast(m.group(1))
+
+
+def test_mobile_touch_targets_and_input_font(app):
+    # UX-02: на ≤800px цели ≥44px; поля ≥16px, иначе iOS приближает страницу
+    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    blocks = re.findall(r"@media \(max-width:800px\) \{.*?\n  \}", html, re.S)
+    assert blocks, "нет мобильного media-блока"
+    mobile = "\n".join(blocks)
+    assert "min-height:44px" in mobile, "нет touch-целей 44px"
+    assert "font-size:16px" in mobile, "нет 16px у полей на mobile"
+
+
+def test_toast_has_keyboard_close(app):
+    # UX-03: toast закрывался только кликом по нему — недоступно с клавиатуры
+    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    m = re.search(r"function flash\(msg, ok, ms\) \{.*?\n\}", html, re.S)
+    assert m, "flash() не найден"
+    body = m.group(0)
+    assert "createElement('button')" in body
+    assert "Закрыть уведомление" in body
+
+
+def test_log_focusable_and_labeled(app):
+    # UX-03: прокручиваемый лог не получал фокус с клавиатуры
+    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    assert re.search(r'<pre class="log" id="log"[^>]*tabindex="0"', html), \
+        "главный лог не фокусируется"
+    assert re.search(r'<pre class="log" id="log"[^>]*aria-label="', html), \
+        "у лога нет доступного имени"
+
+
+def test_upstream_input_linked_to_hint(app):
+    # UX-03: ошибка валидации upstream должна объявляться скринридером
+    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    assert 'aria-describedby="upHint"' in html, "f_upstream не связан с подсказкой"
+    m = re.search(r"function validateUpstream\(\) \{.*?\n\}", html, re.S)
+    assert m and "aria-invalid" in m.group(0), "валидация не ставит aria-invalid"
+
+
+def test_sparkline_has_text_summary(app):
+    # UX-03: спарклайн — только красно-зелёные полоски; текстовая сводка
+    # обязана существовать для незрячих
+    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    m = re.search(r"function drawSpark\(d\) \{.*?\n\}", html, re.S)
+    assert m and "sr-only" in m.group(0), "у спарклайна нет текстового эквивалента"
+
+
+def test_theme_button_accessible_name_updates(app):
+    # UX-03: имя кнопки темы должно отражать целевое состояние
+    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    m = re.search(r"function setThemeBtn\(theme\) \{.*?\n\}", html, re.S)
+    assert m and "aria-label" in m.group(0), "setThemeBtn не ставит aria-label"
+    t = re.search(r"function toggleTheme\(\) \{.*?\n\}", html, re.S)
+    assert t and "setThemeBtn" in t.group(0), "toggleTheme не обновляет кнопку"
+
+
+def test_no_double_escaping_in_textcontent(app):
+    # UX-05: escapeHtml перед textContent показывал пользователю &amp; и т.п.
+    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    offenders = re.findall(r"textContent[^;\n]*=[^;\n]*escapeHtml\(", html)
+    assert not offenders, offenders
+
+
+def test_select_preset_guards_stale_response(app):
+    # UX-05: быстрый выбор A→B — поздний ответ A не должен перезаписывать
+    # форму B (out-of-order response)
+    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    m = re.search(r"async function selectPreset\(name\) \{.*?\n\}", html, re.S)
+    assert m, "selectPreset не найден"
+    body = m.group(0)
+    assert "selectSeq" in body, "нет монотонного токена выбора"
+
+
+def test_save_is_reentry_guarded(app):
+    # UX-05: повторный Ctrl+S во время активного save не должен создавать
+    # второй PUT
+    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    m = re.search(r"async function save\(ev\) \{.*?\n  \}", html, re.S)
+    assert m, "save() не найден"
+    assert "saving" in m.group(0), "нет guard'а от повторного входа"
+
+
 def test_csp_has_no_external_origins(client):
     csp = client.get("/").headers["Content-Security-Policy"]
     for src in csp.split(";"):

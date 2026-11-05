@@ -10,12 +10,15 @@
 
 **Tech Stack:** Python 3.10+, Flask, Waitress, vanilla HTML/CSS/JS, pytest, Ruff, Bandit, ShellCheck, Docker/Entware E2E, GitHub Actions.
 
-**Статус (2026-11-05):** Tasks 1–10 реализованы (релиз v0.18.0). Task 8
-реализован с уточнением: распаковка осталась системному `tar` (зависимость
-xz не меняется), валидация members — stdlib `tarfile` с fallback на
-`tar -tf` (только имена) для Entware-сборок без `python3-lzma`. Подпись
-релизов и trust-модель для naive-assets выделены в Task 8b и отложены
-до отдельного обсуждения.
+**Статус (2026-11-05):** Tasks 1–13 + 17 (доки) реализованы; 1–10 в релизе
+v0.18.0, 11–13 (UX/a11y) ожидают следующего релиза. Task 8 реализован с
+уточнением: распаковка осталась системному `tar` (зависимость xz не
+меняется), валидация members — stdlib `tarfile` с fallback на `tar -tf`
+(только имена) для Entware-сборок без `python3-lzma`. Подпись релизов и
+trust-модель для naive-assets выделены в Task 8b и отложены до отдельного
+обсуждения. Остались: Task 14 (IA/дизайн-токены), 15 (ARCH-01 модули),
+16 (CI gates), 8b; финальная release-validation из Task 17 — пререлизным
+шагом следующего релиза.
 
 ---
 
