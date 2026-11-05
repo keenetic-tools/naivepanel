@@ -1062,6 +1062,89 @@ def test_save_is_reentry_guarded(app):
     assert "saving" in m.group(0), "нет guard'а от повторного входа"
 
 
+# --- UX-04/06: информационная архитектура + дизайн-токены (Task 14) ------------
+
+def test_ui_guidelines_doc_pins_structure(app):
+    doc = (APP_DIR / "docs" / "UI-GUIDELINES.md").read_text(encoding="utf-8")
+    for section in ("Обзор", "Диагностика", "Система", "Настройки"):
+        assert section in doc, section
+    assert "--sp-4" in doc and "inline-SVG" in doc
+
+
+def test_design_tokens_defined(app):
+    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    for token in ("--sp-4:", "--fs-16:", "--font-mono:", "--r-l:",
+                  "--z-toast:", "--focus-ring:", "--status-ok:"):
+        assert token in html, token
+
+
+def test_section_anchors_exist(app):
+    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    for anchor in ('id="sec-overview"', 'id="sec-diag"',
+                   'id="sec-system"', 'id="sec-settings"'):
+        assert anchor in html, anchor
+
+
+def test_mobile_section_nav(app):
+    # табы-якоря четырёх групп: скрыты на desktop, sticky на ≤800px
+    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    assert 'id="secNav"' in html
+    for href in ("#sec-overview", "#sec-diag", "#sec-system", "#sec-settings"):
+        assert f'href="{href}"' in html, href
+    assert re.search(r"#secNav \{[^}]*display:none", html), "нет базового скрытия"
+    mobile = re.findall(r"@media \(max-width:800px\) \{.*?\n  \}", html, re.S)
+    assert mobile and any("#secNav" in b and "display:flex" in b for b in mobile), \
+        "mobile-блок не показывает #secNav"
+
+
+def test_icons_are_inline_svg_set(app):
+    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    assert 'class="ic"' in html, "нет статических inline-SVG"
+    m = re.search(r"const IC = \{.*?\};", html, re.S)
+    assert m and m.group(0).count("<svg") >= 6, "нет SVG-набора иконок (нужно ≥6)"
+    for glyph in ("⧉", "⛓"):
+        assert glyph not in html, f"Unicode-глиф {glyph} остался"
+
+
+def test_theme_button_uses_icon_set(app):
+    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    m = re.search(r"function setThemeBtn\(theme\) \{.*?\n\}", html, re.S)
+    assert m and "IC." in m.group(0), "setThemeBtn не использует SVG-набор"
+
+
+def test_editor_state_chip(app):
+    # UX-04: редактор различает «активен» / «изменено» / «сохранено»
+    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    assert 'id="editorState"' in html, "нет чипа состояния редактора"
+    m = re.search(r"function setEditorState\(\w*\) \{.*?\n\}", html, re.S)
+    assert m, "нет setEditorState()"
+    body = m.group(0)
+    for state in ("активен", "изменено", "сохранено"):
+        assert state in body or state in html, state
+
+
+def test_ops_card_renamed_to_system(app):
+    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    assert "<h2>Система</h2>" in html, "ops-карточка не названа «Система»"
+    assert "<h2>Обслуживание</h2>" not in html, "старый заголовок остался"
+
+
+def test_ui_scripts_parse(app, tmp_path):
+    # регрессия Task 14: битая JS-строка рендера валилась только в браузере
+    # (Invalid token) — статические тесты этого класса не ловят
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node недоступен — JS-синтаксис не проверить")
+    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    blocks = re.findall(r"<script[^>]*>(.*?)</script>", html, re.S)
+    assert blocks, "script-блоки не найдены"
+    for n, block in enumerate(blocks):
+        js = tmp_path / f"ui{n}.js"
+        js.write_text(block, encoding="utf-8")
+        r = subprocess.run([node, "--check", str(js)], capture_output=True, text=True)
+        assert r.returncode == 0, f"script #{n} не парсится:\n{r.stderr}"
+
+
 def test_csp_has_no_external_origins(client):
     csp = client.get("/").headers["Content-Security-Policy"]
     for src in csp.split(";"):

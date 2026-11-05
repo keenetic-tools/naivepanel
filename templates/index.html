@@ -34,6 +34,19 @@
     --dot-halo:rgba(11,122,83,.15);
     --shadow-1:0 1px 2px rgba(24,33,40,.06);
     --shadow-2:0 2px 6px rgba(24,33,40,.07), 0 10px 28px rgba(24,33,40,.10); }
+  /* Semantic tokens (docs/UI-GUIDELINES.md): новые правила — только токены;
+     существующие переводятся по мере правки. Тематические цвета через
+     var-ссылки разрешаются на момент использования — темам переопределять
+     их не нужно. */
+  :root {
+    --sp-1:4px; --sp-2:8px; --sp-3:12px; --sp-4:16px; --sp-5:20px; --sp-6:24px;
+    --fs-11:11px; --fs-12:12px; --fs-13:13px; --fs-14:14px; --fs-16:16px;
+    --font-mono:ui-monospace,Menlo,monospace;
+    --r-s:8px; --r-m:10px; --r-l:12px;
+    --z-header:5; --z-nav:6; --z-toast:10;
+    --focus-ring:2px solid var(--acc);
+    --status-ok:var(--acc); --status-err:var(--err); --status-warn:var(--warn);
+  }
   * { box-sizing:border-box; }
   /* Фон на html красит канву напрямую, включая зону overscroll («резинку»).
      Распространение фона body на канву Safari ломает на композитных слоях
@@ -47,7 +60,7 @@
     background:
       radial-gradient(1100px 480px at 18% -12%, var(--bg-glow), transparent 70%),
       radial-gradient(900px 420px at 108% 8%, var(--bg-glow2), transparent 65%); }
-  header { position:sticky; top:0; z-index:5; padding:14px 20px; display:flex; gap:12px; align-items:center;
+  header { position:sticky; top:0; z-index:var(--z-header); padding:14px var(--sp-5); display:flex; gap:12px; align-items:center;
            border-bottom:1px solid var(--border); background:var(--hdr-bg); }
   @supports (backdrop-filter:blur(8px)) or (-webkit-backdrop-filter:blur(8px)) {
     header { background:var(--hdr-blur); backdrop-filter:blur(8px); -webkit-backdrop-filter:blur(8px); }
@@ -73,17 +86,19 @@
     50% { transform:scale(1.35); opacity:.55; }
   }
   main { display:grid; grid-template-columns: 288px minmax(0,1fr) 320px;
-         grid-template-areas: "aside main ops"; gap:20px;
-         padding:20px max(20px, calc((100% - 1340px)/2)); }
-  /* средние экраны: как раньше 2 колонки, «Обслуживание» — под левой */
+         grid-template-areas: "aside main ops"; gap:var(--sp-5);
+         padding:var(--sp-5) max(var(--sp-5), calc((100% - 1340px)/2)); }
+  /* средние экраны: как раньше 2 колонки, «Обслуживание» — под левой.
+     minmax(0,·): 1fr-трек иначе берёт min-content строки пресета и рвёт
+     вьюпорт (grid blowout) */
   @media (max-width:1239px) and (min-width:801px) {
-    main { grid-template-columns: 288px 1fr; grid-template-areas: "aside main" "ops main"; }
+    main { grid-template-columns: 288px minmax(0,1fr); grid-template-areas: "aside main" "ops main"; }
   }
   @media (max-width:800px) { /* телефон: одна колонка, сверху главное */
-    main { grid-template-columns: 1fr; grid-template-areas: "aside" "main" "ops"; padding:14px; }
+    main { grid-template-columns: minmax(0,1fr); grid-template-areas: "aside" "main" "ops"; padding:14px; }
   }
-  .card { background:var(--card); border:1px solid var(--border); border-radius:12px;
-          padding:16px; box-shadow:var(--shadow-1); }
+  .card { background:var(--card); border:1px solid var(--border); border-radius:var(--r-l);
+          padding:var(--sp-4); box-shadow:var(--shadow-1); }
   .card h2 { margin:0 0 12px; font-size:12px; font-weight:600; text-transform:uppercase;
              letter-spacing:.09em; color:var(--mut); display:flex; align-items:center; gap:8px; }
   .card h2::after { content:""; flex:1; height:1px; background:var(--border); opacity:.6; }
@@ -108,8 +123,10 @@
                    font-variant-numeric:tabular-nums; }
   ul.presets { list-style:none; padding:0; margin:0; }
   #search { margin-bottom:10px; }
-  ul.presets li { border:1px solid var(--border); border-radius:10px; margin-bottom:6px;
+  ul.presets li { border:1px solid var(--border); border-radius:var(--r-m); margin-bottom:6px;
                   display:flex; align-items:center; background:var(--input-bg);
+                  min-width:0; /* grid-item: без этого min-content строки (кнопки+имя)
+                                  раздувает колонку main и рвёт mobile-вьюпорт */
                   transition:border-color .14s ease, transform .14s ease, box-shadow .14s ease; }
   ul.presets li:hover { border-color:var(--acc); transform:translateY(-1px); box-shadow:var(--shadow-1); }
   ul.presets li.selected { border-color:var(--border-sel); background:var(--sel-bg); }
@@ -147,7 +164,7 @@
   }
   .hint-bad { color:var(--err); font-size:11px; margin-top:4px; display:none; }
   .hint-bad.show { display:block; }
-  button { background:var(--acc); color:var(--btn-fg); border:none; border-radius:8px; padding:7px 13px;
+  button { background:var(--acc); color:var(--btn-fg); border:none; border-radius:var(--r-s); padding:7px 13px;
            cursor:pointer; font-weight:600; box-shadow:var(--shadow-1);
            transition:filter .12s ease, transform .08s ease, box-shadow .14s ease; }
   button:hover:not(:disabled) { filter:brightness(1.1); box-shadow:var(--shadow-2); }
@@ -160,16 +177,19 @@
   button.danger { background:var(--err); color:var(--btn-fg); }
   button.wide { width:100%; }
   button:disabled { opacity:.5; cursor:not-allowed; }
-  .iconbtn { padding:4px 9px; border-radius:8px; }
+  .iconbtn { padding:4px 9px; border-radius:var(--r-s); }
+  /* inline-SVG icon set (UX-06, docs/UI-GUIDELINES.md): stroke наследует
+     цвет контрола; доступное имя даёт сам контрол, svg — aria-hidden */
+  .ic { width:14px; height:14px; vertical-align:-2px; pointer-events:none; }
   a.btn { display:inline-block; padding:7px 13px; border-radius:8px; text-decoration:none;
           font:inherit; font-weight:600; }
   a.btn:hover { border-color:var(--acc); background:var(--hov); }
   button:focus-visible, input:focus-visible, textarea:focus-visible, summary:focus-visible,
   a:focus-visible, pre.log:focus-visible {
-    outline:2px solid var(--acc); outline-offset:1px; }
+    outline:var(--focus-ring); outline-offset:1px; }
   label { display:block; font-size:12px; color:var(--mut); margin-top:12px; }
-  input,textarea { width:100%; padding:8px 11px; background:var(--input-bg); color:var(--fg);
-                   border:1px solid var(--border); border-radius:8px; font:13px/1.5 ui-monospace,Menlo,monospace;
+  input,textarea { width:100%; padding:var(--sp-2) 11px; background:var(--input-bg); color:var(--fg);
+                   border:1px solid var(--border); border-radius:var(--r-s); font:var(--fs-13)/1.5 var(--font-mono);
                    transition:border-color .14s ease, box-shadow .14s ease; }
   /* checkbox не должен наследовать width:100% — иначе подпись уезжает вправо */
   input[type="checkbox"] { width:auto; padding:0; margin:0; accent-color:var(--acc); }
@@ -178,15 +198,15 @@
   textarea { min-height:120px; resize:vertical; }
   .row { display:flex; gap:8px; flex-wrap:wrap; margin-top:14px; }
   .actions { display:flex; gap:8px; flex-wrap:wrap; margin-top:14px; }
-  pre.log { background:var(--log-bg); color:var(--log-fg); padding:12px; border:1px solid var(--border);
-            border-radius:10px; box-shadow:inset 0 1px 4px rgba(0,0,0,.12);
+  pre.log { background:var(--log-bg); color:var(--log-fg); padding:var(--sp-3); border:1px solid var(--border);
+            border-radius:var(--r-m); box-shadow:inset 0 1px 4px rgba(0,0,0,.12);
             max-height:260px; overflow:auto; font:12px/1.55 ui-monospace,Menlo,monospace;
             white-space:pre-wrap; font-variant-numeric:tabular-nums; }
   pre.log .lvl-err { color:var(--err); }
   pre.log .lvl-warn { color:var(--warn); }
-  #toasts { position:fixed; right:16px; bottom:16px; display:flex; flex-direction:column; gap:8px;
-            z-index:10; max-width:min(420px, calc(100vw - 32px)); }
-  .toast { padding:10px 13px; border-radius:10px; font-size:13px; cursor:pointer; white-space:pre-line;
+  #toasts { position:fixed; right:var(--sp-4); bottom:var(--sp-4); display:flex; flex-direction:column; gap:var(--sp-2);
+            z-index:var(--z-toast); max-width:min(420px, calc(100vw - 32px)); }
+  .toast { padding:10px 13px; border-radius:var(--r-m); font-size:var(--fs-13); cursor:pointer; white-space:pre-line;
            background:var(--card); border:1px solid var(--border); box-shadow:var(--shadow-2);
            animation:toast-in .18s ease; }
   @keyframes toast-in { from { opacity:0; transform:translateY(6px); } to { opacity:1; transform:none; } }
@@ -197,7 +217,7 @@
              padding:0 2px; margin-left:8px; font-size:12px; font-weight:400;
              box-shadow:none; }
   .toast-x:hover { opacity:1; filter:none; box-shadow:none; background:none; }
-  dialog { border:1px solid var(--border); border-radius:12px; background:var(--card);
+  dialog { border:1px solid var(--border); border-radius:var(--r-l); background:var(--card);
            color:var(--fg); padding:18px; max-width:min(420px, calc(100vw - 32px));
            box-shadow:var(--shadow-2); }
   dialog::backdrop { background:rgba(0,0,0,.45); }
@@ -217,6 +237,15 @@
      а пользователь видит toast (двойной вывод был бы шумным). */
   .sr-only { position:absolute; width:1px; height:1px; margin:-1px; overflow:hidden;
              clip:rect(0 0 0 0); white-space:nowrap; }
+  /* Мобильная навигация по 4 группам IA (UX-04): desktop скрыта */
+  #secNav { display:none; }
+  section[id] { scroll-margin-top:64px; }
+  /* чип состояния редактора: активен / изменено / сохранено (UX-04) */
+  .edstate { font-size:var(--fs-11); font-weight:400; color:var(--mut);
+             border:1px solid var(--border); border-radius:999px;
+             padding:1px 8px; margin-left:var(--sp-2); }
+  .edstate.dirty { color:var(--warn); border-color:var(--warn); }
+  .edstate.active { color:var(--status-ok); border-color:var(--acc); }
   /* Телефон (≤800px): пальцы вместо мыши — цели ≥44px; поля 16px, иначе
      iOS приближает страницу при фокусе (UX-02). Блок обязан идти ПОСЛЕ
      базовых input/button правил — cascade. */
@@ -232,6 +261,20 @@
        кликабельной/тапабельной целью */
     .toast-x { min-height:0; min-width:0; }
   }
+  /* sticky-табы групп под шапкой — только на телефоне */
+  @media (max-width:800px) {
+    #secNav { display:flex; position:sticky; top:53px; z-index:var(--z-nav);
+              gap:var(--sp-1); padding:var(--sp-1) 14px; overflow-x:auto;
+              background:var(--hdr-blur); backdrop-filter:blur(8px);
+              -webkit-backdrop-filter:blur(8px);
+              border-bottom:1px solid var(--border); }
+    #secNav a { flex:none; padding:8px var(--sp-3); border-radius:999px;
+                font-size:var(--fs-13); font-weight:600; text-decoration:none;
+                color:var(--mut); }
+    #secNav a:hover { color:var(--fg); background:var(--hov); }
+    section[id] { scroll-margin-top:118px; }
+  }
+  @media (prefers-reduced-motion: no-preference) { html { scroll-behavior:smooth; } }
 </style>
 <script nonce="{{ csp_nonce }}">
   // Тема применяется до первой отрисовки — без вспышки неправильных цветов.
@@ -248,12 +291,18 @@
 <body>
 <header>
   <h1><span class="logo" aria-hidden="true">N</span>NaivePanel</h1>
-  <button class="ghost iconbtn" id="themeToggle" data-action="theme" title="Переключить тему (светлая/тёмная)">☀</button>
+  <button class="ghost iconbtn" id="themeToggle" data-action="theme" title="Переключить тему (светлая/тёмная)"><svg class="ic" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="8" cy="8" r="3"/><path d="M8 1.2v1.6M8 13.2v1.6M1.2 8h1.6M13.2 8h1.6M3.2 3.2l1.1 1.1M11.7 11.7l1.1 1.1M12.8 3.2l-1.1 1.1M4.3 11.7l-1.1 1.1"/></svg></button>
   <span id="status" aria-live="polite">…</span>
 </header>
+<nav id="secNav" aria-label="Разделы панели">
+  <a href="#sec-overview">Обзор</a>
+  <a href="#sec-diag">Диагностика</a>
+  <a href="#sec-system">Система</a>
+  <a href="#sec-settings">Настройки</a>
+</nav>
 <main>
-  <section class="card" style="grid-area:aside">
-    <h2>Сервис</h2>
+  <section class="card" id="sec-overview" style="grid-area:aside">
+    <h2>Обзор</h2>
     <div class="svcinfo" id="svcinfo"></div>
     <div id="e2eSpark" class="spark" hidden></div>
     <div class="actions">
@@ -297,9 +346,9 @@
   </section>
 
   <section class="card" style="grid-area:main">
-    <h2 id="editorTitle"><span id="editorTitleText">Редактор</span><button type="button"
+    <h2 id="editorTitle"><span id="editorTitleText">Редактор</span><span id="editorState" class="edstate"></span><button type="button"
         class="close" id="btnCloseEditor" data-action="closeEditor" hidden
-        aria-label="Закрыть редактор" title="Закрыть (Esc)">✕</button></h2>
+        aria-label="Закрыть редактор" title="Закрыть (Esc)"><svg class="ic" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8"/></svg></button></h2>
     <form id="editor" style="display:none">
       <label for="f_name">Имя пресета (a-z 0-9 _ - .)</label>
       <input id="f_name" pattern="[a-zA-Z0-9_\-.]{1,64}" autocomplete="off" spellcheck="false">
@@ -360,7 +409,7 @@
     </form>
     <div id="msg" class="sr-only" aria-live="polite"></div>
 
-    <h2 class="sect">Лог</h2>
+    <h2 class="sect" id="sec-diag">Диагностика</h2>
     <div class="actions" style="margin-top:0;margin-bottom:10px" role="group" aria-label="Источник лога">
       <button class="ghost iconbtn" id="btnSrcProxy" data-action="logSrc" data-arg="proxy"
               aria-pressed="true" title="naiveproxy.log — вывод прокси">прокси</button>
@@ -376,8 +425,8 @@
     </div>
   </section>
 
-  <section class="card" style="grid-area:ops">
-    <h2>Обслуживание</h2>
+  <section class="card" id="sec-system" style="grid-area:ops">
+    <h2>Система</h2>
     <h2 class="sect">Бинарник naive</h2>
     <div id="nvInfo" style="font-size:12px;color:var(--mut);margin-top:10px">бинарник: проверка…</div>
     <div class="actions" style="margin-top:8px">
@@ -389,12 +438,6 @@
     <div class="actions" style="margin-top:10px">
       <button class="ghost wide" data-action="panelRestart" title="Перезапуск веб-панели (после обновления файлов)">Перезапуск</button>
     </div>
-    <div class="actions" style="margin-top:8px">
-      <button class="ghost wide" data-action="pwOpen" id="btnPwChange" hidden
-              title="Сменить пароль текущего администратора (без SSH)">Сменить пароль…</button>
-    </div>
-    <div id="ntInfo" style="font-size:12px;color:var(--mut);margin-top:10px"
-         title="Уведомления: настраиваются ниже — токен бота и chat_id, либо webhook в panel.conf (NAIVEPANEL_NOTIFY_URL)">уведомления: …</div>
     <div id="updInfo" style="font-size:12px;color:var(--mut);margin-top:12px">обновления: проверка…</div>
     <div class="actions" style="margin-top:8px">
       <button class="ghost" data-action="updateCheck" title="Сверить версию панели с последним релизом GitHub">Проверить обновления</button>
@@ -406,7 +449,13 @@
       <button class="ghost" data-action="rollbackOpen"
               title="Откат панели или бинарника naive на сохранённую версию — без SSH">Откат версий…</button>
     </div>
-    <h2 class="sect">Уведомления</h2>
+    <h2 class="sect" id="sec-settings">Настройки</h2>
+    <div class="actions" style="margin-top:10px">
+      <button class="ghost wide" data-action="pwOpen" id="btnPwChange" hidden
+              title="Сменить пароль текущего администратора (без SSH)">Сменить пароль…</button>
+    </div>
+    <div id="ntInfo" style="font-size:12px;color:var(--mut);margin-top:10px"
+         title="Уведомления: настраиваются ниже — токен бота и chat_id, либо webhook в panel.conf (NAIVEPANEL_NOTIFY_URL)">уведомления: …</div>
     <form id="tgForm" style="margin-top:10px">
       <div id="tgInfo" style="font-size:12px;color:var(--mut)">Telegram: …</div>
       <label style="display:block;font-size:12px;color:var(--mut);margin-top:10px">Токен бота
@@ -532,6 +581,20 @@ async function handle(r) {
   return data;
 }
 
+// Единый SVG-набор иконок (UX-06): 16×16, stroke=currentColor, w2.
+// Разнородные Unicode-глифы (кресты, стрелки, цепочка, солнце/луна)
+// заменены этим набором.
+const IC = {
+  x: '<svg class="ic" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8"/></svg>',
+  arrow: '<svg class="ic" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 8h10M9 4l4 4-4 4"/></svg>',
+  copy: '<svg class="ic" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" aria-hidden="true"><rect x="5.5" y="5.5" width="7.5" height="7.5" rx="1.5"/><path d="M10.5 3H4.5A1.5 1.5 0 0 0 3 4.5v6"/></svg>',
+  up: '<svg class="ic" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 13V3M4 7l4-4 4 4"/></svg>',
+  down: '<svg class="ic" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 3v10M4 9l4 4 4-4"/></svg>',
+  link: '<svg class="ic" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6.5 9.5l3-3"/><path d="M5.5 7L4 5.5a2.6 2.6 0 0 1 3.7-3.7L9.2 3.3"/><path d="M10.5 9l1.5 1.5a2.6 2.6 0 0 1-3.7 3.7L6.8 12.7"/></svg>',
+  sun: '<svg class="ic" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="8" cy="8" r="3"/><path d="M8 1.2v1.6M8 13.2v1.6M1.2 8h1.6M13.2 8h1.6M3.2 3.2l1.1 1.1M11.7 11.7l1.1 1.1M12.8 3.2l-1.1 1.1M4.3 11.7l-1.1 1.1"/></svg>',
+  moon: '<svg class="ic" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" aria-hidden="true"><path d="M13.5 9.8A6.2 6.2 0 0 1 6.2 2.5a6.2 6.2 0 1 0 7.3 7.3z"/></svg>',
+};
+
 // Сообщение видно toast'ом (клик — закрыть), а #msg — visually-hidden
 // aria-live для скринридера. Ошибки держим дольше: их успевают прочитать.
 function flash(msg, ok, ms) {
@@ -546,7 +609,7 @@ function flash(msg, ok, ms) {
   x.className = 'toast-x';
   x.type = 'button';
   x.setAttribute('aria-label', 'Закрыть уведомление');
-  x.textContent = '✕';
+  x.innerHTML = IC.x;
   t.appendChild(x);
   t.onclick = (e) => { if (e.target === t) t.remove(); };  // клик по тексту тоже закрывает
   x.onclick = () => t.remove();
@@ -565,7 +628,7 @@ function effTheme() {
 }
 function setThemeBtn(theme) {
   const b = $('themeToggle');
-  b.textContent = theme === 'light' ? '☾' : '☀';
+  b.innerHTML = theme === 'light' ? IC.moon : IC.sun;
   // доступное имя отражает целевое состояние, а не текущее (UX-03)
   b.setAttribute('aria-label',
     theme === 'light' ? 'Переключить на тёмную тему' : 'Переключить на светлую тему');
@@ -817,7 +880,7 @@ function restoreFocus(f) {
     if (order && !order.disabled) el = order;
   }
   // на краях цепочки стрелка disabled — фокус уводим на соседнюю стрелку,
-  // иначе на ⛓: иначе после PUT фокус падал бы на <body>
+  // иначе на кнопку цепочки: иначе после PUT фокус падал бы на <body>
   if (el.disabled && (f.action === 'foUp' || f.action === 'foDown')) {
     const other = byAction(f.action === 'foUp' ? 'foDown' : 'foUp');
     el = (other && !other.disabled) ? other : (byAction('foToggle') || el);
@@ -827,6 +890,7 @@ function restoreFocus(f) {
 
 function renderPresets(presets) {
   lastPresets = presets;
+  setEditorState(); // activeName приходит из статуса — чип должен поспевать
   const ordered = orderedPresets(presets);
   const q = ($('search').value || '').trim().toLowerCase();
   const shown = q ? ordered.filter(p =>
@@ -861,8 +925,8 @@ function renderPresets(presets) {
           : (foOrderMode ? '<span class="badge" title="Вне цепочки">—</span>' : ''));
     const full = idx < 0 && foChainArr.length >= FO_CHAIN_MAX;
     const updown = foOrderMode && idx >= 0
-      ? '<button class="act" data-action="foUp" data-arg="' + escapeHtml(p.name) + '" aria-label="Выше ' + escapeHtml(p.name) + '" title="Выше"' + (idx === 0 || foBusy ? ' disabled' : '') + '>↑</button>'
-        + '<button class="act" data-action="foDown" data-arg="' + escapeHtml(p.name) + '" aria-label="Ниже ' + escapeHtml(p.name) + '" title="Ниже"' + (idx === foChainArr.length - 1 || foBusy ? ' disabled' : '') + '>↓</button>'
+      ? '<button class="act" data-action="foUp" data-arg="' + escapeHtml(p.name) + '" aria-label="Выше ' + escapeHtml(p.name) + '" title="Выше"' + (idx === 0 || foBusy ? ' disabled' : '') + '>' + IC.up + '</button>'
+        + '<button class="act" data-action="foDown" data-arg="' + escapeHtml(p.name) + '" aria-label="Ниже ' + escapeHtml(p.name) + '" title="Ниже"' + (idx === foChainArr.length - 1 || foBusy ? ' disabled' : '') + '>' + IC.down + '</button>'
       : '';
     const chainTitle = full ? 'Цепочка заполнена (' + FO_CHAIN_MAX + ')'
       : (idx >= 0 ? 'Убрать из цепочки' : 'Добавить в цепочку');
@@ -871,7 +935,7 @@ function renderPresets(presets) {
           ? ' aria-label="Убрать ' + escapeHtml(p.name) + ' из цепочки"'
           : ' aria-label="Добавить ' + escapeHtml(p.name) + ' в цепочку"')
       + ' aria-pressed="' + (idx >= 0) + '" title="' + chainTitle + '"'
-      + (foBusy || full ? ' disabled' : '') + '>⛓</button>';
+      + (foBusy || full ? ' disabled' : '') + '>' + IC.link + '</button>';
     li.innerHTML = '<button class="sel" '+(p.name === current ? 'aria-current="true" ' : '')
       + 'data-action="select" data-arg="'+escapeHtml(p.name)+'">'
       + '<span class="name" title="'+escapeHtml(p.name)+'">'+escapeHtml(p.name)+'</span>'
@@ -883,9 +947,9 @@ function renderPresets(presets) {
       + '<span class="acts">'
       + updown
       + chainBtn
-      + (!isActive ? '<button class="act" aria-label="Активировать '+escapeHtml(p.name)+'" title="Активировать" data-action="activate" data-arg="'+escapeHtml(p.name)+'">→</button>' : '')
-      + '<button class="act" aria-label="Дублировать '+escapeHtml(p.name)+'" title="Дублировать (пароль переносится)" data-action="duplicate" data-arg="'+escapeHtml(p.name)+'">⧉</button>'
-      + '<button class="del" aria-label="Удалить '+escapeHtml(p.name)+'" title="Удалить" data-action="del" data-arg="'+escapeHtml(p.name)+'">✕</button>'
+      + (!isActive ? '<button class="act" aria-label="Активировать '+escapeHtml(p.name)+'" title="Активировать" data-action="activate" data-arg="'+escapeHtml(p.name)+'">' + IC.arrow + '</button>' : '')
+      + '<button class="act" aria-label="Дублировать '+escapeHtml(p.name)+'" title="Дублировать (пароль переносится)" data-action="duplicate" data-arg="'+escapeHtml(p.name)+'">' + IC.copy + '</button>'
+      + '<button class="del" aria-label="Удалить '+escapeHtml(p.name)+'" title="Удалить" data-action="del" data-arg="'+escapeHtml(p.name)+'">' + IC.x + '</button>'
       + '</span>';
     ul.appendChild(li);
   }
@@ -918,6 +982,7 @@ async function selectPreset(name) {
     $('f_insecure_concurrency').value = cfg['insecure-concurrency'] || '';
     dirty = false;
     setHash(name);
+    setEditorState();
     renderPresets(lastPresets); // подсветить выбранный
     $('msg').textContent = '';
   } catch (e) { flash(e.message, false); }
@@ -934,6 +999,7 @@ async function newPreset() {
     .forEach(id => $(id).value = '');
   dirty = false;
   setHash(null);
+  setEditorState();
   renderPresets(lastPresets); // снять подсветку выбора
   $('f_name').focus();
 }
@@ -946,6 +1012,19 @@ function hideEditor() {
   $('editor').style.display = 'none';
   $('btnCloseEditor').hidden = true;
   setHash(null);
+  setEditorState();
+}
+
+// Чип состояния редактора (UX-04): ровно три состояния — «активен»
+// (открытый пресет сейчас работает), «изменено» (несохранённые правки),
+// «сохранено». Пустой = черновик нового пресета без правок.
+function setEditorState() {
+  const el = $('editorState');
+  if (!current) { el.textContent = ''; el.className = 'edstate'; return; }
+  if (dirty) { el.textContent = 'изменено'; el.className = 'edstate dirty'; }
+  else if (activeName && current === activeName) {
+    el.textContent = 'активен'; el.className = 'edstate active';
+  } else { el.textContent = 'сохранено'; el.className = 'edstate'; }
 }
 
 async function closeEditor() {
@@ -1044,7 +1123,8 @@ function fmtSpan(s) {
 }
 
 // Фейловер: цепочка «основной → запасные» правится прямо из строк пресетов
-// (⛓), порядок — режимом «Порядок» (↑↓). Каждое изменение сразу уходит PUT
+// (кнопка цепочки), порядок — режимом «Порядок» (стрелки). Каждое
+// изменение сразу уходит PUT
 // /api/failover: без черновиков и кнопки «Сохранить». Монитор панели делает
 // E2E-проверку активного пресета и после порога неудач подряд переключает
 // на следующий; назад, на основной — только вручную или авто-возвратом.
@@ -1226,6 +1306,7 @@ async function save(ev) {
       flash('Создан: '+current+' (не активен — нажмите «Сделать активным»)', true);
     }
     dirty = false;
+    setEditorState();
     await refreshAll();
   } catch (e) { flash(e.message, false); }
   finally { saving = false; btn.disabled = false; btn.textContent = 'Сохранить'; }
@@ -1799,7 +1880,7 @@ $('importFile').addEventListener('change', async () => {
 });
 
 $('search').addEventListener('input', () => renderPresets(lastPresets));
-$('editor').addEventListener('input', () => { dirty = true; });
+$('editor').addEventListener('input', () => { dirty = true; setEditorState(); });
 // Известная схема + URL-безопасные символы (креды/путь/query) либо голый host.
 const UP_OK = /^(https?:\/\/|quic:\/\/)[A-Za-z0-9._~%!$&'()*+,;=:@\/?#\-\[\]]+$|^[A-Za-z0-9.\-\[\]:]+$/;
 function validateUpstream() {
