@@ -2567,6 +2567,11 @@ def test_ui_failover_lives_with_presets(app):
     assert "saveFailover" not in html and "offFailover" not in html
 
 
+def test_ui_checkboxes_do_not_stretch(app):
+    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    assert 'input[type="checkbox"] { width:auto' in html
+
+
 # --- История E2E-проверок: буфер, API, спарклайн -----------------------------
 
 def test_e2e_history_append_load_and_trim(app, monkeypatch):
