@@ -16,10 +16,9 @@
 xz не меняется), валидация members — stdlib `tarfile` с fallback на
 `tar -tf` (только имена) для Entware-сборок без `python3-lzma`. Подпись
 релизов и trust-модель для naive-assets выделены в Task 8b и отложены до
-отдельного обсуждения. Остались: 15 (ARCH-01 модули — шаги 1–2/7 закоммичены:
-`panel/config.py` b36d575, `panel/security.py` — хуки регистрирует naivepanel.py,
-порядок before_request зафиксирован контрактным тестом; далее
-presets/service/monitor/updates/app по модулю за коммит), 16 (CI gates), 8b;
+отдельного обсуждения. Остались: 15 (ARCH-01 модули — шаги 1–3/7 закоммичены:
+`panel/config.py` b36d575, `panel/security.py` 808fbc4, `panel/presets.py`;
+далее service/monitor/updates/app по модулю за коммит), 16 (CI gates), 8b;
 финальная release-validation из Task 17 — пререлизным шагом следующего
 релиза.
 

@@ -3486,7 +3486,7 @@ def test_delete_chain_member_logs_failover_write_failure(client, app,
     def boom(path, data):
         raise OSError("disk full")
 
-    monkeypatch.setattr(app, "_save_json", boom)
+    monkeypatch.setattr(app.pres, "_save_json", boom)
     with caplog.at_level("WARNING"):
         r = client.delete("/api/configs/backup", headers=CSRF)
     assert r.status_code == 200
@@ -3536,7 +3536,7 @@ def test_failover_concurrent_puts_are_serialized(app, monkeypatch):
         except Exception as exc:  # noqa: BLE001 - любой сбой = провал теста
             errors.append(f"{type(exc).__name__}: {exc}")
 
-    monkeypatch.setattr(app, "_save_json", slow_save)
+    monkeypatch.setattr(app.pres, "_save_json", slow_save)
     threads = [threading.Thread(target=put, args=(s,)) for s in states]
     for t in threads:
         t.start()
@@ -4078,7 +4078,8 @@ def test_notify_telegram_delete_keeps_webhook_pending(conf_env, monkeypatch):
 def test_notify_telegram_save_reports_conf_write_failure(conf_env, monkeypatch):
     monkeypatch.setenv("NAIVEPANEL_CONF", str(conf_env))
     m = _reload()
-    monkeypatch.setattr(m.tempfile, "mkstemp",
+    # владелец записи panel.conf — panel/config._conf_upsert
+    monkeypatch.setattr(m.cfg.tempfile, "mkstemp",
                         lambda *a, **k: (_ for _ in ()).throw(OSError("ro")))
     c = m.app.test_client()
     r = c.post("/api/notify/telegram",
@@ -4934,6 +4935,24 @@ def test_panel_package_security_extraction(app, env, monkeypatch):
     assert sec._panel_is_exposed_without_auth() is True
 
 
+def test_panel_package_presets_extraction(app, env, monkeypatch):
+    # шаг 3: CRUD/валидация пресетов — panel/presets.py; naivepanel.py держит
+    # роуты. Патч функции на владельце (app.pres) обязан быть виден роутам.
+    import panel.presets as pres
+    assert pres is app.pres, "pres-модуль должен быть тем же объектом"
+    assert app._validate_cfg is pres._validate_cfg
+    assert app._mask_creds("https://u:secret@h") == "https://u:***@h"
+    client = app.app.test_client()
+    r, payload = _create(client, name="pres-extract")
+    assert r.status_code == 201
+    # create падает на дисковой ошибке ВНУТРИ владельца — роут видит патч
+    def boom(path, data):
+        raise OSError("disk full")
+    monkeypatch.setattr(app.pres, "_save_json", boom)
+    r, _ = _create(client, name="pres-boom")
+    assert r.status_code == 500
+
+
 def test_backup_and_restore_include_panel_package(app, env):
     # бэкап/откат обязаны знать о пакете: пропавший panel/*.py после
     # отката панели = нерабочая установка
@@ -4941,14 +4960,17 @@ def test_backup_and_restore_include_panel_package(app, env):
     pkg.mkdir(parents=True, exist_ok=True)
     (pkg / "config.py").write_text("# current config", encoding="utf-8")
     (pkg / "security.py").write_text("# current security", encoding="utf-8")
+    (pkg / "presets.py").write_text("# current presets", encoding="utf-8")
     backup = app._backup_panel_files()
     assert (backup / "panel" / "config.py").read_text() == "# current config"
     assert (backup / "panel" / "security.py").read_text() == "# current security"
+    assert (backup / "panel" / "presets.py").read_text() == "# current presets"
     # симулируем «обновление», затёршее пакет, и откат
     (pkg / "config.py").write_text("# new version", encoding="utf-8")
     (pkg / "security.py").write_text("# new version", encoding="utf-8")
+    (pkg / "presets.py").write_text("# new version", encoding="utf-8")
     import shutil as _sh
-    for name in ("config.py", "security.py"):
+    for name in ("config.py", "security.py", "presets.py"):
         src = backup / "panel" / name
         tmp = (pkg / name).with_name(name + ".restore")
         _sh.copy2(src, tmp)
@@ -4958,7 +4980,7 @@ def test_backup_and_restore_include_panel_package(app, env):
 
 def test_install_sh_ships_panel_package(app):
     src = (APP_DIR / "install.sh").read_text(encoding="utf-8")
-    assert 'PANEL_PKG="__init__.py config.py security.py"' in src, \
+    assert 'PANEL_PKG="__init__.py config.py security.py presets.py"' in src, \
         "installer не качает пакет"
     assert '"$BASE/panel/$f"' in src, "нет загрузки файлов пакета"
     assert 'rm -rf "$PANEL_DIR/panel"' in src, "пакет не заменяется целиком"
@@ -4970,5 +4992,5 @@ def test_sha256sums_covers_panel_package(app):
     lines = (APP_DIR / "SHA256SUMS").read_text(encoding="utf-8").splitlines()
     listed = {parts[1] for parts in (l.split(maxsplit=1) for l in lines) if len(parts) == 2}
     for f in ("naivepanel.py", "panel/__init__.py", "panel/config.py",
-              "panel/security.py", "templates/index.html"):
+              "panel/security.py", "panel/presets.py", "templates/index.html"):
         assert f in listed, f"{f} нет в SHA256SUMS"
