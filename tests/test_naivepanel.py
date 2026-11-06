@@ -609,7 +609,7 @@ def test_htpasswd_replace_missing_user(app):
 
 def test_put_active_propagates_and_restarts(client, app, env):
     stub, marker = _stub_init(env)
-    app.INIT_SCRIPT = stub
+    app.cfg.INIT_SCRIPT = stub
     _create(client)
     r = client.post("/api/configs/home/activate", headers=CSRF)
     assert r.status_code == 200
@@ -657,7 +657,7 @@ def _concurrency_probe(app, monkeypatch, rc=0):
             state["depth"] -= 1
         return {"rc": rc}
 
-    monkeypatch.setattr(app, "_service", fake)
+    monkeypatch.setattr(app.svc, "_service", fake)
     return state
 
 
@@ -687,7 +687,7 @@ def test_put_active_and_activate_are_serialized(client, app, env, monkeypatch):
     # PUT активного пресета входил в _service без лока и мог перехлёстнуться
     # с activate другого пресета — оба писали config.json и крутили init
     stub, _ = _stub_init(env)
-    app.INIT_SCRIPT = stub
+    app.cfg.INIT_SCRIPT = stub
     state = _concurrency_probe(app, monkeypatch)
     _create(client, name="home")
     _create(client, name="backup")
@@ -707,7 +707,7 @@ def test_put_active_and_activate_are_serialized(client, app, env, monkeypatch):
 
 def test_service_restart_and_activate_are_serialized(client, app, env, monkeypatch):
     stub, _ = _stub_init(env)
-    app.INIT_SCRIPT = stub
+    app.cfg.INIT_SCRIPT = stub
     state = _concurrency_probe(app, monkeypatch)
     _create(client, name="home")
     _create(client, name="backup")
@@ -727,10 +727,10 @@ def test_activate_failed_restart_restores_previous(client, app, env, monkeypatch
     # применён: восстанавливаем прежний config.json/.active и пытаемся
     # вернуть сервис на старом конфиге
     stub, _ = _stub_init(env)
-    app.INIT_SCRIPT = stub
+    app.cfg.INIT_SCRIPT = stub
     _create(client, name="home")
     assert client.post("/api/configs/home/activate", headers=CSRF).status_code == 200
-    monkeypatch.setattr(app, "_service", lambda action: {"rc": 3, "stderr": "boom"})
+    monkeypatch.setattr(app.svc, "_service", lambda action: {"rc": 3, "stderr": "boom"})
     _create(client, name="backup")
     r = client.post("/api/configs/backup/activate", headers=CSRF)
     assert r.status_code == 200
@@ -745,10 +745,10 @@ def test_activate_failed_restart_restores_previous(client, app, env, monkeypatch
 
 def test_put_active_failed_restart_restores_previous(client, app, env, monkeypatch):
     stub, _ = _stub_init(env)
-    app.INIT_SCRIPT = stub
+    app.cfg.INIT_SCRIPT = stub
     _create(client, name="home")
     assert client.post("/api/configs/home/activate", headers=CSRF).status_code == 200
-    monkeypatch.setattr(app, "_service", lambda action: {"rc": 3, "stderr": "boom"})
+    monkeypatch.setattr(app.svc, "_service", lambda action: {"rc": 3, "stderr": "boom"})
     r = client.put("/api/configs/home", headers=CSRF, json={
         "name": "home", "listen": "127.0.0.1:1082",
         "upstream": "proxy.example.com", "username": "user"})
@@ -769,8 +769,8 @@ def test_activate_failed_restart_first_activation_cleans_state(client, app, env,
     # до активации ничего не работало → после failed-рестарта не оставляем
     # config.json/.active, указывающих на неприменённый конфиг
     stub, _ = _stub_init(env)
-    app.INIT_SCRIPT = stub
-    monkeypatch.setattr(app, "_service", lambda action: {"rc": 3, "stderr": "boom"})
+    app.cfg.INIT_SCRIPT = stub
+    monkeypatch.setattr(app.svc, "_service", lambda action: {"rc": 3, "stderr": "boom"})
     _create(client, name="home")
     r = client.post("/api/configs/home/activate", headers=CSRF)
     assert r.status_code == 200
@@ -2447,14 +2447,14 @@ def _naive_done(m, timeout=30.0):
 def test_naive_update_downloads_validates_and_replaces(client, app, env, monkeypatch):
     m = _naive_env_reload(env, monkeypatch)
     stub, marker = _stub_init(env, "naive-restarts.txt")
-    m.INIT_SCRIPT = stub
+    m.cfg.INIT_SCRIPT = stub
     # «работающий» прокси: pid-файл с живым процессом → рестарт обязателен.
     # На Linux _pid_is_naive читает /proc/<pid>/comm и справедливо бракует
     # pytest-процесс (это не naive) — подменяем только анти-pid-reuse проверку:
     # тестируем логику воркера, а не классификатор имён процессов.
     m.PID_FILE.parent.mkdir(parents=True, exist_ok=True)
     m.PID_FILE.write_text(str(os.getpid()))
-    monkeypatch.setattr(m, "_pid_is_naive", lambda pid: True)
+    monkeypatch.setattr(m.svc, "_pid_is_naive", lambda pid: True)
     old = env / "naive"
     old.write_text('#!/bin/sh\necho "naive 113.0.5672.3"\n')
     old.chmod(0o755)
@@ -2818,7 +2818,7 @@ def _wd_arm(app):
 def test_watchdog_silent_until_first_observation(app, monkeypatch):
     # первый тик только фиксирует состояние: «изначально лежит» — не сигнал
     wd = app._Watchdog()
-    monkeypatch.setattr(app, "_proxy_running", _wd_seq([(True, 11, 5)]))
+    monkeypatch.setattr(app.svc, "_proxy_running", _wd_seq([(True, 11, 5)]))
     assert wd.observe(recheck_delay=0.01) is None
 
 
@@ -2826,9 +2826,9 @@ def test_watchdog_restarts_on_crash(app, monkeypatch):
     wd = app._Watchdog()
     calls = []
     _wd_arm(app)
-    monkeypatch.setattr(app, "_proxy_running",
+    monkeypatch.setattr(app.svc, "_proxy_running",
                         _wd_seq([(True, 11, 5), (False, None, None), (False, None, None)]))
-    monkeypatch.setattr(app, "_service", _wd_service(calls))
+    monkeypatch.setattr(app.svc, "_service", _wd_service(calls))
     assert wd.observe(recheck_delay=0.01) is None       # фиксируем running
     ev = wd.observe(recheck_delay=0.01)
     assert ev == {"event": "restarted", "rc": 0, "stderr": ""}
@@ -2840,9 +2840,9 @@ def test_watchdog_restarts_on_crash(app, monkeypatch):
 def test_watchdog_respects_stop_marker(app, monkeypatch):
     wd = app._Watchdog()
     calls = []
-    monkeypatch.setattr(app, "_proxy_running",
+    monkeypatch.setattr(app.svc, "_proxy_running",
                         _wd_seq([(True, 11, 5), (False, None, None), (False, None, None)]))
-    monkeypatch.setattr(app, "_service", _wd_service(calls))
+    monkeypatch.setattr(app.svc, "_service", _wd_service(calls))
     app.STOP_MARKER.parent.mkdir(parents=True, exist_ok=True)
     app.STOP_MARKER.write_text("")
     assert wd.observe(recheck_delay=0.01) is None
@@ -2857,9 +2857,9 @@ def test_watchdog_recheck_recovers_from_restart_race(app, monkeypatch):
     # видит, что сервис уже поднялся — рестартить не надо
     wd = app._Watchdog()
     calls = []
-    monkeypatch.setattr(app, "_proxy_running",
+    monkeypatch.setattr(app.svc, "_proxy_running",
                         _wd_seq([(True, 11, 5), (False, None, None), (True, 12, 0)]))
-    monkeypatch.setattr(app, "_service", _wd_service(calls))
+    monkeypatch.setattr(app.svc, "_service", _wd_service(calls))
     assert wd.observe(recheck_delay=0.01) is None
     assert wd.observe(recheck_delay=0.01) is None
     assert calls == []
@@ -2867,7 +2867,7 @@ def test_watchdog_recheck_recovers_from_restart_race(app, monkeypatch):
 
 def test_watchdog_down_to_up_is_not_an_event(app, monkeypatch):
     wd = app._Watchdog()
-    monkeypatch.setattr(app, "_proxy_running", _wd_seq([(False, None, None), (True, 9, 0)]))
+    monkeypatch.setattr(app.svc, "_proxy_running", _wd_seq([(False, None, None), (True, 9, 0)]))
     wd.observe(recheck_delay=0.01)
     assert wd.observe(recheck_delay=0.01) is None
 
@@ -2877,10 +2877,10 @@ def test_watchdog_flap_trips(app, monkeypatch):
     wd = app._Watchdog()
     calls = []
     _wd_arm(app)
-    monkeypatch.setattr(app, "_service", _wd_service(calls))
+    monkeypatch.setattr(app.svc, "_service", _wd_service(calls))
 
     def crash_cycle():
-        monkeypatch.setattr(app, "_proxy_running",
+        monkeypatch.setattr(app.svc, "_proxy_running",
                             _wd_seq([(True, 11, 5), (False, None, None),
                                      (False, None, None)]))
         wd.observe(recheck_delay=0.01)  # фиксируем running
@@ -2904,9 +2904,9 @@ def test_watchdog_requires_init_script(app, monkeypatch):
     # init-скрипта нет (env-фикстура указывает на отсутствующий) — не падаем
     wd = app._Watchdog()
     calls = []
-    monkeypatch.setattr(app, "_proxy_running",
+    monkeypatch.setattr(app.svc, "_proxy_running",
                         _wd_seq([(True, 11, 5), (False, None, None), (False, None, None)]))
-    monkeypatch.setattr(app, "_service", _wd_service(calls))
+    monkeypatch.setattr(app.svc, "_service", _wd_service(calls))
     wd.observe(recheck_delay=0.01)
     assert wd.observe(recheck_delay=0.01) == {"event": "no-init"}
     assert calls == []
@@ -3139,7 +3139,7 @@ def test_failover_switch_restarts_service(client, app, monkeypatch, env):
     stub = env / "stub-init"
     stub.write_text("#!/bin/sh\n")
     stub.chmod(0o755)
-    app.INIT_SCRIPT = stub
+    app.cfg.INIT_SCRIPT = stub
     fo = _fo_setup(client, app)
     _fo_e2e(monkeypatch, app, ok=False, error="x")
     fo.cycle()
@@ -3814,7 +3814,7 @@ def test_notify_send_webhook(app, monkeypatch):
         return {"rc": 0, "stdout": "", "stderr": ""}
 
     _notify_webhook(app)
-    monkeypatch.setattr(app, "_run", fake_run)
+    monkeypatch.setattr(app.svc, "_run", fake_run)
     app._notify_send("failover_switch", "home → backup")
     cmd = captured["cmd"]
     assert cmd[0] == "curl" and cmd[-1] == "https://example.com/hook"
@@ -3825,7 +3825,7 @@ def test_notify_send_webhook(app, monkeypatch):
 
 def test_notify_send_curl_failure_logged(app, monkeypatch):
     _notify_webhook(app)
-    monkeypatch.setattr(app, "_run",
+    monkeypatch.setattr(app.svc, "_run",
                         lambda cmd, timeout=10: {"rc": 7, "stdout": "",
                                                  "stderr": "refused"})
     app._notify_send("e", "x")   # rc!=0 → warning, не исключение
@@ -3838,7 +3838,7 @@ def test_notify_send_failure_does_not_raise(app):
 
 def test_notify_send_detail_success(app, monkeypatch):
     _notify_webhook(app)
-    monkeypatch.setattr(app, "_run", lambda cmd, timeout=10:
+    monkeypatch.setattr(app.svc, "_run", lambda cmd, timeout=10:
                         {"rc": 0, "stdout": "", "stderr": ""})
     assert app._notify_send("e", "x", detail=True) == (True, "")
 
@@ -3852,7 +3852,7 @@ def test_notify_send_detail_disabled(app):
 def test_notify_send_detail_masks_webhook_url(app, monkeypatch):
     url = "https://hooks.example.com/services/T000/B000/SECRETVALUE"
     _notify_webhook(app, url)
-    monkeypatch.setattr(app, "_run", lambda cmd, timeout=10:
+    monkeypatch.setattr(app.svc, "_run", lambda cmd, timeout=10:
                         {"rc": 7, "stdout": "", "stderr": f"curl: {url}"})
     ok, err = app._notify_send("e", "x", detail=True)
     assert ok is False
@@ -3862,7 +3862,7 @@ def test_notify_send_detail_masks_webhook_url(app, monkeypatch):
 def test_notify_send_detail_masks_telegram_token(app, monkeypatch):
     token = "123456:abcdefghijklmnopqrstuvwxyz"
     app._notify_cfg.update({"token": token, "chat": "42", "url": ""})
-    monkeypatch.setattr(app, "_run", lambda cmd, timeout=10:
+    monkeypatch.setattr(app.svc, "_run", lambda cmd, timeout=10:
                         {"rc": 7, "stdout": "", "stderr": f"curl: {token}"})
     ok, err = app._notify_send("e", "x", detail=True)
     assert ok is False
@@ -3924,7 +3924,7 @@ def test_notify_send_via_alive_proxy(app, monkeypatch):
                    {"listen": f"socks://127.0.0.1:{port}", "proxy": "https://u:p@h"})
     captured = []
     _notify_webhook(app)
-    monkeypatch.setattr(app, "_run", _nt_run_capture(captured, []))
+    monkeypatch.setattr(app.svc, "_run", _nt_run_capture(captured, []))
     try:
         assert app._notify_send("e", "x") is True
         assert captured[0][4] == "-x" and captured[0][5] == f"socks5h://127.0.0.1:{port}"
@@ -3939,7 +3939,7 @@ def test_notify_send_proxy_dead_falls_back_direct(app, monkeypatch):
                    {"listen": "socks://127.0.0.1:1", "proxy": "https://u:p@h"})
     captured = []
     _notify_webhook(app)
-    monkeypatch.setattr(app, "_run", _nt_run_capture(captured, []))
+    monkeypatch.setattr(app.svc, "_run", _nt_run_capture(captured, []))
     assert app._notify_send("e", "x") is True
     assert len(captured) == 1 and "-x" not in captured[0]
 
@@ -3949,7 +3949,7 @@ def test_notify_send_all_dead_returns_false(app, monkeypatch):
                    {"listen": "socks://127.0.0.1:1", "proxy": "https://u:p@h"})
     captured = []
     _notify_webhook(app)
-    monkeypatch.setattr(app, "_run",
+    monkeypatch.setattr(app.svc, "_run",
                         _nt_run_capture(captured, [{"rc": 7, "stdout": "",
                                                     "stderr": "refused"}]))
     assert app._notify_send("e", "x") is False
@@ -3964,7 +3964,7 @@ def test_notify_pending_append_flush_and_status(app, monkeypatch):
     results = [{"rc": 0, "stdout": "", "stderr": ""},
                {"rc": 7, "stdout": "", "stderr": "refused"}]
     _notify_webhook(app)
-    monkeypatch.setattr(app, "_run", lambda cmd, timeout=10: results.pop(0))
+    monkeypatch.setattr(app.svc, "_run", lambda cmd, timeout=10: results.pop(0))
     app._save_json(app.ACTIVE_CONFIG,
                    {"listen": "socks://127.0.0.1:1", "proxy": "https://u:p@h"})
     assert app._notify_flush_pending() == 1
@@ -4457,11 +4457,11 @@ def _rb_naive_setup(env, monkeypatch, prev_tag=None):
 def test_rollback_binary_restores_previous(client, env, monkeypatch):
     m = _rb_naive_setup(env, monkeypatch, prev_tag="v113.0.5672.3-1")
     stub, marker = _stub_init(env, "rb-naive-restarts.txt")
-    monkeypatch.setattr(m, "INIT_SCRIPT", stub)
+    monkeypatch.setattr(m.cfg, "INIT_SCRIPT", stub)
     # «работающий» прокси — как в тестах воркера обновления
     m.PID_FILE.parent.mkdir(parents=True, exist_ok=True)
     m.PID_FILE.write_text(str(os.getpid()))
-    monkeypatch.setattr(m, "_pid_is_naive", lambda pid: True)
+    monkeypatch.setattr(m.svc, "_pid_is_naive", lambda pid: True)
 
     r = m.app.test_client().post("/api/rollback", json={"binary": True},
                                  headers=CSRF)
@@ -4486,10 +4486,10 @@ def test_rollback_binary_failed_restart_not_reported_as_restarted(client, env,
     stub = env / "rb-fail-init.sh"
     stub.write_text('#!/bin/sh\necho "boom" >&2\nexit 7\n')
     stub.chmod(0o755)
-    monkeypatch.setattr(m, "INIT_SCRIPT", stub)
+    monkeypatch.setattr(m.cfg, "INIT_SCRIPT", stub)
     m.PID_FILE.parent.mkdir(parents=True, exist_ok=True)
     m.PID_FILE.write_text(str(os.getpid()))
-    monkeypatch.setattr(m, "_pid_is_naive", lambda pid: True)
+    monkeypatch.setattr(m.svc, "_pid_is_naive", lambda pid: True)
 
     r = m.app.test_client().post("/api/rollback", json={"binary": True},
                                  headers=CSRF)
@@ -4953,6 +4953,26 @@ def test_panel_package_presets_extraction(app, env, monkeypatch):
     assert r.status_code == 500
 
 
+def test_panel_package_service_extraction(app, env, monkeypatch):
+    # шаг 4: управление сервисом — panel/service.py; _status остаётся в
+    # naivepanel.py (агрегатор поверх watchdog/failover/notify — уедет с
+    # monitor-шагом). Патчи владельца видны и роутам, и watchdog-коду.
+    import panel.service as svc
+    assert svc is app.svc, "svc-модуль должен быть тем же объектом"
+    assert app._run is svc._run
+    # _service гейтится на INIT_SCRIPT владельца конфига
+    stub = env / "stub-init.sh"
+    stub.write_text("#!/bin/sh\n")
+    app.cfg.INIT_SCRIPT = stub
+    monkeypatch.setattr(app.svc, "_run",
+                        lambda cmd, timeout=10: {"rc": 0, "stdout": "", "stderr": ""})
+    assert app.svc._service("start")["rc"] == 0
+    # /api/status (агрегатор в naivepanel) видит патч _proxy_running владельца
+    monkeypatch.setattr(app.svc, "_proxy_running", lambda: (True, 4242, 99))
+    st = app.app.test_client().get("/api/status").get_json()
+    assert st["pid"] == 4242 and st["active"] is True
+
+
 def test_backup_and_restore_include_panel_package(app, env):
     # бэкап/откат обязаны знать о пакете: пропавший panel/*.py после
     # отката панели = нерабочая установка
@@ -4961,16 +4981,19 @@ def test_backup_and_restore_include_panel_package(app, env):
     (pkg / "config.py").write_text("# current config", encoding="utf-8")
     (pkg / "security.py").write_text("# current security", encoding="utf-8")
     (pkg / "presets.py").write_text("# current presets", encoding="utf-8")
+    (pkg / "service.py").write_text("# current service", encoding="utf-8")
     backup = app._backup_panel_files()
     assert (backup / "panel" / "config.py").read_text() == "# current config"
     assert (backup / "panel" / "security.py").read_text() == "# current security"
     assert (backup / "panel" / "presets.py").read_text() == "# current presets"
+    assert (backup / "panel" / "service.py").read_text() == "# current service"
     # симулируем «обновление», затёршее пакет, и откат
     (pkg / "config.py").write_text("# new version", encoding="utf-8")
     (pkg / "security.py").write_text("# new version", encoding="utf-8")
     (pkg / "presets.py").write_text("# new version", encoding="utf-8")
+    (pkg / "service.py").write_text("# new version", encoding="utf-8")
     import shutil as _sh
-    for name in ("config.py", "security.py", "presets.py"):
+    for name in ("config.py", "security.py", "presets.py", "service.py"):
         src = backup / "panel" / name
         tmp = (pkg / name).with_name(name + ".restore")
         _sh.copy2(src, tmp)
@@ -4980,7 +5003,7 @@ def test_backup_and_restore_include_panel_package(app, env):
 
 def test_install_sh_ships_panel_package(app):
     src = (APP_DIR / "install.sh").read_text(encoding="utf-8")
-    assert 'PANEL_PKG="__init__.py config.py security.py presets.py"' in src, \
+    assert 'PANEL_PKG="__init__.py config.py security.py presets.py service.py"' in src, \
         "installer не качает пакет"
     assert '"$BASE/panel/$f"' in src, "нет загрузки файлов пакета"
     assert 'rm -rf "$PANEL_DIR/panel"' in src, "пакет не заменяется целиком"
@@ -4992,5 +5015,6 @@ def test_sha256sums_covers_panel_package(app):
     lines = (APP_DIR / "SHA256SUMS").read_text(encoding="utf-8").splitlines()
     listed = {parts[1] for parts in (l.split(maxsplit=1) for l in lines) if len(parts) == 2}
     for f in ("naivepanel.py", "panel/__init__.py", "panel/config.py",
-              "panel/security.py", "panel/presets.py", "templates/index.html"):
+              "panel/security.py", "panel/presets.py", "panel/service.py",
+              "templates/index.html"):
         assert f in listed, f"{f} нет в SHA256SUMS"

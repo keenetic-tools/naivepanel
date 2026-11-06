@@ -66,6 +66,10 @@ _reload_or_import("panel.presets")
 from panel import presets as pres  # модуль-владелец CRUD/валидации пресетов (патчи тестов — сюда)
 from panel.presets import *  # noqa: F401,F403 — re-export для совместимости
 
+_reload_or_import("panel.service")
+from panel import service as svc  # модуль-владелец управления сервисом (патчи тестов — сюда)
+from panel.service import *  # noqa: F401,F403 — re-export для совместимости
+
 # --- Фейловер: лок read-modify-write (модуль monitor, ARCH-01) --------
 _FAILOVER_LOCK = threading.Lock()  # PUT / delete / import: read-modify-write
 
@@ -493,76 +497,10 @@ def _e2e_history_load(last: int) -> list[dict[str, Any]]:
 
 # --- Service control ------------------------------------------------------
 
-def _run(cmd: list[str], timeout: int = 10) -> dict[str, Any]:
-    try:
-        # cmd — фиксированный argv-список, shell не используется
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)  # nosec B603
-        return {
-            "rc": r.returncode,
-            "stdout": r.stdout.strip(),
-            "stderr": r.stderr.strip(),
-        }
-    except FileNotFoundError as exc:
-        abort(500, description=f"command not found: {exc.filename}")
-    except subprocess.TimeoutExpired:
-        abort(504, description=f"timeout running {' '.join(cmd)}")
-
-
-def _service(action: str) -> dict[str, Any]:
-    if not INIT_SCRIPT.exists():
-        abort(503, description=f"{INIT_SCRIPT} not found")
-    # stop в S99naiveproxy ждёт до 10с, restart = stop+start — таймаут обязан
-    # покрывать худший случай, иначе /bin/sh убивают посреди рестарта
-    return _run(["/bin/sh", str(INIT_SCRIPT), action], timeout=30)
-
-
-def _pid_is_naive(pid: int) -> bool:
-    """Анти-pid-reuse: сверяем имя процесса, если /proc доступен.
-
-    Не читается (нет /proc — macOS/dev-запуск, чужой uid) — считаем нашим:
-    ложный «работает» безопаснее ложного «остановлен».
-    """
-    try:
-        name = Path(f"/proc/{pid}/comm").read_text(encoding="utf-8").strip()
-    except OSError:
-        return True
-    return name in {"naive", "naiveproxy"}
-
-
-def _proxy_running() -> tuple[bool, int | None, int | None]:
-    """(running, pid, uptime_s) по pid-файлу — для /api/status и watchdog.
-
-    Проверяем, что процесс реально жив — pid-файл может пережить crash.
-    """
-    pid: int | None = None
-    uptime: int | None = None
-    running = False
-    if PID_FILE.exists():
-        try:
-            pid = int(PID_FILE.read_text(encoding="utf-8").strip())
-        except (ValueError, OSError):
-            pid = None
-        if pid is not None:
-            try:
-                os.kill(pid, 0)
-                running = True
-            except ProcessLookupError:
-                pid = None
-            except PermissionError:
-                # Процесс чужой (другой uid), но жив — считаем запущенным
-                running = True
-            if running and not _pid_is_naive(pid):
-                pid = None  # pid переиспользован чужим процессом
-                running = False
-            if running:
-                uptime = max(0, int(time.time() - PID_FILE.stat().st_mtime))
-    return running, pid, uptime
-
-
 def _status() -> dict[str, Any]:
     active_name = pres._active_name()
-    has_init = INIT_SCRIPT.exists()
-    running, pid, uptime = _proxy_running()
+    has_init = cfg.INIT_SCRIPT.exists()
+    running, pid, uptime = svc._proxy_running()
     # _status() зовут и фоновые потоки (naive-update, rollback): вне request
     # context request.authorization бросил бы RuntimeError.
     auth = request.authorization if has_request_context() else None
@@ -573,7 +511,7 @@ def _status() -> dict[str, Any]:
         "pid": pid,
         "uptime": uptime,
         "current": active_name,
-        "init_script": str(INIT_SCRIPT),
+        "init_script": str(cfg.INIT_SCRIPT),
         "init_present": has_init,
         "watchdog": _watchdog.snapshot(),
         "failover": _failover.snapshot(),
@@ -629,7 +567,7 @@ def _notify_send(event: str, text: str,
 
     def attempt(prefix: list[str], timeout: int) -> bool:
         try:
-            res = _run([*prefix, *post, url], timeout=timeout)
+            res = svc._run([*prefix, *post, url], timeout=timeout)
         except HTTPException as exc:
             errors.append(str(exc.description or exc))
             return False
@@ -815,7 +753,7 @@ class _Watchdog:
 
     def observe(self, recheck_delay: float = WATCHDOG_RECHECK_S) -> dict[str, Any] | None:
         """Один тик; возвращает событие (см. тесты) или None, если всё тихо."""
-        running, _, _ = _proxy_running()
+        running, _, _ = svc._proxy_running()
         prev, self._prev_running = self._prev_running, running
         if prev is None or prev == running:
             return None
@@ -827,12 +765,12 @@ class _Watchdog:
         # появится (штатный stop) или сервис вернётся (рестарт).
         if recheck_delay > 0:
             time.sleep(recheck_delay)
-            running, _, _ = _proxy_running()
+            running, _, _ = svc._proxy_running()
             if running:
                 return None
         if STOP_MARKER.exists():
             return {"event": "stopped"}   # штатный stop — не вмешиваемся
-        if not INIT_SCRIPT.exists():
+        if not cfg.INIT_SCRIPT.exists():
             return {"event": "no-init"}
         if self.tripped:
             return {"event": "down-tripped"}
@@ -843,7 +781,7 @@ class _Watchdog:
         self._restarts.append(now)
         self.count += 1
         with _SERVICE_LOCK:
-            res = _service("start")
+            res = svc._service("start")
         return {"event": "restarted", "rc": res.get("rc"),
                 "stderr": res.get("stderr")}
 
@@ -1497,7 +1435,7 @@ def api_configs_delete(name: str):
 _SERVICE_LOCK = threading.Lock()
 
 
-def _apply_active(name: str, cfg: dict[str, Any]) -> dict[str, Any]:
+def _apply_active(name: str, cfgd: dict[str, Any]) -> dict[str, Any]:
     """config.json/.active + рестарт под _SERVICE_LOCK, с откатом при фейле.
 
     Рестарт с новым конфигом упал (rc != 0) → файлы не должны врать, будто
@@ -1513,16 +1451,16 @@ def _apply_active(name: str, cfg: dict[str, Any]) -> dict[str, Any]:
                 prev_cfg = json.loads(ACTIVE_CONFIG.read_text(encoding="utf-8"))
             except (OSError, ValueError):
                 prev_cfg = None
-        pres._write_active(name, cfg)
-        restart = _service("restart") if INIT_SCRIPT.exists() \
+        pres._write_active(name, cfgd)
+        restart = svc._service("restart") if cfg.INIT_SCRIPT.exists() \
             else {"rc": None, "note": "no init script"}
         if restart.get("rc") not in (None, 0):
             restart = dict(restart)
             restart["degraded"] = True
             if prev_cfg is not None and prev_name is not None:
                 pres._write_active(prev_name, prev_cfg)
-                restart["rollback"] = _service("restart") \
-                    if INIT_SCRIPT.exists() else {"rc": None, "note": "no init script"}
+                restart["rollback"] = svc._service("restart") \
+                    if cfg.INIT_SCRIPT.exists() else {"rc": None, "note": "no init script"}
             else:
                 # до активации ничего не работало — не оставляем ссылки на
                 # неприменённый конфиг
@@ -1545,9 +1483,9 @@ def _activate_preset(name: str) -> dict[str, Any]:
     src = CONF_D / f"{name}.json"
     if not src.exists():
         abort(404, description=f"preset {name!r} not found")
-    cfg = pres._load_json(src)
-    pres._validate_cfg(cfg, name)  # битый конфиг не должен ронять рабочий прокси
-    restart = _apply_active(name, cfg)
+    cfgd = pres._load_json(src)
+    pres._validate_cfg(cfgd, name)  # битый конфиг не должен ронять рабочий прокси
+    restart = _apply_active(name, cfgd)
     return {"name": name, "active": True, "restart": restart}
 
 
@@ -1756,7 +1694,7 @@ def api_service(action: str):
     if action not in {"start", "stop", "restart"}:
         abort(400, description="action must be start|stop|restart")
     with _SERVICE_LOCK:
-        return jsonify(_service(action))
+        return jsonify(svc._service(action))
 
 
 @app.route("/api/e2e", methods=["POST"])
@@ -2567,9 +2505,9 @@ def _naive_update_worker() -> None:
         _naive_log(f"installed {tag} -> {NAIVE_BIN}")
         restarted = False
         restart_rc = None
-        if was_active and INIT_SCRIPT.exists():
+        if was_active and cfg.INIT_SCRIPT.exists():
             with _SERVICE_LOCK:
-                rst = _service("restart")
+                rst = svc._service("restart")
             restart_rc = rst["rc"]
             restarted = restart_rc == 0  # как в rollback: rc==0 или честный провал
             _naive_log(f"service restart rc={restart_rc}")
@@ -2791,9 +2729,9 @@ def _rollback_binary():
     _naive_log(f"rollback -> {prev_tag or new_ver}")
     restarted = False
     restart_rc = None
-    if was_active and INIT_SCRIPT.exists():
+    if was_active and cfg.INIT_SCRIPT.exists():
         with _SERVICE_LOCK:
-            rst = _service("restart")
+            rst = svc._service("restart")
         restart_rc = rst["rc"]
         restarted = restart_rc == 0  # «перезапущен» = только при rc==0 (REL-05)
         _naive_log(f"service restart rc={restart_rc}")
