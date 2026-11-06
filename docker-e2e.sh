@@ -21,6 +21,14 @@ BASE_IMAGE="${BASE_IMAGE:-debian:bookworm-slim}"
 AUTH_FLAG=""
 MODE_FLAGS="--yes"
 
+# Контейнер наследует архитектуру хоста. Entware-фид выбираем под неё,
+# иначе E2E не запустится на x86_64 CI-runner (Apple/ARM — aarch64).
+case "$(uname -m)" in
+    x86_64|amd64)  ENTWARE_ARCH=x86-64 ;;
+    arm64|aarch64) ENTWARE_ARCH=aarch64-k3.10 ;;
+    *) echo "unsupported host arch: $(uname -m)" >&2; exit 2 ;;
+esac
+
 for a in "$@"; do
     case "$a" in
         --with-auth) AUTH_FLAG="--with-auth"; MODE_FLAGS="" ;;
@@ -42,10 +50,11 @@ trap 'rm -rf "$WORK"' EXIT
 # --- docroot: содержимое «raw.githubusercontent.com» из рабочей копии ------
 
 WWW="$WORK/www/keenetic-tools/naivepanel/$REF"
-mkdir -p "$WWW/templates"
+mkdir -p "$WWW/templates" "$WWW/panel"
 cp "$REPO_DIR/install.sh" "$REPO_DIR/SHA256SUMS" "$REPO_DIR/naivepanel.py" \
    "$REPO_DIR/S99naivepanel" "$REPO_DIR/S99naiveproxy" "$WWW/"
 cp "$REPO_DIR/templates/index.html" "$WWW/templates/"
+cp "$REPO_DIR"/panel/*.py "$WWW/panel/"
 
 # --- сертификаты -----------------------------------------------------------
 
@@ -91,7 +100,7 @@ python3 /srv/server.py &
 sleep 1
 echo "==> fake raw.githubusercontent.com: OK"
 mkdir -p /opt
-curl -fsSL https://bin.entware.net/aarch64-k3.10/installer/alternative.sh | sh
+curl -fsSL https://bin.entware.net/$ENTWARE_ARCH/installer/alternative.sh | sh
 /opt/bin/opkg update
 export PATH=/opt/bin:/opt/sbin:\$PATH
 echo "==> install: curl -fsSL .../install.sh | sh -s -- $AUTH_FLAG \$EXTRA"
@@ -175,8 +184,8 @@ grep -qi "stale" /tmp/stale-stop.log \
   || { echo "FAIL: no stale-pid message in stop output"; cat /tmp/stale-stop.log; exit 1; }
 
 echo "==> naive binary: auto-install via install.sh (real GitHub API + asset)"
-# контейнер aarch64 (Apple/ARM хост), cpuinfo не от Cortex → aarch64_generic;
-# musl-static сборка запускается в Debian — проверяем реальным --version
+# контейнер той же архитектуры, что хост (aarch64 или x86_64); musl-static
+# сборка запускается в Debian — проверяем реальным --version
 test -x /opt/bin/naive || { echo "FAIL: /opt/bin/naive not installed"; exit 1; }
 echo "naive: \$(/opt/bin/naive --version 2>&1 | head -n 1)"
 echo "marker version: \$(cat /opt/etc/naive/proxy/naive-version)"
@@ -245,6 +254,7 @@ echo "naive survived upgrade rerun: \$(/opt/bin/naive --version 2>&1 | head -n 1
 echo "==> E2E DONE"
 EOF
 
+# shellcheck disable=SC2086  # RUN_FLAGS намеренно разбивается на аргументы
 docker run $RUN_FLAGS \
     --add-host raw.githubusercontent.com:127.0.0.1 \
     -e EXTRA="$MODE_FLAGS" \

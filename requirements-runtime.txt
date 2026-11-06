@@ -1,0 +1,18 @@
+# Runtime dependency surface, pinned for reproducible CI and audits.
+#
+# This is NOT the install path: on Keenetic/Entware the panel installs Flask,
+# Waitress and bcrypt from opkg (see install.sh). These pins are the reviewed
+# versions the code is tested against and the set pip-audit must keep clean.
+#
+# Regenerate after a deliberate upgrade (Python 3.10 + pip):
+#   python -m pip install -r requirements-runtime.txt
+#   python -m pip freeze | grep -Ei '^(flask|werkzeug|jinja2|markupsafe|itsdangerous|click|blinker|waitress|bcrypt)==' | sort
+bcrypt==5.0.0
+blinker==1.9.0
+click==8.5.0
+Flask==3.1.3
+itsdangerous==2.2.0
+Jinja2==3.1.6
+MarkupSafe==3.0.4
+waitress==3.0.2
+Werkzeug==3.1.9

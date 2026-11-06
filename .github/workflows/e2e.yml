@@ -1,0 +1,27 @@
+name: Docker Entware E2E
+
+on:
+  schedule:
+    # Nightly: the E2E downloads real GitHub releases and Entware feeds, so
+    # it lives outside the per-PR critical path.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  docker-e2e:
+    name: install + upgrade on Entware
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - name: Docker Entware E2E
+        run: ./docker-e2e.sh

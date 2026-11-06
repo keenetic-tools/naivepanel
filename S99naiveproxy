@@ -1,4 +1,5 @@
 #!/bin/sh
+# shellcheck disable=SC3043  # local: BusyBox ash на целевых роутерах поддерживает
 # /opt/etc/init.d/S99naiveproxy
 # Init-скрипт для клиента NaiveProxy на Entware (Keenetic).
 #
@@ -10,6 +11,7 @@
 #
 # Команды: start | stop | restart | status | reload
 
+# shellcheck disable=SC2034  # читает rc.func при source
 ENABLED=yes
 PROG=naive
 DAEMON=/opt/bin/$PROG
@@ -26,7 +28,6 @@ STOPMARK=/opt/etc/naive/proxy/.stopped
 
 # --- helpers ---------------------------------------------------------------
 log()  { logger -t naiveproxy "$@"; echo "$@"; }
-have() { command -v "$1" >/dev/null 2>&1; }
 
 # грубая ротация при старте: пока сервис работает, лог аппендится без
 # ограничений; между рестартами его периодически обрезает NaivePanel

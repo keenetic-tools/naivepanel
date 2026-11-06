@@ -1,0 +1,56 @@
+# Full CI toolchain, pinned for reproducible runs on Python 3.10–3.13.
+#
+# Runtime pins live in requirements-runtime.txt (the file pip-audit audits).
+# This file adds tests, lint/security scanners and the audit tool itself.
+#
+# Regenerate after a deliberate upgrade (Python 3.10 + pip, full freeze):
+#   python -m pip install -r requirements-dev.txt
+#   python -m pip freeze | sort
+#
+# filelock: pip-audit's filecache dependency. The CVE fix (4.2.x) requires
+# Python >=3.11, so 3.10 CI keeps the last 3.10-compatible release. It is a
+# dev-only package, never imported by the panel or shipped to routers.
+-r requirements-runtime.txt
+
+# --- tests -----------------------------------------------------------------
+pytest==9.2.0
+exceptiongroup==1.3.1; python_version < "3.11"
+iniconfig==2.3.1
+packaging==26.3
+pluggy==1.7.0
+Pygments==2.21.0
+tomli==2.5.0; python_version < "3.11"
+
+# --- static analysis -------------------------------------------------------
+ruff==0.17.3
+bandit==1.9.4
+PyYAML==6.0.3
+rich==15.0.0
+stevedore==5.8.0
+
+# --- dependency audit ------------------------------------------------------
+pip-audit==2.10.1
+boolean.py==5.0
+CacheControl==0.14.4
+certifi==2026.10.23
+charset-normalizer==3.5.2
+cyclonedx-python-lib==11.12.0
+defusedxml==0.7.1
+filelock==4.1.0; python_version < "3.11"
+filelock==4.2.9; python_version >= "3.11"
+idna==3.20
+license-expression==30.4.4
+markdown-it-py==4.2.0
+mdurl==0.1.2
+msgpack==1.2.4
+packageurl-python==0.17.6
+pip_api==0.0.35
+pip-requirements-parser==32.0.1
+platformdirs==4.12.4
+py-serializable==2.1.0
+pyparsing==3.3.3
+requests==2.34.2
+sortedcontainers==2.4.0
+tomli_w==1.2.0
+typing_extensions==4.16.0
+urllib3==2.8.0
