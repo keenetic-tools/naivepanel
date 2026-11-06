@@ -4914,26 +4914,61 @@ def test_panel_package_config_extraction(app, env, monkeypatch):
     assert cfg.NAIVEPROXY_DIR == m.NAIVEPROXY_DIR, "config не пересобрался"
 
 
+def test_panel_package_security_extraction(app, env, monkeypatch):
+    # шаг 2: auth/CSRF/CSP/Host-allowlist — panel/security.py; naivepanel.py
+    # только регистрирует хуки. Порядок before_request — часть контракта:
+    # nonce раньше Host-allowlist (нужен и на 403-ответах), guard'ы раньше
+    # auth. Изменение порядка = отдельное осознанное решение, не рефакторинг.
+    import panel.security as sec
+    assert sec is app.sec, "sec-модуль должен быть тем же объектом"
+    assert app._require_local_or_auth is sec._require_local_or_auth
+    assert app._htpasswd_verify is sec._htpasswd_verify
+    names = [f.__name__ for f in app.app.before_request_funcs[None]]
+    assert names == ["_make_csp_nonce", "_enforce_host_allowlist",
+                     "_reject_unauthenticated_exposure", "_csrf_protect",
+                     "_require_auth"], names
+    assert [f.__name__ for f in app.app.after_request_funcs[None]] == \
+        ["_security_headers"]
+    # security читает конфиг через атрибут модуля-владелеца: патч cfg виден
+    monkeypatch.setattr(app.cfg, "_bind_is_loopback", lambda: False)
+    assert sec._panel_is_exposed_without_auth() is True
+
+
 def test_backup_and_restore_include_panel_package(app, env):
-    # бэкап/откат обязаны знать о пакете: пропавший panel/config.py после
+    # бэкап/откат обязаны знать о пакете: пропавший panel/*.py после
     # отката панели = нерабочая установка
     pkg = app.PANEL_DIR / "panel"
     pkg.mkdir(parents=True, exist_ok=True)
     (pkg / "config.py").write_text("# current config", encoding="utf-8")
+    (pkg / "security.py").write_text("# current security", encoding="utf-8")
     backup = app._backup_panel_files()
     assert (backup / "panel" / "config.py").read_text() == "# current config"
+    assert (backup / "panel" / "security.py").read_text() == "# current security"
     # симулируем «обновление», затёршее пакет, и откат
     (pkg / "config.py").write_text("# new version", encoding="utf-8")
-    src = backup / "panel" / "config.py"
-    tmp = (pkg / "config.py").with_name("config.py.restore")
+    (pkg / "security.py").write_text("# new version", encoding="utf-8")
     import shutil as _sh
-    _sh.copy2(src, tmp)
-    os.replace(tmp, pkg / "config.py")
-    assert (pkg / "config.py").read_text() == "# current config"
+    for name in ("config.py", "security.py"):
+        src = backup / "panel" / name
+        tmp = (pkg / name).with_name(name + ".restore")
+        _sh.copy2(src, tmp)
+        os.replace(tmp, pkg / name)
+        assert (pkg / name).read_text() == f"# current {name.split('.')[0]}"
 
 
 def test_install_sh_ships_panel_package(app):
     src = (APP_DIR / "install.sh").read_text(encoding="utf-8")
-    assert 'PANEL_PKG="__init__.py config.py"' in src, "installer не качает пакет"
+    assert 'PANEL_PKG="__init__.py config.py security.py"' in src, \
+        "installer не качает пакет"
     assert '"$BASE/panel/$f"' in src, "нет загрузки файлов пакета"
     assert 'rm -rf "$PANEL_DIR/panel"' in src, "пакет не заменяется целиком"
+
+
+def test_sha256sums_covers_panel_package(app):
+    # установщик проверяет чексуммы SHA256SUMS: каждый файл пакета обязан
+    # быть перечислен, иначе fresh-install падает на верификации
+    lines = (APP_DIR / "SHA256SUMS").read_text(encoding="utf-8").splitlines()
+    listed = {parts[1] for parts in (l.split(maxsplit=1) for l in lines) if len(parts) == 2}
+    for f in ("naivepanel.py", "panel/__init__.py", "panel/config.py",
+              "panel/security.py", "templates/index.html"):
+        assert f in listed, f"{f} нет в SHA256SUMS"
