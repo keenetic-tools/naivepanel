@@ -1724,7 +1724,7 @@ def test_http_get_reports_missing_tools(app, monkeypatch):
 # --- self-update: /api/update/check ---------------------------------------------
 
 def test_check_reports_available_update(client, app, monkeypatch):
-    monkeypatch.setattr(app, "_latest_release",
+    monkeypatch.setattr(app.upd, "_latest_release",
                         lambda: {"tag": "v9.9.9", "notes": "big release",
                                  "url": "https://x"})
     d = client.get("/api/update/check").get_json()
@@ -1738,7 +1738,7 @@ def test_check_cache_and_force(client, app, monkeypatch):
     def latest():
         calls["n"] += 1
         return {"tag": "v9.9.9", "notes": "", "url": ""}
-    monkeypatch.setattr(app, "_latest_release", latest)
+    monkeypatch.setattr(app.upd, "_latest_release", latest)
     assert client.get("/api/update/check").get_json().get("cached") is None
     d = client.get("/api/update/check").get_json()
     assert d["cached"] is True          # второй вызов — из кэша, без сети
@@ -1750,7 +1750,7 @@ def test_check_cache_and_force(client, app, monkeypatch):
 def test_check_failsoft_on_network_error(client, app, monkeypatch):
     def dead():
         raise RuntimeError("GitHub unreachable")
-    monkeypatch.setattr(app, "_latest_release", dead)
+    monkeypatch.setattr(app.upd, "_latest_release", dead)
     r = client.get("/api/update/check")
     assert r.status_code == 200         # недоступный GitHub — не ошибка панели
     d = r.get_json()
@@ -1760,7 +1760,7 @@ def test_check_failsoft_on_network_error(client, app, monkeypatch):
 
 
 def test_check_same_version_is_not_available(client, app, monkeypatch):
-    monkeypatch.setattr(app, "_latest_release",
+    monkeypatch.setattr(app.upd, "_latest_release",
                         lambda: {"tag": "v" + app.APP_VERSION, "notes": "", "url": ""})
     assert client.get("/api/update/check").get_json()["available"] is False
 
@@ -1773,7 +1773,7 @@ def _apply_stub(env, monkeypatch, app, tag="v9.9.9"):
     (panel / "templates").mkdir(parents=True, exist_ok=True)
     (panel / "naivepanel.py").write_text("# old panel code")
     marker = env / "update-ran.txt"
-    monkeypatch.setattr(app, "_latest_release",
+    monkeypatch.setattr(app.upd, "_latest_release",
                         lambda: {"tag": tag, "notes": "", "url": ""})
     def fake_install(url, timeout=6.0):
         assert f"{tag}/install.sh" in url, f"install.sh должен качаться с тега: {url}"
@@ -1872,7 +1872,7 @@ def test_apply_wrapper_records_installer_exit_code(client, app, env, monkeypatch
 
 def test_apply_refuses_exposed_panel_without_password(client, app, monkeypatch):
     app.cfg.PANEL_BIND = "192.168.1.1:8089"  # admin.pass не существует (fixture)
-    monkeypatch.setattr(app, "_latest_release",
+    monkeypatch.setattr(app.upd, "_latest_release",
                         lambda: {"tag": "v9.9.9", "notes": "", "url": ""})
     r = client.post("/api/update/apply", headers=CSRF)
     assert r.status_code == 403
@@ -1893,12 +1893,12 @@ def test_apply_with_password_allowed_on_lan_bind(client, app, env, monkeypatch):
 def test_apply_502_when_release_unreachable(client, app, monkeypatch):
     def dead():
         raise RuntimeError("GitHub unreachable")
-    monkeypatch.setattr(app, "_latest_release", dead)
+    monkeypatch.setattr(app.upd, "_latest_release", dead)
     assert client.post("/api/update/apply", headers=CSRF).status_code == 502
 
 
 def test_apply_502_when_install_sh_fails(client, app, env, monkeypatch):
-    monkeypatch.setattr(app, "_latest_release",
+    monkeypatch.setattr(app.upd, "_latest_release",
                         lambda: {"tag": "v9.9.9", "notes": "", "url": ""})
     def no_install(url, timeout=6.0):
         if url.endswith("/install.sh"):
@@ -1917,7 +1917,7 @@ def test_apply_concurrent_single_installer(client, app, env, monkeypatch):
     panel = env / "panel"
     (panel / "templates").mkdir(parents=True, exist_ok=True)
     (panel / "naivepanel.py").write_text("# old panel code")
-    monkeypatch.setattr(app, "_latest_release",
+    monkeypatch.setattr(app.upd, "_latest_release",
                         lambda: {"tag": "v9.9.9", "notes": "", "url": ""})
 
     def slow_install(url, timeout=6.0):
@@ -1952,9 +1952,9 @@ def test_naive_update_concurrent_single_worker(client, app, monkeypatch):
         time.sleep(0.15)  # окно гонки: оба запроса в резолве одновременно
         return {"tag": "v123.0.0", "assets": []}
 
-    monkeypatch.setattr(app, "_naive_release", slow_release)
+    monkeypatch.setattr(app.upd, "_naive_release", slow_release)
     workers = []
-    monkeypatch.setattr(app, "_naive_update_worker",
+    monkeypatch.setattr(app.upd, "_naive_update_worker",
                         lambda: workers.append(1))
     statuses = []
 
@@ -2175,7 +2175,7 @@ def test_naive_bin_version_parses_output(app, env):
     p = env / "naive"
     p.write_text('#!/bin/sh\necho "naive 154.0.8037.49"\n')
     p.chmod(0o755)
-    app.NAIVE_BIN = p
+    app.cfg.NAIVE_BIN = p
     assert app._naive_bin_version() == "154.0.8037.49"
 
 
@@ -2184,7 +2184,7 @@ def test_naive_bin_version_missing_or_broken(app, env):
     p = env / "naive"
     p.write_text('#!/bin/sh\nexit 3\n')  # есть, но не работает
     p.chmod(0o755)
-    app.NAIVE_BIN = p
+    app.cfg.NAIVE_BIN = p
     assert app._naive_bin_version() is None
 
 
@@ -2289,7 +2289,7 @@ def _naive_env_reload(env, monkeypatch):
 
 def _naive_rel(monkeypatch, app, tag="v154.0.8037.49-2",
                assets=(("naiveproxy-v154.0.8037.49-2-openwrt-x86_64.tar.xz", "u1"),)):
-    monkeypatch.setattr(app, "_naive_release",
+    monkeypatch.setattr(app.upd, "_naive_release",
                         lambda: {"tag": tag, "notes": "", "url": "", "assets": list(assets)})
 
 
@@ -2349,7 +2349,7 @@ def test_naive_check_failsoft_and_cache(client, app, env, monkeypatch):
         calls["n"] += 1
         raise RuntimeError("GitHub unreachable")
 
-    monkeypatch.setattr(m, "_naive_release", dead)
+    monkeypatch.setattr(m.upd, "_naive_release", dead)
     r = c.get("/api/naive/check")
     assert r.status_code == 200  # недоступный GitHub — не ошибка панели
     d = r.get_json()
@@ -2376,7 +2376,7 @@ def test_naive_update_502_when_release_unreachable(client, app, env, monkeypatch
     def dead():
         raise RuntimeError("GitHub unreachable")
 
-    monkeypatch.setattr(m, "_naive_release", dead)
+    monkeypatch.setattr(m.upd, "_naive_release", dead)
     assert m.app.test_client().post("/api/naive/update", headers=CSRF).status_code == 502
 
 
@@ -4688,7 +4688,7 @@ def test_e2e_concurrency_limit_returns_429(client, app, monkeypatch):
 
 def test_update_check_force_storm_is_coalesced(client, app, monkeypatch):
     # параллельные force=1 не должны превращаться в залп внешних запросов
-    app._update_check_cache.clear()
+    app.upd._update_check_cache.clear()
     calls = []
     release = threading.Event()
 
@@ -4697,7 +4697,7 @@ def test_update_check_force_storm_is_coalesced(client, app, monkeypatch):
         calls.append(1)
         return {"tag": "v9.9.9", "notes": "", "url": ""}
 
-    monkeypatch.setattr(app, "_latest_release", slow_release)
+    monkeypatch.setattr(app.upd, "_latest_release", slow_release)
     out = []
 
     def check():
@@ -4721,9 +4721,9 @@ def test_update_check_force_storm_is_coalesced(client, app, monkeypatch):
 
 
 def test_update_check_429_when_saturated(client, app, monkeypatch):
-    app._update_check_cache.clear()
+    app.upd._update_check_cache.clear()
     monkeypatch.setattr(app.mon, "_EXPENSIVE_SEM", threading.BoundedSemaphore(0))
-    monkeypatch.setattr(app, "_latest_release",
+    monkeypatch.setattr(app.upd, "_latest_release",
                         lambda: {"tag": "v9.9.9", "notes": "", "url": ""})
     r = client.get("/api/update/check?force=1")
     assert r.status_code == 429
@@ -4855,7 +4855,7 @@ def test_naive_update_records_previous_tag(client, env, monkeypatch):
                          tag="v200.0.0.1-1")
     _naive_rel(monkeypatch, m, tag="v200.0.0.1-1",
                assets=(("naiveproxy-v200.0.0.1-1-openwrt-x86_64.tar.xz", "u"),))
-    monkeypatch.setattr(m, "_http_download",
+    monkeypatch.setattr(m.upd, "_http_download",
                         lambda url, dst: shutil.copy(tarball, dst))
     m._naive_update_worker()
     st = m._naive_state_read()
@@ -4992,6 +4992,23 @@ def test_panel_package_monitor_extraction(app, env, monkeypatch):
     assert "notify" in st
 
 
+def test_panel_package_updates_extraction(app, env, monkeypatch):
+    # шаг 6: self-update/naive-update/rollback — panel/updates.py; роуты
+    # в naivepanel.py зовут их через upd.*. Патч владельца виден роуту
+    # /api/update/check (кэш сбрасываем руками — он живёт в модуле).
+    import panel.updates as upd
+    assert upd is app.upd, "upd-модуль должен быть тем же объектом"
+    assert app._latest_release is upd._latest_release
+    assert app._http_download is upd._http_download
+    app.upd._update_check_cache.clear()
+    monkeypatch.setattr(app.upd, "_latest_release",
+                        lambda: {"tag": "v0.99.0", "notes": "n", "url": "u"})
+    r = app.app.test_client().get("/api/update/check", headers=CSRF)
+    assert r.status_code == 200
+    d = r.get_json()
+    assert d["latest"] == "0.99.0" and d["available"] is True  # v-префикс срезается
+
+
 def test_backup_and_restore_include_panel_package(app, env):
     # бэкап/откат обязаны знать о пакете: пропавший panel/*.py после
     # отката панели = нерабочая установка
@@ -5026,7 +5043,7 @@ def test_backup_and_restore_include_panel_package(app, env):
 
 def test_install_sh_ships_panel_package(app):
     src = (APP_DIR / "install.sh").read_text(encoding="utf-8")
-    assert 'PANEL_PKG="__init__.py config.py security.py presets.py service.py monitor.py"' in src, \
+    assert 'PANEL_PKG="__init__.py config.py security.py presets.py service.py monitor.py updates.py"' in src, \
         "installer не качает пакет"
     assert '"$BASE/panel/$f"' in src, "нет загрузки файлов пакета"
     assert 'rm -rf "$PANEL_DIR/panel"' in src, "пакет не заменяется целиком"
@@ -5039,5 +5056,5 @@ def test_sha256sums_covers_panel_package(app):
     listed = {parts[1] for parts in (l.split(maxsplit=1) for l in lines) if len(parts) == 2}
     for f in ("naivepanel.py", "panel/__init__.py", "panel/config.py",
               "panel/security.py", "panel/presets.py", "panel/service.py",
-              "panel/monitor.py", "templates/index.html"):
+              "panel/monitor.py", "panel/updates.py", "templates/index.html"):
         assert f in listed, f"{f} нет в SHA256SUMS"

@@ -15,24 +15,15 @@ from __future__ import annotations
 import ipaddress
 import json
 import os
-import platform
-import re
 import queue
 import shutil
 import socket
 # subprocess вызывается только с фиксированными argv-списками (shell=False)
 import subprocess  # nosec B404
-import tarfile
 import threading
 import time
 from pathlib import Path
 from typing import Any
-
-try:  # не весь Entware-минималистичный python3 несёт lzma
-    import lzma  # noqa: F401
-    _HAS_LZMA = True
-except ImportError:
-    _HAS_LZMA = False
 
 from flask import (Flask, Response, abort, jsonify,
                    make_response, render_template, request)
@@ -71,6 +62,10 @@ from panel.service import *  # noqa: F401,F403 — re-export для совмес
 _reload_or_import("panel.monitor")
 from panel import monitor as mon  # модуль-владелец мониторинга/автоматики (патчи тестов — сюда)
 from panel.monitor import *  # noqa: F401,F403 — re-export для совместимости
+
+_reload_or_import("panel.updates")
+from panel import updates as upd  # модуль-владелец обновлений/отката (патчи тестов — сюда)
+from panel.updates import *  # noqa: F401,F403 — re-export для совместимости
 
 # --- Flask app ------------------------------------------------------------
 
@@ -719,160 +714,6 @@ def api_password():
     return jsonify({"ok": True})
 
 
-# --- Self-update: проверка и установка обновлений из UI ---------------------
-
-def _http_download(url: str, dst: Path, timeout: float = 300.0) -> None:
-    """Скачивание бинарного файла через curl/wget — как mon._http_get, но в файл.
-
-    Архив бинарника (~3.5МБ) не проходит через stdout-подстановку; таймаут
-    щедрый — на медленном линке роутера качается заметно дольше JSON.
-    """
-    for cmd in (["curl", "-fsSL", "--max-time", str(int(timeout)),
-                 "-o", str(dst), url],
-                ["wget", "-q", "-T", "60", "-t", "2", "-O", str(dst), url]):
-        try:
-            # cmd — фиксированный шаблон, url передаётся argv-элементом
-            r = subprocess.run(cmd, capture_output=True, text=True,
-                               timeout=timeout + 30)  # nosec B603
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            continue
-        if r.returncode == 0 and dst.exists() and dst.stat().st_size > 0:
-            return
-    raise RuntimeError(f"download {url} failed")
-
-
-def _ver_key(v: str) -> tuple[int, ...]:
-    """Версия → числовой кортеж для сравнения: 0.10.0 > 0.9.0 (строкой — нет)."""
-    parts: list[int] = []
-    for p in v.strip().lstrip("vV").split("."):
-        m = re.match(r"\d+", p)
-        parts.append(int(m.group()) if m else 0)
-    return tuple(parts) or (0,)
-
-
-def _latest_release() -> dict[str, Any]:
-    """Самый свежий тег репозитория + notes релиза, если тот оформлен.
-
-    `releases/latest` отстаёт от тегов (релиз-ноту создают не под каждый
-    тег), поэтому сверяем и список тегов, выбирая максимум по версии —
-    независимо от порядка, который GitHub API не гарантирует.
-    """
-    rel: dict[str, Any] = {}
-    try:
-        data = json.loads(mon._http_get(f"{UPDATE_API_BASE}/repos/{UPDATE_REPO}/releases/latest"))
-        tag = data.get("tag_name") or ""
-        if _TAG_RE.match(tag):
-            rel = {"tag": tag,
-                   "notes": (data.get("body") or "").strip()[:4000],
-                   "url": data.get("html_url") or ""}
-    except (RuntimeError, ValueError):
-        pass  # релизов нет или API недоступен — решит список тегов
-    best: str | None = None
-    try:
-        tags = json.loads(mon._http_get(f"{UPDATE_API_BASE}/repos/{UPDATE_REPO}/tags?per_page=10"))
-        names = (t.get("name") or "" for t in tags if isinstance(t, dict))
-        best = max((n for n in names if _TAG_RE.match(n)),
-                   key=_ver_key, default=None)
-    except (RuntimeError, ValueError) as exc:
-        if not rel:
-            raise RuntimeError(f"cannot reach {UPDATE_API_BASE}: {exc}") from exc
-    if best and (not rel or _ver_key(best) > _ver_key(rel["tag"])):
-        return {"tag": best, "notes": "",
-                "url": f"https://github.com/{UPDATE_REPO}/releases/tag/{best}"}
-    if rel:
-        return rel
-    raise RuntimeError(f"no vX.Y.Z tags/releases found in {UPDATE_REPO}")
-
-
-def _update_state_read() -> dict[str, Any]:
-    try:
-        st = json.loads(UPDATE_STATE.read_text(encoding="utf-8"))
-        return st if isinstance(st, dict) else {}
-    except (OSError, ValueError):
-        return {}
-
-
-# Резервирование запуска update-операций: резолв релиза и скачивание идут
-# по сети секунды и выполняются ВНЕ лока; сам запуск (re-check state →
-# spawn → запись «running») — под локом. Без этого два параллельных запроса
-# на медленной сети проходят гейт до первой записи «running» и поднимают
-# два установщика/воркера над одними файлами.
-_UPDATE_LAUNCH_LOCK = threading.Lock()        # panel apply + panel rollback
-_NAIVE_UPDATE_LAUNCH_LOCK = threading.Lock()  # naive update + naive rollback
-
-
-def _update_state_write(st: dict[str, Any]) -> None:
-    try:
-        # атомарно (rename): неатомарный write_text оставлял читателю пустой
-        # файл, ридер возвращал {} — панель сочла бы апдейт завершённым
-        pres._save_json(UPDATE_STATE, st)
-    except OSError as exc:  # state не критичен: обновление переживёт и без него
-        app.logger.warning("cannot write %s: %s", UPDATE_STATE, exc)
-
-
-def _pid_alive(pid: Any) -> bool:
-    """Жив ли процесс установщика (pid пишем в state с v0.8.1)."""
-    try:
-        pid = int(pid)
-    except (TypeError, ValueError):
-        return False  # pid нет (state от версии до v0.8.1) — считаем мёртвым
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True  # существует, но чужой — на роутере один пользователь
-    return True
-
-
-def _update_state() -> dict[str, Any]:
-    """Состояние обновления с самодиагностикой после рестарта панели.
-
-    Успешный апдейт перезапускает панель: новый процесс видит state
-    «running» с целью, равной собственной версии, и закрывает его как
-    «done». Умерший установщик (сеть/checksum/диск) распознаём по pid —
-    state помечается «failed» и не блокирует retry фиктивным
-    «already in progress». Записи без pid протухают через _UPDATE_STALE_S.
-    """
-    st = _update_state_read()
-    if st.get("phase") == "running":
-        if str(st.get("target") or "").lstrip("vV") == APP_VERSION:
-            _update_state_write({**st, "phase": "done", "finished": time.time()})
-            st["phase"] = "done"
-        elif not _pid_alive(st.get("pid")):
-            st["phase"] = "failed"
-            _update_state_write(st)
-        elif time.time() - float(st.get("started") or 0) > _UPDATE_STALE_S:
-            st["stale"] = True
-    return st
-
-
-def _backup_panel_files() -> Path:
-    """Снапшот заменяемых файлов панели в backup/v{APP_VERSION}.
-
-    Вызывается и перед self-update, и перед откатом: оба пути обязаны быть
-    обратимыми. Файл хранится под именем оригинала — откат ищет по имени.
-    """
-    backup = PANEL_DIR / "backup" / f"v{APP_VERSION}"
-    backup.mkdir(parents=True, exist_ok=True)
-    for src in PANEL_UPDATE_FILES:
-        if src.exists():
-            shutil.copy2(src, backup / src.name)
-    # backend-пакет (ARCH-01): backup/vX/panel/*.py, откат знает ту же схему
-    pkg = PANEL_DIR / "panel"
-    if pkg.is_dir():
-        pkg_backup = backup / "panel"
-        pkg_backup.mkdir(parents=True, exist_ok=True)
-        for f in pkg.glob("*.py"):
-            shutil.copy2(f, pkg_backup / f.name)
-    return backup
-
-
-_update_check_cache: dict[str, Any] = {}
-
-
 @app.route("/api/update/check")
 def api_update_check():
     """Есть ли свежий релиз: APP_VERSION против тегов GitHub.
@@ -883,9 +724,9 @@ def api_update_check():
     """
     force = request.args.get("force") in ("1", "true")
     arrived = time.monotonic()
-    if not force and _update_check_cache:
-        if arrived - _update_check_cache["at"] < _update_check_cache.get("ttl", _UPDATE_CHECK_TTL):
-            out = dict(_update_check_cache["data"])
+    if not force and upd._update_check_cache:
+        if arrived - upd._update_check_cache["at"] < upd._update_check_cache.get("ttl", _UPDATE_CHECK_TTL):
+            out = dict(upd._update_check_cache["data"])
             out["cached"] = True
             return jsonify(out)
     with mon._UPDATE_FETCH_LOCK:
@@ -893,8 +734,8 @@ def api_update_check():
         # залпу: берём его, второй внешний ход не нужен (в т.ч. для force —
         # его смысл «свежее, чем у меня», а не «обязательно лично сходить»;
         # сольный force после свежего чека ходит в сеть как раньше)
-        if _update_check_cache and _update_check_cache["at"] >= arrived:
-            out = dict(_update_check_cache["data"])
+        if upd._update_check_cache and upd._update_check_cache["at"] >= arrived:
+            out = dict(upd._update_check_cache["data"])
             out["cached"] = True
             return jsonify(out)
         if not mon._EXPENSIVE_SEM.acquire(blocking=False):
@@ -902,25 +743,25 @@ def api_update_check():
         try:
             checked = time.strftime("%Y-%m-%dT%H:%M:%S%z")
             try:
-                rel = _latest_release()
+                rel = upd._latest_release()
             except RuntimeError as exc:
                 out = {"current": APP_VERSION, "latest": None, "available": False,
                        "error": str(exc), "checked_at": checked}
                 # at = момент заполнения, не входа в лок: сосед по залпу,
                 # пришедший позже входа, должен увидеть at >= своего прихода
-                _update_check_cache.update({"at": time.monotonic(),
+                upd._update_check_cache.update({"at": time.monotonic(),
                                             "ttl": _UPDATE_ERR_TTL, "data": out})
                 return jsonify(out)
             latest = rel["tag"].lstrip("vV")
             out = {
                 "current": APP_VERSION,
                 "latest": latest,
-                "available": _ver_key(latest) > _ver_key(APP_VERSION),
+                "available": upd._ver_key(latest) > upd._ver_key(APP_VERSION),
                 "notes": rel["notes"],
                 "url": rel["url"],
                 "checked_at": checked,
             }
-            _update_check_cache.update({"at": time.monotonic(),
+            upd._update_check_cache.update({"at": time.monotonic(),
                                         "ttl": _UPDATE_CHECK_TTL, "data": out})
             return jsonify(out)
         finally:
@@ -944,7 +785,7 @@ def api_update_apply():
     # ожидания не должны блокировать конкурентный запрос, который после
     # re-check под локом получит честный 409
     try:
-        rel = _latest_release()
+        rel = upd._latest_release()
     except RuntimeError as exc:
         abort(502, description=str(exc))
     tag = rel["tag"]
@@ -953,15 +794,15 @@ def api_update_apply():
                               timeout=30.0)
     except RuntimeError as exc:
         abort(502, description=f"cannot download install.sh@{tag}: {exc}")
-    with _UPDATE_LAUNCH_LOCK:
-        state = _update_state()
+    with upd._UPDATE_LAUNCH_LOCK:
+        state = upd._update_state()
         if state.get("phase") == "running" and not state.get("stale"):
             abort(409, description=f"update to {state.get('target')} already in "
                                    f"progress — installer log: {UPDATE_LOG}")
         try:
             PANEL_DIR.mkdir(parents=True, exist_ok=True)
             # бэкап заменяемых файлов — для отката из UI после неудачного апдейта
-            _backup_panel_files()
+            upd._backup_panel_files()
             stage = PANEL_DIR / ".update-install.sh"
             stage.write_text(installer, encoding="utf-8")
             os.chmod(stage, 0o700)
@@ -1000,13 +841,13 @@ def api_update_apply():
         except OSError as exc:
             # спавн не удался — не оставляем «ничего не происходило»:
             # фиксируем failed в той же критической секции
-            _update_state_write({"phase": "failed", "target": tag,
+            upd._update_state_write({"phase": "failed", "target": tag,
                                  "finished": time.time(),
                                  "error": f"cannot spawn installer: {exc}"})
             abort(500, description=f"cannot spawn installer: {exc}")
         # pid в state: умерший установщик распознаётся при следующем же запросе,
-        # а не через 15 минут (_update_state помечает такой state «failed»)
-        _update_state_write({"phase": "running", "target": tag,
+        # а не через 15 минут (upd._update_state помечает такой state «failed»)
+        upd._update_state_write({"phase": "running", "target": tag,
                              "started": time.time(), "pid": proc.pid})
     app.logger.warning("self-update to %s triggered by %s", tag, request.remote_addr)
     return jsonify({"started": True, "target": tag, "current": APP_VERSION,
@@ -1028,317 +869,9 @@ def api_update_log():
     resp = jsonify({"lines": lines,
                     "content": mon._tail_path(UPDATE_LOG, lines),
                     "panel": mon._tail_path(PANEL_LOG, 20),
-                    "state": _update_state()})
+                    "state": upd._update_state()})
     resp.headers["Cache-Control"] = "no-store"
     return resp
-
-
-# --- Бинарник naive: проверка версии и обновление из UI ----------------------
-
-def _naive_bin_version() -> str | None:
-    """Версия из самого бинарника: `naive --version` → «naive 154.0.8037.49».
-
-    Бинарника нет или он не запускается (битая ручная установка) → None.
-    """
-    if not NAIVE_BIN.exists():
-        return None
-    try:
-        r = subprocess.run([str(NAIVE_BIN), "--version"], capture_output=True,
-                           text=True, timeout=15)  # nosec B603
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    out = (r.stdout or "").strip()
-    if r.returncode != 0 or not out:
-        return None
-    line = out.splitlines()[0].strip()
-    if line.lower().startswith("naive "):
-        line = line[len("naive "):].strip()
-    return line or None
-
-
-def _naive_ver_key(tag_or_ver: str) -> tuple[int, ...]:
-    """«v154.0.8037.49-2» → (154, 0, 8037, 49, 2) — для сравнения версий.
-
-    Суффикс пересборки (-N) учитывается: v154...-2 новее v154...-1, а вывод
-    `naive --version` без суффикса даёт (... ,0) — старше любого -N.
-    """
-    s = (tag_or_ver or "").strip().lower().lstrip("v")
-    build = 0
-    head, sep, tail = s.rpartition("-")
-    if sep and tail.isdigit():
-        s, build = head, int(tail)
-    parts: list[int] = []
-    for p in s.split("."):
-        m = re.match(r"\d+", p)
-        parts.append(int(m.group()) if m else 0)
-    return (*parts, build)
-
-
-def _naive_read(path: Path) -> str | None:
-    try:
-        v = path.read_text(encoding="utf-8").strip()
-    except OSError:
-        return None
-    return v or None
-
-
-def _naive_detect_target() -> str | None:
-    """openwrt-таргет по железу — зеркало detect_naive_target из install.sh.
-
-    NAIVEPROXY_UNAME_M / NAIVEPROXY_CPUINFO / NAIVEPROXY_ELF переопределяют
-    источники (тесты); в проде — platform.machine(), /proc/cpuinfo и
-    ELF-заголовок /bin/sh (энддиан MIPS: байт 5, 1=LE 2=BE). None — prebuilt
-    под такое железо не существует (big-endian MIPS, экзотическая arch).
-    """
-    machine = (os.environ.get("NAIVEPROXY_UNAME_M") or platform.machine()).lower()
-    try:
-        info = Path(os.environ.get("NAIVEPROXY_CPUINFO", "/proc/cpuinfo")) \
-            .read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        info = ""
-
-    def field(name: str) -> str:
-        for line in info.splitlines():
-            key, sep, value = line.partition(":")
-            if sep and key.strip() == name:
-                return value.strip()
-        return ""
-
-    part = field("CPU part").lower()
-    if machine in ("x86_64", "amd64"):
-        return "x86_64"
-    if re.fullmatch(r"i[3-6]86", machine):
-        return "x86"
-    if machine in ("aarch64", "arm64"):
-        return {"0xd03": "aarch64_cortex-a53",
-                "0xd08": "aarch64_cortex-a72",
-                "0xd0e": "aarch64_cortex-a76"}.get(part, "aarch64_generic")
-    if machine.startswith("armv7"):
-        feats = set(field("Features").split())
-        neon, vfp4 = "neon" in feats, "vfpv4" in feats
-        if part == "0xc05":
-            return "arm_cortex-a5_vfpv4"
-        if part == "0xc08":
-            return "arm_cortex-a8_vfpv3"
-        if part == "0xc09":
-            return "arm_cortex-a9_neon" if neon else "arm_cortex-a9"
-        if part == "0xc0f":
-            return "arm_cortex-a15_neon-vfpv4"
-        if neon and vfp4:
-            return "arm_cortex-a7_neon-vfpv4"
-        if vfp4:
-            return "arm_cortex-a7_vfpv4"
-        return "arm_cortex-a7"
-    if machine.startswith("armv6"):
-        return "arm_arm1176jzf-s_vfp"
-    if machine.startswith("armv5"):
-        return "arm_arm926ej-s"
-    if machine == "mips":
-        try:
-            data = Path(os.environ.get("NAIVEPROXY_ELF", "/bin/sh")).read_bytes()
-        except OSError:
-            data = b""
-        if data[5:6] == b"\x02":
-            return None  # big-endian: prebuilt-сборок нет
-        model = field("cpu model")
-        if any(k in model for k in ("24Kc", "24KEc", "34Kc", "1004Kc", "mips32r2")):
-            return "mipsel_24kc"
-        return "mipsel_mips32"
-    return None
-
-
-def _naive_pick_asset(assets: list[tuple[str, str]],
-                      target: str | None) -> tuple[str, str] | None:
-    """Лучший (имя, url) ассета под таргет: точный → arch-фолбэк,
-    в каждом сначала -static (musl, без зависимостей от библиотек /opt/lib).
-    """
-    if not target:
-        return None
-    fallback = ""
-    if target.startswith("aarch64_"):
-        fallback = "aarch64_generic"
-    elif target.startswith("arm_"):
-        fallback = "arm_cortex-a7"
-    elif target.startswith("mipsel_"):
-        fallback = "mipsel_mips32"
-    for cand in (target, fallback):
-        if not cand:
-            continue
-        for flavor in (f"{cand}-static", cand):
-            for name, url in assets:
-                if name.endswith(f"-openwrt-{flavor}.tar.xz"):
-                    return name, url
-    return None
-
-
-def _naive_release() -> dict[str, Any]:
-    """Последний релиз klzgrad/naiveproxy: тег + ассеты (+ заметка)."""
-    data = json.loads(mon._http_get(f"{NAIVE_SRC_API}/repos/{NAIVE_SRC_REPO}/releases/latest"))
-    tag = data.get("tag_name") or ""
-    assets = [(a.get("name") or "", a.get("browser_download_url") or "")
-              for a in data.get("assets") or [] if isinstance(a, dict)]
-    if not tag or not assets:
-        raise RuntimeError(f"unexpected release payload from {NAIVE_SRC_REPO}")
-    return {"tag": tag, "notes": (data.get("body") or "").strip()[:4000],
-            "url": data.get("html_url") or "", "assets": assets}
-
-
-def _naive_state_read() -> dict[str, Any]:
-    try:
-        st = json.loads(NAIVE_UPDATE_STATE.read_text(encoding="utf-8"))
-        return st if isinstance(st, dict) else {}
-    except (OSError, ValueError):
-        return {}
-
-
-def _naive_state_write(st: dict[str, Any]) -> None:
-    try:
-        NAIVEPROXY_DIR.mkdir(parents=True, exist_ok=True)
-        # атомарно, как _update_state_write — по той же причине
-        pres._save_json(NAIVE_UPDATE_STATE, st)
-    except OSError as exc:  # state не критичен: обновление переживёт и без него
-        app.logger.warning("cannot write %s: %s", NAIVE_UPDATE_STATE, exc)
-
-
-def _naive_state() -> dict[str, Any]:
-    """State обновления бинарника; «running» без прогресса → stale.
-
-    Воркер живёт потоком внутри панели: её рестарт убивает поток, pid для
-    проверки взять неоткуда — потому только тайм-аут (скачивание ~3.5МБ
-    укладывается в него с запасом, а реальный прогресс виден в логе).
-    """
-    st = _naive_state_read()
-    if st.get("phase") == "running":
-        if time.time() - float(st.get("started") or 0) > _NAIVE_STALE_S:
-            st["stale"] = True
-    return st
-
-
-def _naive_log(msg: str) -> None:
-    try:
-        with NAIVE_UPDATE_LOG.open("a", encoding="utf-8") as fh:
-            fh.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
-    except OSError:
-        pass  # лог не критичен
-
-
-def _validate_tar_members(tgz: Path) -> None:
-    """Проверка ВСЕХ members архива до распаковки (SEC-03).
-
-    Артефакт приходит из внешнего релиза: member с absolute path/`..` или
-    symlink/hardlink мог бы писать вне stage. Основной путь — stdlib
-    tarfile (одинаковая семантика на всех платформах); без python3-lzma
-    (минимальные Entware-сборки) — хотя бы имена из `tar -tf`: path
-    traversal отсекаем, типы members — нет. Распаковка в обоих случаях
-    остаётся системному tar (зависимость xz не меняется).
-    """
-    if _HAS_LZMA:
-        with tarfile.open(tgz, "r:xz") as archive:
-            for member in archive.getmembers():
-                member_path = Path(member.name)
-                if member_path.is_absolute() or ".." in member_path.parts:
-                    raise RuntimeError(f"unsafe archive path: {member.name!r}")
-                if member.issym() or member.islnk() \
-                        or not (member.isfile() or member.isdir()):
-                    raise RuntimeError(f"unsupported archive member: {member.name!r}")
-        return
-    r = subprocess.run(["tar", "-tf", str(tgz)], capture_output=True,
-                       text=True, timeout=60)  # nosec B603
-    if r.returncode != 0:
-        raise RuntimeError("cannot list archive (tar/xz missing?): "
-                           + (r.stderr.strip() or f"rc={r.returncode}"))
-    for name in r.stdout.splitlines():
-        member_path = Path(name)
-        if member_path.is_absolute() or ".." in member_path.parts:
-            raise RuntimeError(f"unsafe archive path: {name!r}")
-
-
-def _naive_update_worker() -> None:
-    """Фоновое обновление /opt/bin/naive (запускается потоком из apply).
-
-    Порядок страховит: скачали → распаковали → ПРОВЕРИЛИ `--version` →
-    только тогда заменили (rename: работающий naive продолжает старый инод)
-    и перезапустили сервис, если он работал. Любой сбой до rename не трогает
-    рабочий бинарник; прежний образ остаётся бэкапом naive.previous.
-    """
-    try:
-        rel = _naive_release()
-        tag = rel["tag"]
-        build = _naive_read(NAIVE_BUILD) or ""
-        target = build.removesuffix("-static") or _naive_detect_target()
-        picked = _naive_pick_asset(rel["assets"], target)
-        if not picked:
-            raise RuntimeError(f"release {tag} has no openwrt asset for "
-                               f"target {target!r}")
-        name, url = picked
-        _naive_log(f"{tag}: asset {name} ({target})")
-        stage = NAIVEPROXY_DIR / ".naive-update"
-        shutil.rmtree(stage, ignore_errors=True)
-        stage.mkdir(parents=True, exist_ok=True)
-        tgz = stage / "naive.tar.xz"
-        _naive_log(f"downloading {url}")
-        _http_download(url, tgz)
-        _validate_tar_members(tgz)  # до распаковки: вне stage писать нельзя
-        r = subprocess.run(["tar", "-xJf", str(tgz), "-C", str(stage)],
-                           capture_output=True, text=True, timeout=120)  # nosec B603
-        if r.returncode != 0:
-            raise RuntimeError("tar -xJf failed (xz missing? opkg install xz): "
-                               + (r.stderr.strip() or f"rc={r.returncode}"))
-        bins = sorted(stage.glob("naiveproxy-*/naive"))
-        if not bins:
-            raise RuntimeError("tarball contains no naiveproxy-*/naive")
-        new_bin = bins[0]
-        new_bin.chmod(0o755)
-        rv = subprocess.run([str(new_bin), "--version"], capture_output=True,
-                            text=True, timeout=15)  # nosec B603
-        if rv.returncode != 0:
-            raise RuntimeError("downloaded binary failed --version check "
-                               "(wrong target?) — keeping the current one")
-        new_ver = (rv.stdout or "").strip().splitlines()[0].strip()
-        _naive_log(f"check ok: {new_ver}")
-        was_active = mon._status()["active"]
-        if NAIVE_BIN.exists():
-            backup = NAIVEPROXY_DIR / "backup" / "naive.previous"
-            backup.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(NAIVE_BIN, backup)
-            # тег откатываемой версии: без него откатчик не знает, что вернёт
-            prev_tag = _naive_read(NAIVE_TAG)
-            if prev_tag:
-                backup.with_name(backup.name + ".tag").write_text(
-                    prev_tag + "\n", encoding="utf-8")
-        # cp в тот же каталог + os.replace = rename внутри ФС: открытый
-        # для записи работающий бинарник дал бы ETXTBSY, а rename оставляет
-        # старый образ выполняющемуся процессу
-        placed = NAIVE_BIN.with_name(NAIVE_BIN.name + ".new")
-        shutil.copy2(new_bin, placed)
-        placed.chmod(0o755)
-        os.replace(placed, NAIVE_BIN)
-        NAIVE_TAG.write_text(tag + "\n", encoding="utf-8")
-        NAIVE_BUILD.write_text(
-            name.rsplit(".tar.xz", 1)[0].rsplit("-openwrt-", 1)[-1] + "\n",
-            encoding="utf-8")
-        shutil.rmtree(stage, ignore_errors=True)
-        _naive_log(f"installed {tag} -> {NAIVE_BIN}")
-        restarted = False
-        restart_rc = None
-        if was_active and cfg.INIT_SCRIPT.exists():
-            with mon._SERVICE_LOCK:
-                rst = svc._service("restart")
-            restart_rc = rst["rc"]
-            restarted = restart_rc == 0  # как в rollback: rc==0 или честный провал
-            _naive_log(f"service restart rc={restart_rc}")
-        _naive_state_write({"phase": "done", "target": tag,
-                            "finished": time.time(), "version": new_ver,
-                            "restarted": restarted, "restart_rc": restart_rc})
-        app.logger.info("naive binary updated to %s (%s)", tag, name)
-    except Exception as exc:  # любая ошибка воркера — в state и лог, не в панель
-        _naive_log(f"failed: {exc}")
-        app.logger.warning("naive update failed", exc_info=True)
-        _naive_state_write({"phase": "failed", "error": str(exc)[:500],
-                            "finished": time.time()})
-
-
-_naive_check_cache: dict[str, Any] = {}
 
 
 @app.route("/api/naive/check")
@@ -1351,44 +884,44 @@ def api_naive_check():
     """
     force = request.args.get("force") in ("1", "true")
     arrived = time.monotonic()
-    if not force and _naive_check_cache:
-        if arrived - _naive_check_cache["at"] < _naive_check_cache.get("ttl", _NAIVE_CHECK_TTL):
-            out = dict(_naive_check_cache["data"])
+    if not force and upd._naive_check_cache:
+        if arrived - upd._naive_check_cache["at"] < upd._naive_check_cache.get("ttl", _NAIVE_CHECK_TTL):
+            out = dict(upd._naive_check_cache["data"])
             out["cached"] = True
             return jsonify(out)
     with mon._NAIVE_FETCH_LOCK:
         # коалесцирование, как у /api/update/check (см. mon._UPDATE_FETCH_LOCK)
-        if _naive_check_cache and _naive_check_cache["at"] >= arrived:
-            out = dict(_naive_check_cache["data"])
+        if upd._naive_check_cache and upd._naive_check_cache["at"] >= arrived:
+            out = dict(upd._naive_check_cache["data"])
             out["cached"] = True
             return jsonify(out)
         if not mon._EXPENSIVE_SEM.acquire(blocking=False):
             abort(429, description="too many concurrent checks, try later")
         try:
             checked = time.strftime("%Y-%m-%dT%H:%M:%S%z")
-            version = _naive_bin_version()
-            tag = _naive_read(NAIVE_TAG)
+            version = upd._naive_bin_version()
+            tag = upd._naive_read(NAIVE_TAG)
             out: dict[str, Any] = {
                 "version": version,
                 "tag": tag,
                 "path": str(NAIVE_BIN) if NAIVE_BIN.exists() else None,
-                "target": _naive_read(NAIVE_BUILD) or _naive_detect_target(),
+                "target": upd._naive_read(NAIVE_BUILD) or upd._naive_detect_target(),
                 "checked_at": checked,
             }
             try:
-                rel = _naive_release()
+                rel = upd._naive_release()
             except (RuntimeError, ValueError) as exc:
                 out.update({"latest": None, "available": False, "error": str(exc)})
                 # at = момент заполнения (см. /api/update/check)
-                _naive_check_cache.update({"at": time.monotonic(),
+                upd._naive_check_cache.update({"at": time.monotonic(),
                                            "ttl": _NAIVE_ERR_TTL, "data": out})
                 return jsonify(out)
             latest = rel["tag"]
-            cur = _naive_ver_key(tag) if tag else (_naive_ver_key(version) if version else None)
+            cur = upd._naive_ver_key(tag) if tag else (upd._naive_ver_key(version) if version else None)
             out.update({"latest": latest,
-                        "available": cur is None or _naive_ver_key(latest) > cur,
+                        "available": cur is None or upd._naive_ver_key(latest) > cur,
                         "notes": rel["notes"], "url": rel["url"]})
-            _naive_check_cache.update({"at": time.monotonic(),
+            upd._naive_check_cache.update({"at": time.monotonic(),
                                        "ttl": _NAIVE_CHECK_TTL, "data": out})
             return jsonify(out)
         finally:
@@ -1404,14 +937,14 @@ def api_naive_update():
     apply: замена root-исполняемого файла в LAN без auth недопустима.
     """
     sec._require_local_or_auth()
-    # резолв релиза — по сети, до лока (см. _NAIVE_UPDATE_LAUNCH_LOCK)
+    # резолв релиза — по сети, до лока (см. upd._NAIVE_UPDATE_LAUNCH_LOCK)
     try:
-        rel = _naive_release()
+        rel = upd._naive_release()
     except (RuntimeError, ValueError) as exc:
         abort(502, description=str(exc))
     tag = rel["tag"]
-    with _NAIVE_UPDATE_LAUNCH_LOCK:
-        st = _naive_state()
+    with upd._NAIVE_UPDATE_LAUNCH_LOCK:
+        st = upd._naive_state()
         if st.get("phase") == "running" and not st.get("stale"):
             abort(409, description=f"naive update to {st.get('target')} already "
                                    f"in progress — log: {NAIVE_UPDATE_LOG}")
@@ -1422,14 +955,14 @@ def api_naive_update():
                 f"{time.strftime('%Y-%m-%d %H:%M:%S')}\n", encoding="utf-8")
         except OSError:
             pass  # лог не критичен
-        _naive_state_write({"phase": "running", "target": tag,
+        upd._naive_state_write({"phase": "running", "target": tag,
                             "started": time.time()})
         try:
-            threading.Thread(target=_naive_update_worker, name="naive-update",
+            threading.Thread(target=upd._naive_update_worker, name="naive-update",
                              daemon=True).start()
         except RuntimeError as exc:
             # поток не создался — не висеть «running» до тайм-аута stale
-            _naive_state_write({"phase": "failed", "target": tag,
+            upd._naive_state_write({"phase": "failed", "target": tag,
                                 "finished": time.time(),
                                 "error": f"cannot start worker: {exc}"})
             abort(500, description=f"cannot start update worker: {exc}")
@@ -1447,7 +980,7 @@ def api_naive_status():
         lines = 40
     resp = jsonify({"lines": lines,
                     "content": mon._tail_path(NAIVE_UPDATE_LOG, lines),
-                    "state": _naive_state()})
+                    "state": upd._naive_state()})
     resp.headers["Cache-Control"] = "no-store"
     return resp
 
@@ -1460,33 +993,6 @@ def api_naive_status():
 # (панель продолжает работать старым кодом, пока файлы не вернутся на место),
 # откат бинарника — тот же паттерн, что обновление: rename + рестарт сервиса.
 
-NAIVE_PREV_BIN = NAIVEPROXY_DIR / "backup" / "naive.previous"
-NAIVE_PREV_TAG = NAIVEPROXY_DIR / "backup" / "naive.previous.tag"
-
-
-def _rollback_panel_versions() -> list[dict[str, Any]]:
-    """Версии панели в backup/: [{version, size, ts}], новые сверху.
-
-    Считаем только каталоги строгого vX.Y.Z — мусорные имена туда не попадают.
-    """
-    out: list[dict[str, Any]] = []
-    try:
-        dirs = [d for d in (PANEL_DIR / "backup").iterdir()
-                if d.is_dir() and _TAG_RE.match(d.name)]
-    except OSError:
-        return out
-    for d in dirs:
-        size = 0
-        try:
-            size = sum(f.stat().st_size for f in d.iterdir() if f.is_file())
-            ts = int(d.stat().st_mtime)
-        except OSError:
-            continue
-        out.append({"version": d.name, "size": size, "ts": ts})
-    out.sort(key=lambda v: _ver_key(v["version"]), reverse=True)
-    return out
-
-
 @app.route("/api/rollback")
 def api_rollback_get():
     """Что можно откатить: версии панели в backup/ + прошлый бинарник.
@@ -1497,68 +1003,16 @@ def api_rollback_get():
     """
     binary: dict[str, Any] = {"present": False, "tag": None, "size": 0}
     try:
-        if NAIVE_PREV_BIN.is_file():
+        if upd.NAIVE_PREV_BIN.is_file():
             binary = {"present": True,
-                      "tag": _naive_read(NAIVE_PREV_TAG),
-                      "size": NAIVE_PREV_BIN.stat().st_size}
+                      "tag": upd._naive_read(upd.NAIVE_PREV_TAG),
+                      "size": upd.NAIVE_PREV_BIN.stat().st_size}
     except OSError:
         pass
     return jsonify({"current": APP_VERSION,
-                    "panel": _rollback_panel_versions(),
+                    "panel": upd._rollback_panel_versions(),
                     "binary": binary})
 
-
-def _rollback_binary():
-    """Возврат naive.previous на место бинарника: проверили — заменили —
-    перезапустили, если прокси работал. Синхронно: сеть не нужна, это
-    локальный rename, сервер при этом живёт."""
-    bprev = NAIVE_PREV_BIN
-    if not bprev.is_file():
-        abort(404, description="no naive.previous backup — nothing to roll back to")
-    try:
-        rv = subprocess.run([str(bprev), "--version"], capture_output=True,
-                            text=True, timeout=15)  # nosec B603
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        abort(500, description=f"cannot run backup binary: {exc}")
-    out = (rv.stdout or "").strip().splitlines()
-    if rv.returncode != 0 or not out:
-        abort(500, description="backup binary failed --version check — "
-                               "keeping the current one")
-    new_ver = out[0].strip()
-    prev_tag = _naive_read(NAIVE_PREV_TAG)
-    was_active = mon._status()["active"]
-    try:
-        # тот же rename-паттерн, что обновление: работающий naive доживает
-        # свой инод, ETXTBSY не бывает
-        placed = NAIVE_BIN.with_name(NAIVE_BIN.name + ".new")
-        shutil.copy2(bprev, placed)
-        placed.chmod(0o755)
-        os.replace(placed, NAIVE_BIN)
-        if prev_tag:
-            NAIVE_TAG.write_text(prev_tag + "\n", encoding="utf-8")
-        else:
-            # тег прошлой версии неизвестен; оставить тег текущей — врать
-            # в /api/naive/check, лучше без тега (check возьмёт из бинарника)
-            NAIVE_TAG.unlink(missing_ok=True)
-    except OSError as exc:
-        abort(500, description=f"cannot restore binary: {exc}")
-    _naive_log(f"rollback -> {prev_tag or new_ver}")
-    restarted = False
-    restart_rc = None
-    if was_active and cfg.INIT_SCRIPT.exists():
-        with mon._SERVICE_LOCK:
-            rst = svc._service("restart")
-        restart_rc = rst["rc"]
-        restarted = restart_rc == 0  # «перезапущен» = только при rc==0 (REL-05)
-        _naive_log(f"service restart rc={restart_rc}")
-    _naive_state_write({"phase": "done", "target": prev_tag or new_ver,
-                        "finished": time.time(), "version": new_ver,
-                        "restarted": restarted, "restart_rc": restart_rc,
-                        "rollback": True})
-    app.logger.warning("naive binary rolled back to %s by %s",
-                       prev_tag or new_ver, request.remote_addr)
-    return jsonify({"restored": prev_tag or new_ver, "version": new_ver,
-                    "restarted": restarted, "restart_rc": restart_rc})
 
 
 @app.route("/api/rollback", methods=["POST"])
@@ -1574,12 +1028,12 @@ def api_rollback_post():
     if body.get("binary"):
         # откат бинарника синхронный: гейт + сама операция — под тем же
         # локом, что и запуск naive-update воркера (state у них общий)
-        with _NAIVE_UPDATE_LAUNCH_LOCK:
-            st = _naive_state()
+        with upd._NAIVE_UPDATE_LAUNCH_LOCK:
+            st = upd._naive_state()
             if st.get("phase") == "running" and not st.get("stale"):
                 abort(409, description=f"naive update to {st.get('target')} already "
                                        f"in progress — log: {NAIVE_UPDATE_LOG}")
-            return _rollback_binary()
+            return upd._rollback_binary()
     version = str(body.get("panel") or "")
     if not _TAG_RE.match(version):
         abort(400, description="bad version name — expected vX.Y.Z")
@@ -1589,16 +1043,16 @@ def api_rollback_post():
     if not (backup / "naivepanel.py").is_file():
         abort(404, description=f"no usable backup {version} "
                                f"(need naivepanel.py inside)")
-    with _UPDATE_LAUNCH_LOCK:
-        # state общий с update/apply: re-check под локом (см. _UPDATE_LAUNCH_LOCK)
-        state = _update_state()
+    with upd._UPDATE_LAUNCH_LOCK:
+        # state общий с update/apply: re-check под локом (см. upd._UPDATE_LAUNCH_LOCK)
+        state = upd._update_state()
         if state.get("phase") == "running" and not state.get("stale"):
             abort(409, description=f"update to {state.get('target')} already in "
                                    f"progress — installer log: {UPDATE_LOG}")
         if not PANEL_INIT.exists():
             abort(503, description=f"{PANEL_INIT} not found")
         try:
-            _backup_panel_files()   # откат обратим: текущая версия — тоже в бэкап
+            upd._backup_panel_files()   # откат обратим: текущая версия — тоже в бэкап
             restored = []
             for dst in PANEL_UPDATE_FILES:
                 src = backup / dst.name
@@ -1642,13 +1096,13 @@ def api_rollback_post():
                 start_new_session=True,
             )
         except OSError as exc:
-            _update_state_write({"phase": "failed", "target": version,
+            upd._update_state_write({"phase": "failed", "target": version,
                                  "finished": time.time(),
                                  "error": f"cannot spawn restarter: {exc}"})
             abort(500, description=f"cannot spawn restarter: {exc}")
         # state переиспользуем от update: поднятая старая панель увидит цель,
         # равную своей версии, и закроет «running» как «done»
-        _update_state_write({"phase": "running", "target": version,
+        upd._update_state_write({"phase": "running", "target": version,
                              "started": time.time(), "pid": proc.pid,
                              "rollback": True})
     app.logger.warning("rollback to %s triggered by %s", version,
@@ -1672,7 +1126,7 @@ def api_rollback_delete(version: str):
         shutil.rmtree(target)
     except OSError as exc:
         abort(500, description=f"cannot remove {version}: {exc}")
-    left = [v["version"] for v in _rollback_panel_versions()]
+    left = [v["version"] for v in upd._rollback_panel_versions()]
     app.logger.info("backup %s removed by %s, left: %s", version,
                     request.remote_addr, ", ".join(left) or "none")
     return jsonify({"deleted": version, "left": left})
@@ -1689,7 +1143,7 @@ def api_rollback_cleanup():
     keep = body.get("keep", 1)
     if not isinstance(keep, int) or isinstance(keep, bool) or keep < 0:
         abort(400, description="keep must be a non-negative integer")
-    versions = _rollback_panel_versions()
+    versions = upd._rollback_panel_versions()
     removed = []
     for v in versions[keep:]:
         try:
@@ -1701,7 +1155,7 @@ def api_rollback_cleanup():
         app.logger.info("backups removed by %s: %s", request.remote_addr,
                         ", ".join(removed))
     return jsonify({"removed": removed,
-                    "left": [v["version"] for v in _rollback_panel_versions()]})
+                    "left": [v["version"] for v in upd._rollback_panel_versions()]})
 
 
 # Лог какого хвоста показывать: по умолчанию — naive, src=panel — сама панель

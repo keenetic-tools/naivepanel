@@ -10,19 +10,21 @@
 
 **Tech Stack:** Python 3.10+, Flask, Waitress, vanilla HTML/CSS/JS, pytest, Ruff, Bandit, ShellCheck, Docker/Entware E2E, GitHub Actions.
 
-**Статус (2026-11-05):** Tasks 1–14 + 17 (доки) реализованы; 1–10 в v0.18.0,
-11–13 в v0.19.0, Task 14 (IA/токены/иконки) в рабочем дереве. Task 8
-реализован с уточнением: распаковка осталась системному `tar` (зависимость
-xz не меняется), валидация members — stdlib `tarfile` с fallback на
-`tar -tf` (только имена) для Entware-сборок без `python3-lzma`. Подпись
-релизов и trust-модель для naive-assets выделены в Task 8b и отложены до
-отдельного обсуждения. Остались: 15 (ARCH-01 модули — шаги 1–5/7 закоммичены:
-config b36d575, security 808fbc4, presets 210f6ca, service 9cf8087, monitor
-~1280 строк: e2e+история, watchdog, фейловер, notify, _status, активация;
-в naivepanel.py ~1920 строк — роуты, updates/rollback, log-trim, main;
-далее updates/app по модулю за коммит), 16 (CI gates), 8b;
-финальная release-validation из Task 17 — пререлизным шагом следующего
-релиза.
+**Статус (2026-11-06):** Tasks 1–14 + 16 + 17 (доки) реализованы; 1–10 в
+v0.18.0, 11–13 в v0.19.0, Task 14 (IA/токены/иконки) в рабочем дереве.
+Task 8 реализован с уточнением: распаковка осталась системному `tar`
+(зависимость xz не меняется), валидация members — stdlib `tarfile` с
+fallback на `tar -tf` (только имена) для Entware-сборок без
+`python3-lzma`. Подпись релизов и trust-модель для naive-assets выделены в
+Task 8b и отложены до отдельного обсуждения. Task 16 (CI gates)
+закоммичен 47ad0cd: matrix 3.10–3.13, blocking `pip-audit --strict` по
+runtime-пинам, ShellCheck, SHA-pinned actions, nightly Docker E2E.
+Остались: 15 (ARCH-01 модули — шаги 1–6/7 закоммичены: config b36d575,
+security 808fbc4, presets 210f6ca, service 9cf8087, monitor a901e84,
+updates ~620 строк: self-update, naive-update, rollback; Task 16 —
+47ad0cd CI gates; в naivepanel.py ~1370 строк — роуты, log-trim, main;
+остался финальный app-шаг), 8b; финальная release-validation из Task 17 —
+пререлизным шагом следующего релиза.
 
 ---
 
