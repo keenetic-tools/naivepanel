@@ -24,7 +24,7 @@ MODE_FLAGS="--yes"
 # Контейнер наследует архитектуру хоста. Entware-фид выбираем под неё,
 # иначе E2E не запустится на x86_64 CI-runner (Apple/ARM — aarch64).
 case "$(uname -m)" in
-    x86_64|amd64)  ENTWARE_ARCH=x86-64 ;;
+    x86_64|amd64)  ENTWARE_ARCH=x64-k3.2 ;;
     arm64|aarch64) ENTWARE_ARCH=aarch64-k3.10 ;;
     *) echo "unsupported host arch: $(uname -m)" >&2; exit 2 ;;
 esac
