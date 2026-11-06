@@ -1562,7 +1562,7 @@ def test_import_rejects_traversal_name_in_failover(client, app):
 
 def test_import_rechecks_presets_inside_lock(client, app, monkeypatch):
     _create(client, name="home")
-    real_load = app._load_failover_conf
+    real_load = app.mon._load_failover_conf
     calls = {"n": 0}
 
     def load_and_vanish():
@@ -1571,7 +1571,7 @@ def test_import_rechecks_presets_inside_lock(client, app, monkeypatch):
             (app.CONF_D / "home.json").unlink()
         return real_load()
 
-    monkeypatch.setattr(app, "_load_failover_conf", load_and_vanish)
+    monkeypatch.setattr(app.mon, "_load_failover_conf", load_and_vanish)
     payload = {"presets": {}, "failover": {"enabled": True, "chain": ["home"]}}
     d = client.post("/api/configs/import", json=payload, headers=CSRF).get_json()
     assert d["failover"]["applied"] is False
@@ -1671,7 +1671,7 @@ def _github(monkeypatch, app, release=None, tags=()):
         if "/tags" in url:
             return json.dumps([{"name": t} for t in tags])
         raise AssertionError(f"unexpected url: {url}")
-    monkeypatch.setattr(app, "_http_get", fake_get)
+    monkeypatch.setattr(app.mon, "_http_get", fake_get)
 
 
 def test_latest_release_prefers_newer_tag_over_release(app, monkeypatch):
@@ -1707,7 +1707,7 @@ def test_latest_release_ignores_non_semver_tags(app, monkeypatch):
 def test_latest_release_no_network_raises(app, monkeypatch):
     def dead(url, timeout=6.0):
         raise RuntimeError("timeout")
-    monkeypatch.setattr(app, "_http_get", dead)
+    monkeypatch.setattr(app.mon, "_http_get", dead)
     with pytest.raises(RuntimeError):
         app._latest_release()
 
@@ -1778,7 +1778,7 @@ def _apply_stub(env, monkeypatch, app, tag="v9.9.9"):
     def fake_install(url, timeout=6.0):
         assert f"{tag}/install.sh" in url, f"install.sh должен качаться с тега: {url}"
         return f'#!/bin/sh\necho "ran $*" >> "{marker}"\n'
-    monkeypatch.setattr(app, "_http_get", fake_install)
+    monkeypatch.setattr(app.mon, "_http_get", fake_install)
     return marker
 
 
@@ -1859,7 +1859,7 @@ def test_apply_wrapper_records_installer_exit_code(client, app, env, monkeypatch
     def failing_install(url, timeout=6.0):
         return '#!/bin/sh\nexit 3\n'
 
-    monkeypatch.setattr(app, "_http_get", failing_install)
+    monkeypatch.setattr(app.mon, "_http_get", failing_install)
     r = client.post("/api/update/apply", headers=CSRF)
     assert r.status_code == 202
     for _ in range(50):
@@ -1904,7 +1904,7 @@ def test_apply_502_when_install_sh_fails(client, app, env, monkeypatch):
         if url.endswith("/install.sh"):
             raise RuntimeError("404")
         raise AssertionError(url)
-    monkeypatch.setattr(app, "_http_get", no_install)
+    monkeypatch.setattr(app.mon, "_http_get", no_install)
     assert client.post("/api/update/apply", headers=CSRF).status_code == 502
 
 
@@ -1924,7 +1924,7 @@ def test_apply_concurrent_single_installer(client, app, env, monkeypatch):
         time.sleep(0.15)  # окно гонки: оба запроса в сети одновременно
         return "#!/bin/sh\nexit 0\n"
 
-    monkeypatch.setattr(app, "_http_get", slow_install)
+    monkeypatch.setattr(app.mon, "_http_get", slow_install)
     popens = []
 
     class _Proc:
@@ -2271,7 +2271,7 @@ def test_naive_pick_asset_prefers_static(app):
 def test_naive_release_requires_tag_and_assets(app, monkeypatch):
     def fake_get(url, timeout=6.0):
         return json.dumps({"tag_name": "", "assets": []})
-    monkeypatch.setattr(app, "_http_get", fake_get)
+    monkeypatch.setattr(app.mon, "_http_get", fake_get)
     with pytest.raises(RuntimeError):
         app._naive_release()
 
@@ -2676,7 +2676,7 @@ def test_extract_exit_ip(app):
 def test_e2e_http_listen_full_path(app, monkeypatch):
     # http-listen: CONNECT → 200 → GET → ответ с IP (echo-хост http, без TLS)
     stub = _StubServer(_http_proxy_ok)
-    monkeypatch.setattr(app, "E2E_URL", "http://e2e.example/")
+    monkeypatch.setattr(app.cfg, "E2E_URL", "http://e2e.example/")
     try:
         d = app._proxy_e2e_check(f"http://127.0.0.1:{stub.port}")
         assert d["ok"] is True, d
@@ -2689,7 +2689,7 @@ def test_e2e_http_listen_full_path(app, monkeypatch):
 
 def test_e2e_socks_listen_full_path(app, monkeypatch):
     stub = _StubServer(_socks5_proxy_ok)
-    monkeypatch.setattr(app, "E2E_URL", "http://e2e.example/")
+    monkeypatch.setattr(app.cfg, "E2E_URL", "http://e2e.example/")
     try:
         d = app._proxy_e2e_check(f"socks://127.0.0.1:{stub.port}")
         assert d["ok"] is True, d
@@ -2732,7 +2732,7 @@ def test_e2e_tunnel_ack_but_no_data_fails(app, monkeypatch):
         conn.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
         time.sleep(0.3)  # клиент успеет отправить GET и упереться в закрытие
     stub = _StubServer(handler)
-    monkeypatch.setattr(app, "E2E_URL", "http://e2e.example/")
+    monkeypatch.setattr(app.cfg, "E2E_URL", "http://e2e.example/")
     try:
         d = app._proxy_e2e_check(f"http://127.0.0.1:{stub.port}", timeout=3.0)
         assert d["ok"] is False, d
@@ -2776,7 +2776,7 @@ def test_e2e_endpoint_uses_active_config(client, app, monkeypatch):
     assert r.get_json()["ok"] is False
     # явный listen в теле перекрывает активный конфиг
     stub = _StubServer(_socks5_proxy_ok)
-    monkeypatch.setattr(app, "E2E_URL", "http://e2e.example/")
+    monkeypatch.setattr(app.cfg, "E2E_URL", "http://e2e.example/")
     try:
         r = client.post("/api/e2e", json={"listen": f"socks://127.0.0.1:{stub.port}"},
                         headers=CSRF)
@@ -2962,7 +2962,7 @@ def _fo_e2e(monkeypatch, app, ok, error=None):
     result = {"ok": ok, "ms": 5}
     if error:
         result["error"] = error
-    monkeypatch.setattr(app, "_proxy_e2e_check",
+    monkeypatch.setattr(app.mon, "_proxy_e2e_check",
                         lambda listen: (calls.append(listen), result)[1])
     return calls
 
@@ -2999,13 +2999,13 @@ def test_failover_delete_takes_lock(app, monkeypatch):
 
     class FakeConf:
         def unlink(self):
-            seen.append(app._FAILOVER_LOCK.locked())
+            seen.append(app.mon._FAILOVER_LOCK.locked())
             raise FileNotFoundError
 
         def read_text(self, encoding=None):
             raise FileNotFoundError
 
-    monkeypatch.setattr(app, "FAILOVER_CONF", FakeConf())
+    monkeypatch.setattr(app.cfg, "FAILOVER_CONF", FakeConf())
     assert app.app.test_client().delete(
         "/api/failover", headers=CSRF).status_code == 200
     assert seen == [True]
@@ -3178,8 +3178,8 @@ def test_ui_checkboxes_do_not_stretch(app):
 
 def test_e2e_history_append_load_and_trim(app, monkeypatch):
     # обрезка ленивая (раз в _E2E_TRIM_EVERY аппендов) — здесь на каждом
-    monkeypatch.setattr(app, "E2E_KEEP", 10)
-    monkeypatch.setattr(app, "_E2E_TRIM_EVERY", 1)
+    monkeypatch.setattr(app.cfg, "E2E_KEEP", 10)
+    monkeypatch.setattr(app.cfg, "_E2E_TRIM_EVERY", 1)
     for i in range(12):
         app._e2e_history_append(i % 3 != 0, i)
     entries = app._e2e_history_load(100)
@@ -3224,7 +3224,7 @@ def test_e2e_history_cycle_writes_entries(client, app, monkeypatch):
     # полный цикл: ok-проверка и fail-проверка пишутся в буфер как есть
     fo = _fo_setup(client, app, presets=("home",), chain=("home",))
     results = [{"ok": True, "ms": 30}, {"ok": False, "ms": 0, "error": "x"}]
-    monkeypatch.setattr(app, "_proxy_e2e_check", lambda listen: results.pop(0))
+    monkeypatch.setattr(app.mon, "_proxy_e2e_check", lambda listen: results.pop(0))
     fo.cycle()
     fo.cycle()
     hist = app._e2e_history_load(10)
@@ -3514,7 +3514,7 @@ def test_failover_concurrent_puts_are_serialized(app, monkeypatch):
 
     def slow_save(path, data):
         nonlocal depth, max_depth
-        if not app._FAILOVER_LOCK.locked():
+        if not app.mon._FAILOVER_LOCK.locked():
             lock_missing.append(True)
         with guard:
             depth += 1
@@ -3657,10 +3657,10 @@ def test_auto_return_after_streak_and_probe(client, app, monkeypatch):
     # на третьем — проба живым naive и активация основного
     fo = _fo_setup2(client, app, presets=("home", "backup"),
                     activate="backup", auto_return=True)
-    monkeypatch.setattr(app, "FAILOVER_RETURN_ALIVE", 3)
+    monkeypatch.setattr(app.cfg, "FAILOVER_RETURN_ALIVE", 3)
     _fo_e2e(monkeypatch, app, ok=True)
-    monkeypatch.setattr(app, "_tcp_probe", lambda h, p, timeout=3.0: 5)
-    monkeypatch.setattr(app, "_probe_preset",
+    monkeypatch.setattr(app.mon, "_tcp_probe", lambda h, p, timeout=3.0: 5)
+    monkeypatch.setattr(app.mon, "_probe_preset",
                         lambda cfg, timeout=15.0: {"ok": True, "probe": True})
     assert fo.cycle() is None                    # стрик 1
     assert fo.cycle() is None                    # стрик 2
@@ -3675,11 +3675,11 @@ def test_auto_return_after_streak_and_probe(client, app, monkeypatch):
 def test_auto_return_probe_fail_sets_cooldown(client, app, monkeypatch):
     fo = _fo_setup2(client, app, presets=("home", "backup"),
                     activate="backup", auto_return=True)
-    monkeypatch.setattr(app, "FAILOVER_RETURN_ALIVE", 1)
-    monkeypatch.setattr(app, "_tcp_probe", lambda h, p, timeout=3.0: 5)
+    monkeypatch.setattr(app.cfg, "FAILOVER_RETURN_ALIVE", 1)
+    monkeypatch.setattr(app.mon, "_tcp_probe", lambda h, p, timeout=3.0: 5)
     probes = [{"ok": False, "error": "TLS через туннель не поднялся"},
               {"ok": True, "probe": True}]
-    monkeypatch.setattr(app, "_probe_preset",
+    monkeypatch.setattr(app.mon, "_probe_preset",
                         lambda cfg, timeout=15.0: probes.pop(0))
     _fo_e2e(monkeypatch, app, ok=True)
     ev = fo.cycle()
@@ -3696,11 +3696,11 @@ def test_auto_return_no_streak_no_probe(client, app, monkeypatch):
     # основной мёртв по TCP: стрик не копится, пробу не поднимаем
     fo = _fo_setup2(client, app, presets=("home", "backup"),
                     activate="backup", auto_return=True)
-    monkeypatch.setattr(app, "FAILOVER_RETURN_ALIVE", 2)
+    monkeypatch.setattr(app.cfg, "FAILOVER_RETURN_ALIVE", 2)
     _fo_e2e(monkeypatch, app, ok=True)
-    monkeypatch.setattr(app, "_tcp_probe", lambda h, p, timeout=3.0: None)
+    monkeypatch.setattr(app.mon, "_tcp_probe", lambda h, p, timeout=3.0: None)
     called = []
-    monkeypatch.setattr(app, "_probe_preset",
+    monkeypatch.setattr(app.mon, "_probe_preset",
                         lambda cfg, timeout=15.0: called.append(1) or {"ok": True})
     for _ in range(4):
         assert fo.cycle() is None
@@ -3724,7 +3724,7 @@ def test_cascade_probes_first_alive(client, app, monkeypatch):
         name = "backup" if "backup" in cfg["proxy"] else "dead"
         probed.append(name)
         return {"ok": name == "backup", "probe": True}
-    monkeypatch.setattr(app, "_probe_preset", fake_probe)
+    monkeypatch.setattr(app.mon, "_probe_preset", fake_probe)
     fo.cycle()
     ev = fo.cycle()
     assert ev["event"] == "switched" and ev["to"] == "backup"
@@ -3737,7 +3737,7 @@ def test_cascade_single_candidate_skips_probe(client, app, monkeypatch):
     fo = _fo_setup2(client, app, presets=("home", "backup"))
     _fo_e2e(monkeypatch, app, ok=False, error="x")
     called = []
-    monkeypatch.setattr(app, "_probe_preset",
+    monkeypatch.setattr(app.mon, "_probe_preset",
                         lambda cfg, timeout=10.0: called.append(1) or {"ok": True})
     fo.cycle()
     ev = fo.cycle()
@@ -3766,11 +3766,11 @@ def test_probe_preset_via_stub(app, monkeypatch):
     # проба поднимает naive на свободном порту — подменяем spawn, порт
     # указываем на живой socks-стаб: должен пройти полный E2E через него
     stub = _StubServer(_socks5_proxy_ok)
-    monkeypatch.setattr(app, "NAIVE_BIN", Path("/bin/sh"))  # exists() ✓
-    monkeypatch.setattr(app, "_free_port", lambda: stub.port)
+    monkeypatch.setattr(app.cfg, "NAIVE_BIN", Path("/bin/sh"))  # exists() ✓
+    monkeypatch.setattr(app.mon, "_free_port", lambda: stub.port)
     monkeypatch.setattr(app.subprocess, "Popen",
                         lambda *a, **kw: _FakeProc(alive=True))
-    monkeypatch.setattr(app, "E2E_URL", "http://e2e.example/")
+    monkeypatch.setattr(app.cfg, "E2E_URL", "http://e2e.example/")
     try:
         d = app._probe_preset({"listen": "socks://127.0.0.1:1",
                                "proxy": "https://u:p@h.example"})
@@ -3782,7 +3782,7 @@ def test_probe_preset_via_stub(app, monkeypatch):
 
 
 def test_probe_preset_binary_missing(app, monkeypatch):
-    monkeypatch.setattr(app, "NAIVE_BIN", Path("/nonexistent/naive"))
+    monkeypatch.setattr(app.cfg, "NAIVE_BIN", Path("/nonexistent/naive"))
     d = app._probe_preset({"proxy": "https://u:p@h"})
     assert d["ok"] is False and "не найден" in d["error"]
 
@@ -4012,7 +4012,7 @@ def test_notify_telegram_save_and_get(conf_env, monkeypatch):
         m._bot_cache[token] = ("@testbot", time.monotonic() + 3600)
         return "@testbot"
 
-    monkeypatch.setattr(m, "_tg_bot_name", fake_bot)
+    monkeypatch.setattr(m.mon, "_tg_bot_name", fake_bot)
     c = m.app.test_client()
     token = "123456:abcdefghijklmnopqrstuvwxyz"
     r = c.post("/api/notify/telegram", json={"token": token, "chat_id": "42"},
@@ -4033,7 +4033,7 @@ def test_notify_telegram_save_and_get(conf_env, monkeypatch):
 def test_notify_telegram_empty_token_keeps_existing(conf_env, monkeypatch):
     monkeypatch.setenv("NAIVEPANEL_CONF", str(conf_env))
     m = _reload()
-    monkeypatch.setattr(m, "_tg_bot_name", lambda token: None)
+    monkeypatch.setattr(m.mon, "_tg_bot_name", lambda token: None)
     token = "123:abcdefghijklmnopqrstuvwxyz"
     m._notify_cfg.update({"token": token, "chat": "42", "url": ""})
     c = m.app.test_client()
@@ -4093,7 +4093,7 @@ def test_notify_telegram_save_reports_conf_write_failure(conf_env, monkeypatch):
 def test_notify_telegram_validation(conf_env, monkeypatch):
     monkeypatch.setenv("NAIVEPANEL_CONF", str(conf_env))
     m = _reload()
-    monkeypatch.setattr(m, "_tg_bot_name", lambda token: None)
+    monkeypatch.setattr(m.mon, "_tg_bot_name", lambda token: None)
     c = m.app.test_client()
     good = "123456:abcdefghijklmnopqrstuvwxyz"
     assert c.post("/api/notify/telegram", json={"token": "bad", "chat_id": "42"},
@@ -4137,7 +4137,7 @@ def test_notify_test_sends_and_rate_limits(app, monkeypatch):
                             "chat": "42", "url": ""})
     app._notify_test_last = 0.0
     calls = []
-    monkeypatch.setattr(app, "_notify_send", _notify_send_stub(calls))
+    monkeypatch.setattr(app.mon, "_notify_send", _notify_send_stub(calls))
     c = app.app.test_client()
     assert c.post("/api/notify/test", headers=CSRF).status_code == 200
     assert calls == ["test"]
@@ -4152,7 +4152,7 @@ def test_notify_test_reports_telegram_error(app, monkeypatch):
     app._notify_cfg.update({"token": "123456:abcdefghijklmnopqrstuvwxyz",
                             "chat": "42", "url": ""})
     app._notify_test_last = 0.0
-    monkeypatch.setattr(app, "_notify_send",
+    monkeypatch.setattr(app.mon, "_notify_send",
                         _notify_send_stub([], (False, "chat not found")))
     c = app.app.test_client()
     r = c.post("/api/notify/test", headers=CSRF)
@@ -4178,11 +4178,11 @@ def test_notify_test_throttle_resets_on_reconfigure(conf_env, monkeypatch):
     token = "123456:abcdefghijklmnopqrstuvwxyz"
     monkeypatch.setenv("NAIVEPANEL_CONF", str(conf_env))
     m = _reload()
-    monkeypatch.setattr(m, "_tg_bot_name", lambda token: None)
+    monkeypatch.setattr(m.mon, "_tg_bot_name", lambda token: None)
     m._notify_cfg.update({"token": token, "chat": "42", "url": ""})
     m._notify_test_last = 0.0
     calls = []
-    monkeypatch.setattr(m, "_notify_send", _notify_send_stub(calls))
+    monkeypatch.setattr(m.mon, "_notify_send", _notify_send_stub(calls))
     c = m.app.test_client()
     assert c.post("/api/notify/test", headers=CSRF).status_code == 200
     assert c.post("/api/notify/test", headers=CSRF).status_code == 429
@@ -4203,7 +4203,7 @@ def test_notify_save_warns_when_env_wins(conf_env, monkeypatch):
     monkeypatch.setenv("NAIVEPANEL_CONF", str(conf_env))
     monkeypatch.setenv("NAIVEPANEL_TG_TOKEN", "999:fromenvironment0000000000")
     m = _reload()
-    monkeypatch.setattr(m, "_tg_bot_name", lambda token: None)
+    monkeypatch.setattr(m.mon, "_tg_bot_name", lambda token: None)
     c = m.app.test_client()
     r = c.post("/api/notify/telegram",
                json={"token": "123456:abcdefghijklmnopqrstuvwxyz",
@@ -4241,7 +4241,7 @@ def test_notify_telegram_save_sets_0600(conf_env, monkeypatch):
     conf_env.chmod(0o644)
     monkeypatch.setenv("NAIVEPANEL_CONF", str(conf_env))
     m = _reload()
-    monkeypatch.setattr(m, "_tg_bot_name", lambda token: None)
+    monkeypatch.setattr(m.mon, "_tg_bot_name", lambda token: None)
     r = m.app.test_client().post(
         "/api/notify/telegram",
         json={"token": "123456:abcdefghijklmnopqrstuvwxyz", "chat_id": "42"},
@@ -4295,7 +4295,7 @@ def test_conf_upsert_concurrent_saves_use_unique_temps(conf_env, monkeypatch):
 
 def test_tg_bot_name_non_dict_result(app, monkeypatch):
     for raw in ('{"result": []}', "[]", "null"):
-        monkeypatch.setattr(app, "_http_get",
+        monkeypatch.setattr(app.mon, "_http_get",
                             lambda url, timeout=5, _r=raw: _r)
         app._bot_cache.clear()
         assert app._tg_bot_name("123456:abcdefghijklmnopqrstuvwxyz") is None
@@ -4637,7 +4637,7 @@ def test_expensive_limit_leaves_threads_for_cheap_routes(app):
 def test_probe_concurrency_limit_returns_429(client, app, monkeypatch):
     # залп probe держал по worker-потоку на каждый TCP-коннект (3с таймаут)
     # — waitress исчерпывался и /api/status отваливался. Сверх лимита — 429.
-    monkeypatch.setattr(app, "_EXPENSIVE_SEM", threading.BoundedSemaphore(1))
+    monkeypatch.setattr(app.mon, "_EXPENSIVE_SEM", threading.BoundedSemaphore(1))
     release = threading.Event()
 
     def slow_connect(ep, timeout=None):
@@ -4665,14 +4665,14 @@ def test_probe_concurrency_limit_returns_429(client, app, monkeypatch):
 
 
 def test_e2e_concurrency_limit_returns_429(client, app, monkeypatch):
-    monkeypatch.setattr(app, "_EXPENSIVE_SEM", threading.BoundedSemaphore(1))
+    monkeypatch.setattr(app.mon, "_EXPENSIVE_SEM", threading.BoundedSemaphore(1))
     release = threading.Event()
 
     def slow_check(listen):
         release.wait(timeout=5)
         return {"ok": False, "error": "blocked in test"}
 
-    monkeypatch.setattr(app, "_proxy_e2e_check", slow_check)
+    monkeypatch.setattr(app.mon, "_proxy_e2e_check", slow_check)
     _create(client)
     client.post("/api/configs/home/activate", headers=CSRF)
     t = threading.Thread(
@@ -4722,7 +4722,7 @@ def test_update_check_force_storm_is_coalesced(client, app, monkeypatch):
 
 def test_update_check_429_when_saturated(client, app, monkeypatch):
     app._update_check_cache.clear()
-    monkeypatch.setattr(app, "_EXPENSIVE_SEM", threading.BoundedSemaphore(0))
+    monkeypatch.setattr(app.mon, "_EXPENSIVE_SEM", threading.BoundedSemaphore(0))
     monkeypatch.setattr(app, "_latest_release",
                         lambda: {"tag": "v9.9.9", "notes": "", "url": ""})
     r = client.get("/api/update/check?force=1")
@@ -4973,6 +4973,25 @@ def test_panel_package_service_extraction(app, env, monkeypatch):
     assert st["pid"] == 4242 and st["active"] is True
 
 
+def test_panel_package_monitor_extraction(app, env, monkeypatch):
+    # шаг 5: E2E+история, watchdog, фейловер, уведомления, активация пресетов
+    # и _status — panel/monitor.py; naivepanel.py держит роуты и updates.
+    # Патч монитора на владельце виден роутам; константы — через cfg.
+    import panel.monitor as mon
+    assert mon is app.mon, "mon-модуль должен быть тем же объектом"
+    assert app._status is mon._status
+    assert app._apply_active is mon._apply_active
+    assert app._activate_preset is mon._activate_preset
+    # failover-конфиг монитора читает cfg-владельца: подмена видна
+    class FakeConf:
+        def read_text(self, encoding=None):
+            raise FileNotFoundError
+    monkeypatch.setattr(app.cfg, "FAILOVER_CONF", FakeConf())
+    st = app.app.test_client().get("/api/status").get_json()
+    assert st["failover"]["chain"] == [] and st["watchdog"]["enabled"] is True
+    assert "notify" in st
+
+
 def test_backup_and_restore_include_panel_package(app, env):
     # бэкап/откат обязаны знать о пакете: пропавший panel/*.py после
     # отката панели = нерабочая установка
@@ -4982,18 +5001,22 @@ def test_backup_and_restore_include_panel_package(app, env):
     (pkg / "security.py").write_text("# current security", encoding="utf-8")
     (pkg / "presets.py").write_text("# current presets", encoding="utf-8")
     (pkg / "service.py").write_text("# current service", encoding="utf-8")
+    (pkg / "monitor.py").write_text("# current monitor", encoding="utf-8")
     backup = app._backup_panel_files()
     assert (backup / "panel" / "config.py").read_text() == "# current config"
     assert (backup / "panel" / "security.py").read_text() == "# current security"
     assert (backup / "panel" / "presets.py").read_text() == "# current presets"
     assert (backup / "panel" / "service.py").read_text() == "# current service"
+    assert (backup / "panel" / "monitor.py").read_text() == "# current monitor"
     # симулируем «обновление», затёршее пакет, и откат
     (pkg / "config.py").write_text("# new version", encoding="utf-8")
     (pkg / "security.py").write_text("# new version", encoding="utf-8")
     (pkg / "presets.py").write_text("# new version", encoding="utf-8")
     (pkg / "service.py").write_text("# new version", encoding="utf-8")
+    (pkg / "monitor.py").write_text("# new version", encoding="utf-8")
     import shutil as _sh
-    for name in ("config.py", "security.py", "presets.py", "service.py"):
+    for name in ("config.py", "security.py", "presets.py", "service.py",
+                 "monitor.py"):
         src = backup / "panel" / name
         tmp = (pkg / name).with_name(name + ".restore")
         _sh.copy2(src, tmp)
@@ -5003,7 +5026,7 @@ def test_backup_and_restore_include_panel_package(app, env):
 
 def test_install_sh_ships_panel_package(app):
     src = (APP_DIR / "install.sh").read_text(encoding="utf-8")
-    assert 'PANEL_PKG="__init__.py config.py security.py presets.py service.py"' in src, \
+    assert 'PANEL_PKG="__init__.py config.py security.py presets.py service.py monitor.py"' in src, \
         "installer не качает пакет"
     assert '"$BASE/panel/$f"' in src, "нет загрузки файлов пакета"
     assert 'rm -rf "$PANEL_DIR/panel"' in src, "пакет не заменяется целиком"
@@ -5016,5 +5039,5 @@ def test_sha256sums_covers_panel_package(app):
     listed = {parts[1] for parts in (l.split(maxsplit=1) for l in lines) if len(parts) == 2}
     for f in ("naivepanel.py", "panel/__init__.py", "panel/config.py",
               "panel/security.py", "panel/presets.py", "panel/service.py",
-              "templates/index.html"):
+              "panel/monitor.py", "templates/index.html"):
         assert f in listed, f"{f} нет в SHA256SUMS"

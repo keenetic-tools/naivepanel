@@ -20,7 +20,6 @@ import re
 import queue
 import shutil
 import socket
-import ssl  # E2E-проверка: TLS через туннель прокси, только системные CA
 # subprocess вызывается только с фиксированными argv-списками (shell=False)
 import subprocess  # nosec B404
 import tarfile
@@ -28,7 +27,6 @@ import threading
 import time
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
 
 try:  # не весь Entware-минималистичный python3 несёт lzma
     import lzma  # noqa: F401
@@ -36,7 +34,7 @@ try:  # не весь Entware-минималистичный python3 несёт 
 except ImportError:
     _HAS_LZMA = False
 
-from flask import (Flask, Response, abort, has_request_context, jsonify,
+from flask import (Flask, Response, abort, jsonify,
                    make_response, render_template, request)
 from werkzeug.exceptions import HTTPException
 
@@ -70,1103 +68,9 @@ _reload_or_import("panel.service")
 from panel import service as svc  # модуль-владелец управления сервисом (патчи тестов — сюда)
 from panel.service import *  # noqa: F401,F403 — re-export для совместимости
 
-# --- Фейловер: лок read-modify-write (модуль monitor, ARCH-01) --------
-_FAILOVER_LOCK = threading.Lock()  # PUT / delete / import: read-modify-write
-
-# --- Уведомления (Telegram / webhook) ----------------------------------------
-# Конфиг изменяемый: UI пишет его в panel.conf и сразу обновляет runtime,
-# не перезапуская панель. Секреты живут только здесь и в panel.conf.
-_notify_lock = threading.Lock()
-_notify_cfg: dict[str, str] = {
-    "token": os.environ.get("NAIVEPANEL_TG_TOKEN", ""),
-    "chat": os.environ.get("NAIVEPANEL_TG_CHAT", ""),
-    "url": os.environ.get("NAIVEPANEL_NOTIFY_URL", ""),
-}
-
-
-def _notify_snapshot() -> dict[str, str]:
-    with _notify_lock:
-        return dict(_notify_cfg)
-
-
-def _notify_channel(cfg: dict[str, str] | None = None) -> str | None:
-    c = cfg if cfg is not None else _notify_snapshot()
-    if c.get("token") and c.get("chat"):
-        return "telegram"
-    if c.get("url"):
-        return "webhook"
-    return None
-
-# Дорогие операции (TCP-коннект probe, туннель E2E, внешние update-check)
-# держат worker-поток секунды. Залп таких запросов исчерпал бы все потоки
-# waitress — и панель молчала бы даже на /api/status. Лимит обязан быть
-# МЕНЬШЕ пула потоков (иначе запросы просто сериализует сам waitress, а
-# дешёвые роуты стоят в общей очереди); сверх лимита — немедленный 429.
-_EXPENSIVE_LIMIT = max(1, min(4, WAITRESS_THREADS - 2))
-_EXPENSIVE_SEM = threading.BoundedSemaphore(_EXPENSIVE_LIMIT)
-# Коалесцирование параллельных update-check'ов: один внешний резолв на
-# залп; ждавшие получают только что заполненный кэш (и force тоже — его
-# смысл «свежее, чем TTL», а не «обязательно лично сходить»).
-_UPDATE_FETCH_LOCK = threading.Lock()
-_NAIVE_FETCH_LOCK = threading.Lock()
-# Границы внешних HTTP-запросов метаданных: зависший коннект не должен
-# съедать весь таймаут, безразмерный ответ — память.
-_HTTP_CONNECT_TIMEOUT = 5
-_HTTP_MAX_BYTES = 2 * 1024 * 1024
-
-
-
-# --- E2E-проверка: реальный запрос ЧЕРЕЗ прокси -----------------------------
-# /api/probe отвечает «до upstream есть TCP» — но не «прокси проксирует».
-# Здесь открываем listen-порт активного пресета как клиент и строим туннель
-# до echo-хоста (E2E_URL): HTTP CONNECT для http-listen, SOCKS5 — для socks.
-# Поднявшийся туннель доказывает всю цепочку: listen жив, креды upstream
-# приняты, форвардинг работает, DNS резолвится на стороне прокси. Поверх
-# туннеля — GET за exit-IP (при недоступности echo-хоста туннель всё равно
-# считаем успехом: прокси свою часть выполнил).
-
-
-def _listen_endpoint(listen: str) -> tuple[str, str, int] | None:
-    """listen-URI пресета → (схема, host, port).
-
-    `socks://127.0.0.1:1080` → ("socks", …); `http://127.0.0.1:8080` →
-    ("http", …). Без схемы — socks (то же умолчание, что в _normalize_listen).
-    Порт по умолчанию: 1080 для socks, 8080 для http.
-    """
-    raw = (listen or "").strip()
-    scheme = "socks"
-    if "://" in raw:
-        prefix, _, raw = raw.partition("://")
-        if prefix.lower() in ("socks", "socks5"):
-            scheme = "socks"
-        elif prefix.lower() == "http":
-            scheme = "http"
-        else:
-            return None
-    ep = pres._upstream_endpoint(raw or " ")
-    if not ep:
-        return None
-    host, port = ep
-    if not re.search(r":\d+$", raw):  # порт не указан — умолчания listen
-        port = 1080 if scheme == "socks" else 8080
-    return scheme, host, port
-
-
-def _tcp_probe(host: str, port: int, timeout: float = 3.0) -> int | None:
-    """Голый TCP-коннект до host:port; None = недоступен. Время в мс.
-
-    Дешёвая разведка для ручного «пинга» и авто-возврата: без TLS и кредов.
-    """
-    t0 = time.monotonic()
-    try:
-        with socket.create_connection((host, port), timeout=timeout):
-            pass
-        return round((time.monotonic() - t0) * 1000)
-    except OSError:
-        return None
-
-
-def _free_port() -> int:
-    """Свободный localhost-порт (bind(0)); гонка с системой пренебрежима."""
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
-def _probe_preset(cfg: dict[str, Any], timeout: float = 15.0) -> dict[str, Any]:
-    """Полный E2E пресета-кандидата БЕЗ его активации.
-
-    Поднимаем второй naive прямо из CLI — `--listen socks://127.0.0.1:<порт>
-    --proxy <URI>`, без временных файлов — и гоняем обычную E2E-проверку
-    через этот порт. Так авто-возврат и каскад переключают на проверенно
-    живой пресет, а не на «первый существующий». Креды живут в argv пробного
-    процесса ~15 секунд (однопользовательский роутер — приемлемо); команду
-    в лог не пишем. Схема listen пробы — всегда socks (проверяем upstream).
-    """
-    if not NAIVE_BIN.exists():
-        return {"ok": False, "error": f"бинарник не найден: {NAIVE_BIN}"}
-    proxy_uri = cfg.get("proxy")
-    if not isinstance(proxy_uri, str) or not proxy_uri.strip():
-        return {"ok": False, "error": "у пресета нет proxy"}
-    port = _free_port()
-    # argv-список, shell не используется; команду не логируем (креды)
-    proc = subprocess.Popen(  # nosec B603
-        [str(NAIVE_BIN), f"--listen=socks://127.0.0.1:{port}",
-         f"--proxy={proxy_uri}"],
-        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    try:
-        deadline = time.monotonic() + 3.0
-        while time.monotonic() < deadline:
-            if _tcp_probe("127.0.0.1", port, timeout=0.5) is not None:
-                result = _proxy_e2e_check(f"socks://127.0.0.1:{port}",
-                                          timeout=timeout)
-                result["probe"] = True
-                return result
-            if proc.poll() is not None:
-                return {"ok": False, "probe": True,
-                        "error": "пробный naive упал при старте (проверьте proxy-URI)"}
-            time.sleep(0.2)
-        return {"ok": False, "probe": True,
-                "error": "пробный naive не начал слушать за 3с"}
-    finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
-
-
-def _recv_until(sock: socket.socket, marker: bytes, limit: int = 8192) -> bytes:
-    """Читает из сокета до marker (включительно) или лимита буфера."""
-    buf = b""
-    while marker not in buf and len(buf) < limit:
-        chunk = sock.recv(4096)
-        if not chunk:
-            break
-        buf += chunk
-    return buf
-
-
-def _recv_exact(sock: socket.socket, count: int) -> bytes:
-    """Ровно count байт; короткое чтение — что успели."""
-    buf = b""
-    while len(buf) < count:
-        chunk = sock.recv(count - len(buf))
-        if not chunk:
-            break
-        buf += chunk
-    return buf
-
-
-def _http_connect_via_proxy(sock: socket.socket, host: str, port: int,
-                            timeout: float) -> str | None:
-    """HTTP-прокси: CONNECT host:port; None = туннель поднят."""
-    sock.settimeout(timeout)
-    sock.sendall((f"CONNECT {host}:{port} HTTP/1.1\r\n"
-                  f"Host: {host}:{port}\r\n"
-                  "User-Agent: naivepanel-e2e\r\n\r\n").encode())
-    head = _recv_until(sock, b"\r\n\r\n")
-    if b"\r\n\r\n" not in head:
-        return "прокси не ответил на CONNECT"
-    status = head.split(b"\r\n", 1)[0]
-    try:
-        code = int(status.split()[1])
-    except (IndexError, ValueError):
-        return f"нечитаемый ответ на CONNECT: {status[:60]!r}"
-    if code != 200:
-        # 407/502 — например, upstream отверг креды из активного пресета
-        return f"CONNECT отклонён прокси: HTTP {code}"
-    return None
-
-
-def _socks5_connect_via_proxy(sock: socket.socket, host: str, port: int,
-                              timeout: float) -> str | None:
-    """SOCKS5-прокси: greeting + CONNECT (без auth); None = туннель поднят."""
-    sock.settimeout(timeout)
-    sock.sendall(b"\x05\x01\x00")  # VER5, 1 метод, NO-AUTH
-    hello = _recv_exact(sock, 2)
-    if len(hello) < 2:
-        return "прокси оборвал SOCKS-приветствие"
-    if hello[0] != 5:
-        return "listen-порт отвечает не по SOCKS5"
-    if hello[1] != 0x00:
-        return "SOCKS-прокси требует аутентификацию (проверка её не поддерживает)"
-    # CONNECT с именем хоста (ATYP=домен): DNS резолвится на стороне прокси
-    sock.sendall(b"\x05\x01\x00\x03" + bytes([len(host)]) + host.encode()
-                 + port.to_bytes(2, "big"))
-    head = _recv_exact(sock, 4)
-    if len(head) < 4 or head[0] != 5:
-        return "прокси оборвал/испортил SOCKS-ответ"
-    if head[1] != 0:
-        return f"SOCKS CONNECT отклонён прокси (rep={head[1]})"
-    # остаток ответа (BND.ADDR/BND.PORT) вычитываем целиком — иначе он
-    # попадёт в начало HTTP-ответа echo-сервера
-    atyp = head[3]
-    if atyp == 1:
-        rest = _recv_exact(sock, 4 + 2)
-    elif atyp == 3:
-        ln = _recv_exact(sock, 1)
-        if not ln:
-            return "прокси оборвал SOCKS-ответ (ATYP=домен)"
-        rest = _recv_exact(sock, ln[0] + 2)
-    elif atyp == 4:
-        rest = _recv_exact(sock, 16 + 2)
-    else:
-        return f"SOCKS-ответ с неизвестным ATYP={atyp}"
-    if not rest:
-        return "прокси оборвал SOCKS-ответ"
-    return None
-
-
-def _get_via_tunnel(sock: socket.socket, host: str, path: str,
-                    use_tls: bool, timeout: float) -> tuple[str | None, str | None]:
-    """GET через установленный туннель; (body, error) — ровно один не None.
-
-    HTTP/1.0 + Connection: close: ответ без chunked, читаем до EOF.
-    """
-    if use_tls:
-        try:
-            sock = ssl.create_default_context().wrap_socket(sock, server_hostname=host)
-        except (ssl.SSLError, OSError) as exc:
-            return None, f"TLS через туннель не поднялся: {exc}"
-    sock.settimeout(timeout)
-    sock.sendall((f"GET {path} HTTP/1.0\r\n"
-                  f"Host: {host}\r\n"
-                  "User-Agent: naivepanel-e2e\r\nAccept: */*\r\n"
-                  "Connection: close\r\n\r\n").encode())
-    buf = b""
-    while len(buf) < 16384:
-        try:
-            chunk = sock.recv(4096)
-        except (ssl.SSLEOFError, ssl.SSLError, OSError):
-            break
-        if not chunk:
-            break
-        buf += chunk
-    head, sep, body = buf.partition(b"\r\n\r\n")
-    if not sep:
-        return None, "echo-сервер не вернул HTTP-ответ"
-    code = head.split(b"\r\n", 1)[0].split()
-    if len(code) < 2 or code[1] != b"200":
-        got = code[1].decode("latin-1", "replace") if len(code) >= 2 else "?"
-        return None, f"echo-сервер ответил HTTP {got}"
-    # пустое тело — валидный ответ: прокси работает, exit-IP просто не распознан
-    return body.decode("utf-8", "replace").strip(), None
-
-
-_IPV4_RE = re.compile(r"\b(\d{1,3}(?:\.\d{1,3}){3})\b")
-_IPV6_RE = re.compile(r"(?<![0-9a-fA-F:.])(?:[0-9a-fA-F]{0,4}:){3,7}[0-9a-fA-F]{0,4}(?![0-9a-fA-F:.])")
-
-
-def _extract_exit_ip(text: str) -> str | None:
-    """IPv4/IPv6 из ответа echo-сервера (plain или JSON)."""
-    m = _IPV4_RE.search(text)
-    if m:
-        return m.group(1)
-    try:
-        data = json.loads(text)
-    except (json.JSONDecodeError, ValueError):
-        data = None
-    if isinstance(data, dict) and isinstance(data.get("ip"), str):
-        return data["ip"]
-    m6 = _IPV6_RE.search(text)
-    return m6.group(0) if m6 else None
-
-
-def _proxy_e2e_check(listen_uri: str, timeout: float = E2E_TIMEOUT) -> dict[str, Any]:
-    """Прогоняет один реальный запрос через listen naive (см. E2E_URL).
-
-    ok=True — только полный ответ echo-хоста через туннель (exit_ip может
-    быть None с note, если ответ не распознан). Подтверждённый, но
-    «мёртвый» туннель (ACK, затем обрыв — так ведёт себя naive при лежащем
-    upstream) — это ok:False с причиной.
-    """
-    t0 = time.monotonic()
-
-    def _ms() -> int:
-        return int((time.monotonic() - t0) * 1000)
-
-    ep = _listen_endpoint(listen_uri)
-    if not ep:
-        return {"ok": False, "ms": _ms(), "error": f"listen не распознан: {listen_uri!r}"}
-    scheme, lhost, lport = ep
-
-    parts = urlsplit(E2E_URL)
-    echo_host = parts.hostname
-    if not echo_host:
-        return {"ok": False, "ms": _ms(), "error": f"NAIVEPANEL_E2E_URL некорректен: {E2E_URL!r}"}
-    echo_port = parts.port or (443 if parts.scheme == "https" else 80)
-    echo_path = parts.path or "/"
-    use_tls = parts.scheme == "https"
-
-    sock: socket.socket | None = None
-    try:
-        sock = socket.create_connection((lhost, lport), timeout=min(5.0, timeout))
-        tunnel = (_http_connect_via_proxy if scheme == "http"
-                  else _socks5_connect_via_proxy)
-        err = tunnel(sock, echo_host, echo_port, timeout)
-        if err:
-            return {"ok": False, "ms": _ms(), "error": err}
-        body, err = _get_via_tunnel(sock, echo_host, echo_path, use_tls, timeout)
-        if err is not None:
-            # Туннель мог быть подтверждён формально, а данные не пошли —
-            # так ведёт себя naive при лежащем upstream: ACK на CONNECT,
-            # затем обрыв (TLS EOF). Это НЕУДАЧА проверки: успех — только
-            # полный ответ echo-хоста через туннель. От разовых осечек
-            # самого echo-хоста защищает порог фейловера, не «оговорка».
-            return {"ok": False, "ms": _ms(), "error": err}
-        ip = _extract_exit_ip(body)
-        return {"ok": True, "ms": _ms(), "exit_ip": ip,
-                "note": None if ip else "ответ echo-сервера получен, exit-IP не распознан"}
-    except ConnectionRefusedError:
-        return {"ok": False, "ms": _ms(),
-                "error": f"{lhost}:{lport} не принимает соединения — прокси остановлен?"}
-    except (socket.timeout, ssl.SSLError, OSError) as exc:
-        return {"ok": False, "ms": _ms(), "error": f"{type(exc).__name__}: {exc}"}
-    finally:
-        if sock is not None:
-            try:
-                sock.close()
-            except OSError:
-                pass
-
-
-def _active_listen() -> str | None:
-    """listen активного пресета из config.json (первый адрес, если массив)."""
-    try:
-        cfg = json.loads(ACTIVE_CONFIG.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    raw = cfg.get("listen")
-    if isinstance(raw, list):
-        raw = raw[0] if raw else None
-    if isinstance(raw, str) and raw.strip():
-        return raw.strip()
-    return None
-
-
-# --- История E2E-проверок: кольцевой буфер -----------------------------------
-
-_e2e_since_trim = 0
-
-
-def _e2e_history_append(ok: bool, ms: int | None) -> None:
-    """Одна запись {t, ok, ms} в JSONL-буфер; периодически обрезаем хвост.
-
-    Файл маленький (десятки КБ), пишет только поток монитора раз в интервал —
-    простой append с редкой обрезкой дешевле переписывания всего файла.
-    Ошибка записи не должна ронять монитор — предупреждение в лог.
-    """
-    global _e2e_since_trim
-    try:
-        E2E_HISTORY.parent.mkdir(parents=True, exist_ok=True)
-        with E2E_HISTORY.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps({"t": int(time.time()), "ok": bool(ok),
-                                 "ms": int(ms or 0)}) + "\n")
-        _e2e_since_trim += 1
-        if _e2e_since_trim >= _E2E_TRIM_EVERY:
-            _e2e_since_trim = 0
-            _e2e_history_trim()
-    except OSError as exc:
-        app.logger.warning("e2e history append failed: %s", exc)
-
-
-def _e2e_history_trim() -> None:
-    """Оставляем последние E2E_KEEP записей (атомарная замена файла)."""
-    try:
-        lines = _e2e_history_read_all()
-    except OSError:
-        return
-    if len(lines) <= E2E_KEEP:
-        return
-    tmp = E2E_HISTORY.with_suffix(".jsonl.tmp")
-    try:
-        with tmp.open("w", encoding="utf-8") as fh:
-            # splitlines() срезает \n — восстанавливаем, иначе записи склеятся
-            fh.write("\n".join(lines[-E2E_KEEP:]) + "\n")
-        tmp.replace(E2E_HISTORY)
-    except OSError as exc:
-        app.logger.warning("e2e history trim failed: %s", exc)
-
-
-def _e2e_history_read_all() -> list[str]:
-    """Все строки буфера (сырые); отсутствие файла — пустой список."""
-    try:
-        return E2E_HISTORY.read_text(encoding="utf-8").splitlines()
-    except FileNotFoundError:
-        return []
-
-
-def _e2e_history_load(last: int) -> list[dict[str, Any]]:
-    """Последние `last` записей буфера, старые → новые; битые строки skipped."""
-    out: list[dict[str, Any]] = []
-    for line in _e2e_history_read_all():
-        try:
-            entry = json.loads(line)
-            if (isinstance(entry, dict) and isinstance(entry.get("t"), int)
-                    and isinstance(entry.get("ok"), bool)):
-                out.append({"t": entry["t"], "ok": entry["ok"],
-                            "ms": int(entry.get("ms") or 0)})
-        except (json.JSONDecodeError, ValueError, TypeError):
-            continue  # обрыв записи (панель упала посреди append) — пропускаем
-    return out[-last:]
-
-
-# --- Service control ------------------------------------------------------
-
-def _status() -> dict[str, Any]:
-    active_name = pres._active_name()
-    has_init = cfg.INIT_SCRIPT.exists()
-    running, pid, uptime = svc._proxy_running()
-    # _status() зовут и фоновые потоки (naive-update, rollback): вне request
-    # context request.authorization бросил бы RuntimeError.
-    auth = request.authorization if has_request_context() else None
-    channel = _notify_channel()
-    return {
-        "version": APP_VERSION,
-        "active": running,
-        "pid": pid,
-        "uptime": uptime,
-        "current": active_name,
-        "init_script": str(cfg.INIT_SCRIPT),
-        "init_present": has_init,
-        "watchdog": _watchdog.snapshot(),
-        "failover": _failover.snapshot(),
-        "notify": {"enabled": channel is not None,
-                   "channel": channel,
-                   "pending": len(_notify_pending_all())},
-        "auth": {"enabled": PANEL_ADMIN_PASS.exists(),
-                 "user": auth.username if auth else None},
-    }
-
-
-# --- Уведомления: очередь + sender-поток --------------------------------------
-
-_notify_queue: "queue.Queue[tuple[str, str]]" = queue.Queue()
-_notify_last: dict[str, float] = {}  # event → epoch последней постановки (дедуп)
-
-
-def _notify(event: str, text: str, dedupe_s: float = 60.0) -> None:
-    """Поставить событие в очередь уведомлений; вызывается из потоков монитора.
-
-    Дедуп: одинаковое событие не чаще раза в dedupe_s — каскад из трёх
-    переключений не должен заспамить чат. Для «доступно обновление» окно
-    больше (6ч), чтобы не напоминать при каждом открытии страницы.
-    """
-    if _notify_channel() is None:
-        return
-    now = time.time()
-    if now - _notify_last.get(event, 0.0) < dedupe_s:
-        return
-    _notify_last[event] = now
-    _notify_queue.put((event, text))
-
-
-def _notify_send(event: str, text: str,
-                 detail: bool = False) -> bool | tuple[bool, str]:
-    """Доставка: сначала через активный naive, затем напрямую.
-
-    detail=True → (ok, error) для кнопки «тест»; иначе bool (как раньше).
-    """
-    cfg = _notify_snapshot()
-    channel = _notify_channel(cfg)
-    if channel is None:
-        return (False, "уведомления не настроены") if detail else False
-    if channel == "telegram":
-        url = f"https://api.telegram.org/bot{cfg['token']}/sendMessage"
-        body: dict[str, Any] = {"chat_id": cfg["chat"], "text": text,
-                                "disable_web_page_preview": True}
-    else:
-        url, body = cfg["url"], {"event": event, "text": text,
-                                 "ts": int(time.time())}
-    post = ["-H", "Content-Type: application/json", "-d", json.dumps(body)]
-    errors: list[str] = []
-
-    def attempt(prefix: list[str], timeout: int) -> bool:
-        try:
-            res = svc._run([*prefix, *post, url], timeout=timeout)
-        except HTTPException as exc:
-            errors.append(str(exc.description or exc))
-            return False
-        if res["rc"] == 0:
-            return True
-        errors.append(res["stderr"] or f"curl rc={res['rc']}")
-        return False
-
-    listen = _active_listen()
-    ep = _listen_endpoint(listen) if listen else None
-    if ep and _tcp_probe(ep[1], ep[2], timeout=1.0) is not None:
-        proxy = f"{'socks5h' if ep[0] == 'socks' else 'http'}://{ep[1]}:{ep[2]}"
-        if attempt(["curl", "-fsS", "--max-time", "15", "-x", proxy], 20):
-            return (True, "") if detail else True
-    if attempt(["curl", "-fsS", "--max-time", "10"], 15):
-        return (True, "") if detail else True
-    if detail:
-        err = errors[-1] if errors else "delivery failed"
-        for secret in (cfg.get("token"), cfg.get("url")):
-            if secret:
-                err = err.replace(secret, "***")
-        return False, err[:300]
-    return False
-
-
-# --- Pending: недоставленные события ждут оживания любого пути ---------------
-
-NOTIFY_PENDING = PANEL_DIR / "notify-pending.jsonl"
-_NOTIFY_PENDING_CAP = 50
-
-
-def _notify_pending_append(event: str, text: str) -> None:
-    """Событие в файл-очередь (переживает рестарт панели); cap по последним."""
-    try:
-        PANEL_DIR.mkdir(parents=True, exist_ok=True)
-        lines = [str(x) for x in _notify_pending_all(raw=True)]
-        lines.append(json.dumps({"event": event, "text": text,
-                                 "ts": int(time.time())}))
-        tmp = NOTIFY_PENDING.with_suffix(".jsonl.tmp")
-        with tmp.open("w", encoding="utf-8") as fh:
-            fh.write("\n".join(lines[-_NOTIFY_PENDING_CAP:]) + "\n")
-        tmp.replace(NOTIFY_PENDING)
-    except OSError as exc:
-        app.logger.warning("notify pending append failed: %s", exc)
-
-
-def _notify_pending_all(raw: bool = False) -> list[Any]:
-    """Отложенные события (старые → новые); битые строки пропускаем."""
-    try:
-        lines = NOTIFY_PENDING.read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return []
-    if raw:
-        return lines
-    out: list[Any] = []
-    for line in lines:
-        try:
-            item = json.loads(line)
-            if isinstance(item, dict) and item.get("event") and item.get("text"):
-                out.append(item)
-        except (json.JSONDecodeError, ValueError):
-            continue
-    return out
-
-
-def _notify_flush_pending() -> int:
-    """Доставить отложенные: до 5 за тик, стоп на первой неудаче (не долбим)."""
-    items = _notify_pending_all()
-    if not items:
-        return 0
-    delivered = 0
-    kept_from: int | None = None
-    for i, item in enumerate(items[:5]):
-        if _notify_send(item["event"], item["text"]):
-            delivered += 1
-            app.logger.warning(
-                "notify: доставлено отложенное %s (событие %s)",
-                item["event"],
-                time.strftime("%H:%M:%S", time.localtime(item.get("ts", 0))))
-        else:
-            kept_from = i
-            break
-    if delivered:
-        kept = items[kept_from:] if kept_from is not None else items[5:]
-        try:
-            tmp = NOTIFY_PENDING.with_suffix(".jsonl.tmp")
-            with tmp.open("w", encoding="utf-8") as fh:
-                fh.write("\n".join(json.dumps(i) for i in kept)
-                         + ("\n" if kept else ""))
-            tmp.replace(NOTIFY_PENDING)
-        except OSError as exc:
-            app.logger.warning("notify pending flush failed: %s", exc)
-    return delivered
-
-
-def _notify_tick(timeout: float = 30.0) -> None:
-    if _notify_channel() is not None:
-        _notify_flush_pending()
-    try:
-        event, text = _notify_queue.get(timeout=timeout)
-    except queue.Empty:
-        return
-    if _notify_send(event, text):
-        return
-    if _notify_channel() is None:
-        app.logger.info("notify %s: канал отключён — событие отброшено", event)
-        return
-    app.logger.warning(
-        "notify %s: все пути недоступны (прокси и напрямую) — отложено",
-        event)
-    _notify_pending_append(event, text)
-
-
-def _notify_loop() -> None:
-    while True:
-        try:
-            _notify_tick()
-        except Exception:
-            app.logger.exception("notify loop error — продолжаю")
-            time.sleep(1)
-
-
-# --- Настройка Telegram: валидация, кэш имени бота, upsert panel.conf --------
-
-_TG_TOKEN_RE = re.compile(r"^[0-9]{5,}:[A-Za-z0-9_-]{20,}$")
-_TG_CHAT_RE = re.compile(r"^(-?[0-9]{1,20}|@[A-Za-z][A-Za-z0-9_]{3,31})$")
-_bot_cache: dict[str, tuple[str | None, float]] = {}
-_BOT_TTL = 3600.0
-_BOT_NEG_TTL = 300.0
-
-
-def _tg_bot_name(token: str) -> str | None:
-    """@username бота через getMe; положительный кэш 1ч, отрицательный 5м."""
-    if not token:
-        return None
-    now = time.monotonic()
-    hit = _bot_cache.get(token)
-    if hit and hit[1] > now:
-        return hit[0]
-    name = None
-    try:
-        raw = _http_get(f"https://api.telegram.org/bot{token}/getMe", timeout=5)
-        payload = json.loads(raw)
-        result = payload.get("result") if isinstance(payload, dict) else None
-        username = result.get("username") if isinstance(result, dict) else None
-        name = f"@{username}" if username else None
-    except (RuntimeError, ValueError, KeyError, TypeError):
-        pass
-    _bot_cache[token] = (name, now + (_BOT_TTL if name else _BOT_NEG_TTL))
-    return name
-
-
-# --- Watchdog: авто-рестарт упавшего naive ----------------------------------
-
-
-class _Watchdog:
-    """Следит за переходом naive running→down и поднимает его обратно.
-
-    Реагирует ТОЛЬКО на переход вниз, observed при живой панели: после
-    старта панели «прокси не работает» — не сигнал (неизвестно, остановили
-    ли его руками до нас; автозапуск делает init-скрипт). Штатный stop
-    init-скрипт маркирует файлом STOP_MARKER — тогда панель не вмешивается.
-    Флаппинг (падает сразу после старта) гасим: WATCHDOG_FLAP_MAX рестартов
-    за WATCHDOG_FLAP_WINDOW — и watchdog отключается до рестарта панели.
-    """
-
-    def __init__(self, flap_max: int = WATCHDOG_FLAP_MAX,
-                 flap_window: float = WATCHDOG_FLAP_WINDOW) -> None:
-        self._prev_running: bool | None = None
-        self._restarts: list[float] = []
-        self._flap_max = flap_max
-        self._flap_window = flap_window
-        self.tripped = False   # отключился из-за флаппинга
-        self.count = 0         # рестартов за жизнь панели
-
-    def snapshot(self) -> dict[str, Any]:
-        return {"enabled": WATCHDOG_ENABLED, "restarts": self.count,
-                "tripped": self.tripped}
-
-    def _flapped(self, now: float) -> bool:
-        self._restarts = [t for t in self._restarts if now - t < self._flap_window]
-        return len(self._restarts) >= self._flap_max
-
-    def observe(self, recheck_delay: float = WATCHDOG_RECHECK_S) -> dict[str, Any] | None:
-        """Один тик; возвращает событие (см. тесты) или None, если всё тихо."""
-        running, _, _ = svc._proxy_running()
-        prev, self._prev_running = self._prev_running, running
-        if prev is None or prev == running:
-            return None
-        if running:  # down→up: поднялся (руками или сам) — просто фиксируем
-            return None
-        # up→down: crash или чей-то stop/restart. Пауза закрывает гонку с
-        # init-скриптом: stop() пишет маркер ДО kill, а restart() между
-        # stop и start пару секунд держит сервис вниз — за паузу маркер
-        # появится (штатный stop) или сервис вернётся (рестарт).
-        if recheck_delay > 0:
-            time.sleep(recheck_delay)
-            running, _, _ = svc._proxy_running()
-            if running:
-                return None
-        if STOP_MARKER.exists():
-            return {"event": "stopped"}   # штатный stop — не вмешиваемся
-        if not cfg.INIT_SCRIPT.exists():
-            return {"event": "no-init"}
-        if self.tripped:
-            return {"event": "down-tripped"}
-        now = time.time()
-        if self._flapped(now):
-            self.tripped = True
-            return {"event": "tripped"}
-        self._restarts.append(now)
-        self.count += 1
-        with _SERVICE_LOCK:
-            res = svc._service("start")
-        return {"event": "restarted", "rc": res.get("rc"),
-                "stderr": res.get("stderr")}
-
-
-_watchdog = _Watchdog()
-
-
-def _watchdog_loop() -> None:
-    # daemon-поток, как log-trim: каждая итерация под try, чтобы неожиданная
-    # ошибка не убила цикл целиком
-    while True:
-        try:
-            ev = _watchdog.observe()
-            if ev is not None:
-                if ev["event"] == "restarted":
-                    if ev.get("rc") == 0:
-                        app.logger.warning(
-                            "watchdog: naive упал — перезапущен (рестартов: %d)",
-                            _watchdog.count)
-                        _notify("watchdog_restart",
-                                f"NaivePanel: naive упал — watchdog перезапустил "
-                                f"(рестартов: {_watchdog.count})")
-                    else:
-                        app.logger.error(
-                            "watchdog: naive упал, перезапуск НЕ удался: rc=%s %s",
-                            ev.get("rc"), ev.get("stderr") or "")
-                        _notify("watchdog_restart_failed",
-                                "NaivePanel: naive упал, перезапуск НЕ удался — "
-                                "загляните в панель")
-                elif ev["event"] == "tripped":
-                    app.logger.error(
-                        "watchdog: naive падает %d раз за %dс — авто-рестарт "
-                        "отключён до перезапуска панели; проверьте лог прокси",
-                        WATCHDOG_FLAP_MAX, int(WATCHDOG_FLAP_WINDOW))
-                    _notify("watchdog_tripped",
-                            f"NaivePanel: naive падает {WATCHDOG_FLAP_MAX} раз за "
-                            f"{int(WATCHDOG_FLAP_WINDOW)}с — авто-рестарт отключён, "
-                            f"нужно вмешательство")
-                elif ev["event"] == "down-tripped":
-                    app.logger.error("watchdog: naive снова вниз — стоим (отключён)")
-                elif ev["event"] == "stopped":
-                    app.logger.info("watchdog: штатный stop (маркер) — не вмешиваюсь")
-        except Exception:  # один сбойный тик не должен останавливать поток
-            app.logger.warning("watchdog cycle failed", exc_info=True)
-        time.sleep(WATCHDOG_INTERVAL)
-
-
-# --- Автофейловер: монитор цепочки пресетов ----------------------------------
-
-
-def _load_failover_conf() -> dict[str, Any]:
-    """failover.json → конфиг монитора; без файла — всё выключено.
-
-    Битый файл трактуем как «выключен»: монитор не должен падать из-за
-    руки, поправившей JSON мимо панели. auto_return — opt-in (v0.14).
-    """
-    empty = {"enabled": False, "chain": [], "auto_return": False}
-    try:
-        data = json.loads(FAILOVER_CONF.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return empty
-    if not isinstance(data, dict):
-        return empty
-    chain = data.get("chain")
-    if not isinstance(chain, list):
-        chain = []
-    # stale/невалидные имена (в т.ч. попытки path traversal) не участвуют
-    chain = [n for n in chain
-             if isinstance(n, str) and NAME_RE.match(n)
-             and (CONF_D / f"{n}.json").exists()]
-    enabled = bool(data.get("enabled")) and bool(chain)
-    auto_return = data.get("auto_return") is True and enabled
-    return {"enabled": enabled, "chain": chain,
-            "auto_return": auto_return}
-
-
-def _preset_cfg(name: str) -> dict[str, Any] | None:
-    """Конфиг пресета из conf.d для пробы (без HTTP-исключений)."""
-    try:
-        data = json.loads((CONF_D / f"{name}.json").read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    return data if isinstance(data, dict) else None
-
-
-class _Failover:
-    """Периодическая E2E-проверка активного пресета, переключение по цепочке.
-
-    Только вперёд, на следующий пресет цепочки; назад (на основной) —
-    вручную: авто-возврат — источник флаппинга. Гистерезис — THRESHOLD
-    неудач подряд: одна осечка (в т.ч. разовый сбой echo-хоста) — не повод
-    переключать. Неудача — всё, кроме полного ответа echo-хоста, включая
-    «туннель подтверждён, но данные не пошли» (лежащий upstream за живым
-    naive; найдено в бою на v0.12.2, фикс в v0.13).
-    """
-
-    def __init__(self, threshold: int = FAILOVER_THRESHOLD) -> None:
-        self._threshold = threshold
-        self._fails = 0
-        self._last_check: float | None = None
-        self._last_ok: bool | None = None
-        self._last_error: str | None = None
-        self._last_ms: int | None = None
-        self._last_switch: float | None = None
-        self.switches = 0
-        self.returns = 0          # авто-возвратов на основной
-        self.hot = False          # последняя проверка провалена — пробуем часто
-        self._exhausted_announced = False
-        self.idle_reason: str | None = None
-        self._streaks: dict[str, int] = {}    # TCP-живых подряд (авто-возврат)
-        self._cooldown: dict[str, float] = {} # кандидат → epoch конца cooldown
-        self._return_watch: dict[str, Any] | None = None  # для UI «ждём возврата»
-
-    def snapshot(self) -> dict[str, Any]:
-        conf = _load_failover_conf()
-        active = pres._active_name()
-        idx = conf["chain"].index(active) if active in conf["chain"] else None
-        # Динамические причины паузы перепроверяем: idle_reason — итог
-        # ПОСЛЕДНЕГО цикла монитора, и до следующего цикла (до 30с) мог
-        # появиться пресет / сняться маркер stop. Показывать устаревшую
-        # паузу рядом со свежим active_index — противоречие в статусе.
-        idle = self.idle_reason
-        if idle == "прокси остановлен вручную" and not STOP_MARKER.exists():
-            idle = None
-        elif idle == "нет активного пресета с listen" and active and _active_listen():
-            idle = None
-        return {
-            "enabled": FAILOVER_ENABLED and conf["enabled"],
-            "monitor": FAILOVER_ENABLED,
-            "chain": conf["chain"],
-            "chain_max": FAILOVER_CHAIN_MAX,
-            "active_index": idx,
-            "threshold": self._threshold,
-            "interval": FAILOVER_INTERVAL,
-            "fast_interval": FAILOVER_FAST,
-            "probing_fast": self.hot,
-            "fails": self._fails,
-            "last_check": self._last_check,
-            "last_ok": self._last_ok,
-            "last_error": self._last_error,
-            "last_ms": self._last_ms,
-            "switches": self.switches,
-            "returns": self.returns,
-            "auto_return": FAILOVER_ENABLED and conf["auto_return"],
-            "return_watch": self._return_watch,
-            "last_switch": self._last_switch,
-            "idle": idle,
-        }
-
-    def _idle(self, reason: str) -> None:
-        self.idle_reason = reason
-        self._fails = 0
-        self.hot = False
-
-    def cycle(self) -> dict[str, Any] | None:
-        """Один тик монитора; возвращает событие для лога или None.
-
-        Монитор всегда проверяет активный пресет и пишет результат в историю
-        (спарклайн в UI); фейловер-переключения — только когда цепочка
-        настроена и активный пресет в ней. idle_reason выставляется только
-        когда проверки НЕ идут (прокси остановлен / нет пресета).
-        """
-        conf = _load_failover_conf()
-        if not FAILOVER_ENABLED:
-            self._idle("монитор выключен")
-            return None
-        if STOP_MARKER.exists():
-            self._idle("прокси остановлен вручную")
-            return None
-        active = pres._active_name()
-        listen = _active_listen() if active else None
-        if not listen:
-            self._idle("нет активного пресета с listen")
-            return None
-        self.idle_reason = None
-
-        result = _proxy_e2e_check(listen)
-        self._last_check = time.time()
-        self._last_ok = bool(result.get("ok"))
-        self._last_error = result.get("error") or result.get("note")
-        self._last_ms = result.get("ms")
-        _e2e_history_append(self._last_ok, self._last_ms)
-
-        # дальше — только логика переключений; история пишется в любом случае
-        armed = conf["enabled"] and active in conf["chain"]
-        self.hot = armed and not result.get("ok")  # неудача → частые проверки
-        if result.get("ok"):
-            self._fails = 0
-            self._exhausted_announced = False
-            idx = conf["chain"].index(active) if armed else None
-            if armed and conf["auto_return"] and idx and idx > 0:
-                return self._try_return(conf, active, idx)
-            return None
-        if not armed:
-            self._fails = 0  # копить порог без включённого фейловера незачем
-            return None
-        self._fails += 1
-        if self._fails < self._threshold:
-            return {"event": "failing", "fails": self._fails}
-
-        self._fails = 0
-        return self._switch_forward(conf, active)
-
-    def _candidates_after(self, chain: list[str], idx: int) -> list[str]:
-        """Пресеты позже idx в цепочке, существующие в conf.d, по порядку."""
-        return [c for c in chain[idx + 1:] if (CONF_D / f"{c}.json").exists()]
-
-    def _switch_forward(self, conf: dict[str, Any], active: str) -> dict[str, Any] | None:
-        """Каскад вперёд: единственный кандидат — сразу (скорость важнее,
-        E2E проверит следующим тиком); нескольких — пробуем каждого живым
-        naive и активируем первого прошедшего («первый живой», не «первый
-        существующий»): без рестартов сервиса на мёртвых запасных."""
-        chain = conf["chain"]
-        idx = chain.index(active)
-        rest = self._candidates_after(chain, idx)
-        if len(rest) == 1:
-            return self._activate_and_count(active, rest[0])
-        for candidate in rest:
-            cfg = _preset_cfg(candidate)
-            if cfg is None:
-                continue
-            probe = _probe_preset(cfg, timeout=10.0)
-            if not probe.get("ok"):
-                app.logger.info(
-                    "фейловер: кандидат %s не прошёл пробу: %s",
-                    candidate, probe.get("error"))
-                continue
-            return self._activate_and_count(active, candidate)
-        if self._exhausted_announced:
-            return None  # уже кричали; следующая волна — только после ok
-        self._exhausted_announced = True
-        return {"event": "exhausted", "active": active}
-
-    def _activate_and_count(self, frm: str, to: str) -> dict[str, Any]:
-        try:
-            res = _activate_preset(to)
-        except HTTPException:
-            # битый пресет — валидация отвергла; каскад пойдёт дальше,
-            # но для простоты single-кандидат пути считаем исчерпанием
-            return {"event": "activate-failed", "to": to}
-        self.switches += 1
-        self._last_switch = time.time()
-        self._streaks.clear()  # активный сменился — копить про прошлого незачем
-        return {"event": "switched", "from": frm, "to": to,
-                "restart": res.get("restart")}
-
-    def _try_return(self, conf: dict[str, Any], active: str,
-                    idx: int) -> dict[str, Any] | None:
-        """Авто-возврат: пресеты РАНЬШЕ текущего. TCP-стрик у каждого;
-        первый набравший RETURN_ALIVE и не в cooldown — проба живым naive,
-        прошёл — активация. Дальше регулярная проверка нового активного
-        подтвердит; не пройдёт — фейловер уведёт вперёд как обычно."""
-        now = time.time()
-        best: tuple[str, int] | None = None
-        for candidate in conf["chain"][:idx]:
-            cfg = _preset_cfg(candidate)
-            ep = pres._upstream_endpoint(cfg.get("proxy") or "") if cfg else None
-            alive = bool(ep and _tcp_probe(ep[0], ep[1], timeout=3.0) is not None)
-            self._streaks[candidate] = self._streaks.get(candidate, 0) + 1 if alive else 0
-            streak = self._streaks[candidate]
-            if streak and (best is None or streak > best[1]):
-                best = (candidate, streak)
-        self._return_watch = ({"name": best[0], "streak": best[1],
-                               "need": FAILOVER_RETURN_ALIVE}
-                              if best else None)
-        for candidate in conf["chain"][:idx]:
-            if self._streaks.get(candidate, 0) < FAILOVER_RETURN_ALIVE:
-                continue
-            if now < self._cooldown.get(candidate, 0.0):
-                continue  # уже обжигались — ждём конца cooldown
-            cfg = _preset_cfg(candidate)
-            if cfg is None:
-                continue
-            probe = _probe_preset(cfg, timeout=15.0)
-            if probe.get("ok"):
-                try:
-                    res = _activate_preset(candidate)
-                except HTTPException:
-                    self._cooldown[candidate] = now + FAILOVER_RETURN_COOLDOWN
-                    continue
-                self.returns += 1
-                self._streaks.clear()
-                self._return_watch = None
-                return {"event": "returned", "from": active, "to": candidate,
-                        "restart": res.get("restart")}
-            # TCP жив, а прокси нет (креды/TLS/защита) — кандидату cooldown
-            self._cooldown[candidate] = now + FAILOVER_RETURN_COOLDOWN
-            self._streaks[candidate] = 0
-            return {"event": "return_probe_failed", "candidate": candidate,
-                    "error": probe.get("error")}
-        return None
-
-
-_failover = _Failover()
-
-
-def _failover_loop() -> None:
-    # как watchdog: daemon-поток, сбойный тик не убивает цикл. Пустая цепочка
-    # — честный idle, поэтому поток стартует всегда: цепочку можно задать из
-    # UI без перезапуска панели.
-    while True:
-        try:
-            ev = _failover.cycle()
-            if ev is not None:
-                if ev["event"] == "switched":
-                    rst = ev.get("restart") or {}
-                    rc = rst.get("rc") if isinstance(rst, dict) else None
-                    if isinstance(rc, int) and rc != 0:
-                        app.logger.error(
-                            "фейловер: %s не прошёл E2E-проверки — переключение"
-                            " на %s, но рестарт НЕ удался: rc=%s %s",
-                            ev["from"], ev["to"], rc, rst.get("stderr") or "")
-                    else:
-                        app.logger.warning(
-                            "фейловер: %s не прошёл %d E2E-проверок подряд — "
-                            "переключение на %s",
-                            ev["from"], FAILOVER_THRESHOLD, ev["to"])
-                    _notify("failover_switch",
-                            f"NaivePanel: {ev['from']} не работает — "
-                            f"переключение на {ev['to']}")
-                elif ev["event"] == "returned":
-                    app.logger.warning(
-                        "авто-возврат: %s жив (TCP %d подряд + проба E2E) — "
-                        "возврат с %s", ev["to"], FAILOVER_RETURN_ALIVE, ev["from"])
-                    _notify("failover_return",
-                            f"NaivePanel: {ev['to']} снова жив — авто-возврат "
-                            f"с {ev['from']}")
-                elif ev["event"] == "return_probe_failed":
-                    app.logger.warning(
-                        "авто-возврат: %s TCP-жив, но проба E2E не прошла (%s) — "
-                        "cooldown %dс", ev["candidate"], ev.get("error"),
-                        FAILOVER_RETURN_COOLDOWN)
-                    _notify("failover_return_probe_failed",
-                            f"NaivePanel: авто-возврат на {ev['candidate']} "
-                            f"отложен — проба не прошла")
-                elif ev["event"] == "activate-failed":
-                    app.logger.error(
-                        "фейловер: активация %s не удалась (валидация)",
-                        ev["to"])
-                elif ev["event"] == "exhausted":
-                    app.logger.error(
-                        "фейловер: цепочка исчерпана — %s не работает и "
-                        "запасных больше нет; проверка продолжается, возврат "
-                        "на основной — вручную", ev["active"])
-                    _notify("failover_exhausted",
-                            f"NaivePanel: цепочка исчерпана — {ev['active']} "
-                            f"не работает, запасных нет")
-                # failing не логируем: до порога это нормальный шум сети
-        except Exception:  # один сбойный тик не должен останавливать поток
-            app.logger.warning("failover cycle failed", exc_info=True)
-        # двухскоростной ритм: сбой → частые проверки до порога/восстановления
-        time.sleep(FAILOVER_FAST if _failover.hot else FAILOVER_INTERVAL)
-
-
-
-
-def _tail_path(path: Path, lines: int = 100) -> str:
-    """Последние `lines` строк файла — чтением с конца, а не всего файла.
-
-    Между рестартами лог может вырасти далеко за урезающий лимит init-скрипта,
-    а /api/logs дёргается поллингом каждые 3с — readlines() всего файла на
-    роутере был бы заметен по памяти/CPU. Заодно маскируем креды в URI.
-    """
-    if not path.exists():
-        return ""
-    lines = max(1, min(lines, 1000))
-    try:
-        with path.open("rb") as fh:
-            fh.seek(0, os.SEEK_END)
-            end = fh.tell()
-            chunk = 8192
-            buf = b""
-            while True:
-                start = max(0, end - chunk)
-                fh.seek(start)
-                buf = fh.read(end - start) + buf
-                if buf.count(b"\n") > lines or start == 0:
-                    break
-                end = start
-                chunk = min(chunk * 2, 4 * 1024 * 1024)
-            data = buf.decode("utf-8", errors="replace")
-    except OSError as exc:
-        return f"<log read error: {exc}>"
-    return pres._mask_creds("".join(data.splitlines(keepends=True)[-lines:]))
-
+_reload_or_import("panel.monitor")
+from panel import monitor as mon  # модуль-владелец мониторинга/автоматики (патчи тестов — сюда)
+from panel.monitor import *  # noqa: F401,F403 — re-export для совместимости
 
 # --- Flask app ------------------------------------------------------------
 
@@ -1218,20 +122,20 @@ def index() -> Response:
 
 @app.route("/api/status")
 def api_status():
-    return jsonify(_status())
+    return jsonify(mon._status())
 
 
 @app.route("/api/notify")
 def api_notify_get():
-    cfg = _notify_snapshot()
-    channel = _notify_channel(cfg)
-    bot = _bot_cache.get(cfg["token"], (None, 0.0))[0] if cfg["token"] else None
+    cfg = mon._notify_snapshot()
+    channel = mon._notify_channel(cfg)
+    bot = mon._bot_cache.get(cfg["token"], (None, 0.0))[0] if cfg["token"] else None
     return jsonify({
         "channel": channel,
         "enabled": channel is not None,
         "telegram": {"configured": bool(cfg["token"] and cfg["chat"]),
                      "chat_id": cfg["chat"], "bot": bot},
-        "pending": len(_notify_pending_all()),
+        "pending": len(mon._notify_pending_all()),
     })
 
 
@@ -1244,12 +148,12 @@ def api_notify_telegram_save():
         data = {}
     token = str(data.get("token") or "").strip()
     chat = str(data.get("chat_id") or "").strip()
-    cfg = _notify_snapshot()
+    cfg = mon._notify_snapshot()
     if not token and not (cfg["token"] and cfg["chat"]):
         abort(400, description="bot token is required")
-    if token and not _TG_TOKEN_RE.match(token):
+    if token and not mon._TG_TOKEN_RE.match(token):
         abort(400, description="bot token format looks wrong (123456:ABC…)")
-    if not _TG_CHAT_RE.match(chat):
+    if not mon._TG_CHAT_RE.match(chat):
         abort(400, description="chat_id must be numeric or @channel")
 
     updates: dict[str, str | None] = {"NAIVEPANEL_TG_CHAT": chat}
@@ -1262,17 +166,17 @@ def api_notify_telegram_save():
         warning = ("значение задано через окружение — после рестарта "
                    "оно переопределит сохранённое")
     _conf_upsert(updates)
-    with _notify_lock:
+    with mon._notify_lock:
         if token:
-            _notify_cfg["token"] = token
-        _notify_cfg["chat"] = chat
+            mon._notify_cfg["token"] = token
+        mon._notify_cfg["chat"] = chat
         _notify_test_last = 0.0  # новый канал — тест сразу разрешён
-    _bot_cache.pop(token, None)
+    mon._bot_cache.pop(token, None)
     if cfg["token"]:
-        _bot_cache.pop(cfg["token"], None)
-    bot = _tg_bot_name(token or cfg["token"])
+        mon._bot_cache.pop(cfg["token"], None)
+    bot = mon._tg_bot_name(token or cfg["token"])
     app.logger.info("notify: telegram configured by %s", request.remote_addr)
-    return jsonify({"ok": True, "channel": _notify_channel(),
+    return jsonify({"ok": True, "channel": mon._notify_channel(),
                     "telegram": {"configured": True, "chat_id": chat,
                                  "bot": bot},
                     "warning": warning})
@@ -1291,25 +195,25 @@ def api_notify_telegram_delete():
         warning = ("токен задан через окружение — после рестарта он снова "
                    "включится; уберите его из init-скрипта")
     _conf_upsert(updates)
-    with _notify_lock:
-        _notify_cfg["token"] = ""
-        _notify_cfg["chat"] = ""
+    with mon._notify_lock:
+        mon._notify_cfg["token"] = ""
+        mon._notify_cfg["chat"] = ""
         _notify_test_last = 0.0  # после удаления тест не должен троттлиться
-    _bot_cache.clear()
-    if _notify_channel() is None:
+    mon._bot_cache.clear()
+    if mon._notify_channel() is None:
         # Telegram был единственным путём доставки — очередь и файл больше
         # некуда деть. Если настроен webhook, всё остаётся: события доставимы.
         while True:
             try:
-                _notify_queue.get_nowait()
+                mon._notify_queue.get_nowait()
             except queue.Empty:
                 break
         try:
-            NOTIFY_PENDING.unlink()
+            mon.NOTIFY_PENDING.unlink()
         except OSError:
             pass
     app.logger.info("notify: telegram disabled by %s", request.remote_addr)
-    return jsonify({"ok": True, "channel": _notify_channel(),
+    return jsonify({"ok": True, "channel": mon._notify_channel(),
                     "warning": warning})
 
 
@@ -1321,16 +225,16 @@ _notify_test_last = 0.0
 def api_notify_test():
     global _notify_test_last
     sec._require_local_or_auth()
-    if _notify_channel() is None:
+    if mon._notify_channel() is None:
         abort(409, description="уведомления не настроены")
     now = time.monotonic()
-    with _notify_lock:
+    with mon._notify_lock:
         if now - _notify_test_last < _NOTIFY_TEST_MIN:
             abort(429, description="тестовое сообщение можно отправлять "
                                    "не чаще одного раза в "
                                    f"{int(_NOTIFY_TEST_MIN)} секунд")
         _notify_test_last = now
-    ok, err = _notify_send("test", "NaivePanel: тестовое уведомление",
+    ok, err = mon._notify_send("test", "NaivePanel: тестовое уведомление",
                            detail=True)
     if not ok:
         abort(502, description=f"delivery failed: {err}")
@@ -1389,7 +293,7 @@ def api_configs_update(name: str):
     if pres._active_name() == name:
         # Активный пресет = работающий конфиг: применяем сразу, как activate,
         # иначе «Сохранено» врало бы — файл обновлён, а naive работает старым.
-        restart = _apply_active(name, cfg)
+        restart = mon._apply_active(name, cfg)
     return jsonify({"name": name, "updated": True, "restart": restart})
 
 
@@ -1404,22 +308,22 @@ def api_configs_delete(name: str):
         abort(404, description=f"preset {name!r} not found")
     path.unlink()
     # цепочка фейловера не должна ссылаться ни на удалённый пресет, ни на
-    # прочие stale-имена: _load_failover_conf уже отфильтровывает всё, чего
+    # прочие stale-имена: mon._load_failover_conf уже отфильтровывает всё, чего
     # нет в conf.d. Пишем нормализованный конфиг только если он отличается
     # от сырых значений — иначе не трогаем файл (в т.ч. битый).
-    with _FAILOVER_LOCK:
+    with mon._FAILOVER_LOCK:
         try:
-            raw = json.loads(FAILOVER_CONF.read_text(encoding="utf-8"))
+            raw = json.loads(cfg.FAILOVER_CONF.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             raw = None
         if isinstance(raw, dict):
-            conf = _load_failover_conf()
+            conf = mon._load_failover_conf()
             stored = {"enabled": raw.get("enabled"),
                       "chain": raw.get("chain"),
                       "auto_return": raw.get("auto_return")}
             if conf != stored:
                 try:
-                    pres._save_json(FAILOVER_CONF, conf)
+                    pres._save_json(cfg.FAILOVER_CONF, conf)
                 except OSError as exc:
                     app.logger.warning(
                         "failover cleanup after deleting %s failed: %s",
@@ -1427,71 +331,9 @@ def api_configs_delete(name: str):
     return jsonify({"name": name, "deleted": True})
 
 
-# Активация из двух мест: API (ручной клик) и фейловер-монитор (авто); плюс
-# PUT активного пресета, ручные service start/stop/restart и рестарты после
-# обновления/отката бинарника. Один лок сериализует их все: параллельные
-# stop/start init-скрипта на медленном роутере перехлёстываются, а два
-# писателя config.json/.active оставляют файлы, врущие о состоянии сервиса.
-_SERVICE_LOCK = threading.Lock()
-
-
-def _apply_active(name: str, cfgd: dict[str, Any]) -> dict[str, Any]:
-    """config.json/.active + рестарт под _SERVICE_LOCK, с откатом при фейле.
-
-    Рестарт с новым конфигом упал (rc != 0) → файлы не должны врать, будто
-    конфиг применён: восстанавливаем прежний config.json/.active и пробуем
-    вернуть сервис на старом конфиге. Неудача отката не скрывается —
-    результат помечается degraded, обе ошибки видны вызывающему/UI.
-    """
-    with _SERVICE_LOCK:
-        prev_name = pres._active_name()
-        prev_cfg = None
-        if prev_name is not None:
-            try:
-                prev_cfg = json.loads(ACTIVE_CONFIG.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                prev_cfg = None
-        pres._write_active(name, cfgd)
-        restart = svc._service("restart") if cfg.INIT_SCRIPT.exists() \
-            else {"rc": None, "note": "no init script"}
-        if restart.get("rc") not in (None, 0):
-            restart = dict(restart)
-            restart["degraded"] = True
-            if prev_cfg is not None and prev_name is not None:
-                pres._write_active(prev_name, prev_cfg)
-                restart["rollback"] = svc._service("restart") \
-                    if cfg.INIT_SCRIPT.exists() else {"rc": None, "note": "no init script"}
-            else:
-                # до активации ничего не работало — не оставляем ссылки на
-                # неприменённый конфиг
-                ACTIVE_CONFIG.unlink(missing_ok=True)
-                ACTIVE_POINTER.unlink(missing_ok=True)
-            app.logger.warning(
-                "activate %s degraded: restart rc=%s, restored=%s",
-                name, restart.get("rc"), prev_name)
-        return restart
-
-
-def _activate_preset(name: str) -> dict[str, Any]:
-    """Валидация + запись config.json/.active + рестарт сервиса.
-
-    Используется ручным activate из UI и автофейловером — одна и та же
-    семантика: битый конфиг не роняет рабочий прокси (валидация до записи).
-    """
-    if not NAME_RE.match(name):
-        abort(400, description="invalid name")
-    src = CONF_D / f"{name}.json"
-    if not src.exists():
-        abort(404, description=f"preset {name!r} not found")
-    cfgd = pres._load_json(src)
-    pres._validate_cfg(cfgd, name)  # битый конфиг не должен ронять рабочий прокси
-    restart = _apply_active(name, cfgd)
-    return {"name": name, "active": True, "restart": restart}
-
-
 @app.route("/api/configs/<name>/activate", methods=["POST"])
 def api_configs_activate(name: str):
-    return jsonify(_activate_preset(name))
+    return jsonify(mon._activate_preset(name))
 
 
 @app.route("/api/configs/<name>/duplicate", methods=["POST"])
@@ -1537,7 +379,7 @@ def api_configs_export():
             presets[p.stem] = pres._load_json(p)
         except Exception as exc:  # битый файл не должен ронять весь экспорт
             app.logger.warning("export: skipping %s: %s", p.name, exc)
-    fo = _load_failover_conf()
+    fo = mon._load_failover_conf()
     # цепочка должна ссылаться только на реально экспортированные пресеты:
     # нечитаемый файл пропущен выше, и импорт такой цепочки провалился бы.
     fo["chain"] = [n for n in fo["chain"] if n in presets]
@@ -1571,25 +413,25 @@ def api_configs_import():
         abort(400, description="expected {presets: {name: config}}")
     imported: list[str] = []
     skipped: list[dict[str, str]] = []
-    for name, cfg in sorted(incoming.items()):
+    for name, pc in sorted(incoming.items()):
         if not NAME_RE.match(name or ""):
             skipped.append({"name": name, "reason": "invalid name"})
             continue
         if name in RESERVED_NAMES:
             skipped.append({"name": name, "reason": "reserved name"})
             continue
-        if not isinstance(cfg, dict):
+        if not isinstance(pc, dict):
             skipped.append({"name": name, "reason": "expected object"})
             continue
         try:
-            pres._validate_cfg(cfg, name)
+            pres._validate_cfg(pc, name)
         except HTTPException as exc:
             skipped.append({"name": name, "reason": str(exc.description)})
             continue
         if (CONF_D / f"{name}.json").exists():
             skipped.append({"name": name, "reason": "already exists"})
             continue
-        pres._save_json(CONF_D / f"{name}.json", cfg)
+        pres._save_json(CONF_D / f"{name}.json", pc)
         imported.append(name)
     fo_res: dict[str, Any] = {"applied": False, "reason": "no failover block"}
     incoming_fo = data.get("failover")
@@ -1603,7 +445,7 @@ def api_configs_import():
             # Блокер-цель проверяем ДО разбора входящей цепочки: на роутере
             # с рабочей цепочкой причина должна быть про цель, а не про
             # случайный мусор в импортируемом файле.
-            if _load_failover_conf()["chain"]:
+            if mon._load_failover_conf()["chain"]:
                 reason = "target already has a failover chain"
             elif not isinstance(enabled, bool):
                 reason = "enabled must be boolean"
@@ -1637,8 +479,8 @@ def api_configs_import():
                 auto = incoming_fo.get("auto_return") is True
                 # check-and-set под локом: параллельный PUT не должен
                 # перезаписать уже существующую цепочку
-                with _FAILOVER_LOCK:
-                    if _load_failover_conf()["chain"]:
+                with mon._FAILOVER_LOCK:
+                    if mon._load_failover_conf()["chain"]:
                         fo_res = {"applied": False,
                                   "reason": "target already has a failover chain"}
                     else:
@@ -1652,7 +494,7 @@ def api_configs_import():
                                                 + ", ".join(missing)}
                         else:
                             _ensure_dirs()
-                            pres._save_json(FAILOVER_CONF,
+                            pres._save_json(cfg.FAILOVER_CONF,
                                        {"enabled": enabled, "chain": chain,
                                         "auto_return": auto})
                             fo_res = {"applied": True, "reason": None}
@@ -1675,7 +517,7 @@ def api_probe():
     if not ep:
         abort(400, description="upstream required (host[:port] or URI)")
     host, port = ep
-    if not _EXPENSIVE_SEM.acquire(blocking=False):
+    if not mon._EXPENSIVE_SEM.acquire(blocking=False):
         abort(429, description="too many concurrent checks, try later")
     t0 = time.monotonic()
     try:
@@ -1686,14 +528,14 @@ def api_probe():
     except OSError as exc:  # refused/timeout/DNS — не ошибка панели
         return jsonify({"host": host, "port": port, "error": str(exc)})
     finally:
-        _EXPENSIVE_SEM.release()
+        mon._EXPENSIVE_SEM.release()
 
 
 @app.route("/api/service/<action>", methods=["POST"])
 def api_service(action: str):
     if action not in {"start", "stop", "restart"}:
         abort(400, description="action must be start|stop|restart")
-    with _SERVICE_LOCK:
+    with mon._SERVICE_LOCK:
         return jsonify(svc._service(action))
 
 
@@ -1708,15 +550,15 @@ def api_e2e():
     data = request.get_json(silent=True) or {}
     listen = (data.get("listen") or "").strip()
     if not listen:
-        listen = _active_listen()
+        listen = mon._active_listen()
         if not listen:
             abort(400, description="no active preset with listen: activate a preset first")
-    if not _EXPENSIVE_SEM.acquire(blocking=False):
+    if not mon._EXPENSIVE_SEM.acquire(blocking=False):
         abort(429, description="too many concurrent checks, try later")
     try:
-        resp = jsonify(_proxy_e2e_check(listen))
+        resp = jsonify(mon._proxy_e2e_check(listen))
     finally:
-        _EXPENSIVE_SEM.release()
+        mon._EXPENSIVE_SEM.release()
     resp.headers["Cache-Control"] = "no-store"  # результат живой, не кешируем
     return resp
 
@@ -1733,7 +575,7 @@ def api_e2e_history():
     except ValueError:
         last = 120
     last = max(1, min(last, E2E_KEEP))
-    entries = _e2e_history_load(last)
+    entries = mon._e2e_history_load(last)
     ok_n = sum(1 for e in entries if e["ok"])
     n = len(entries)
     avg_ms = round(sum(e["ms"] for e in entries) / n) if n else None
@@ -1755,7 +597,7 @@ def api_e2e_history():
 
 @app.route("/api/failover")
 def api_failover_get():
-    resp = jsonify(_failover.snapshot())
+    resp = jsonify(mon._failover.snapshot())
     resp.headers["Cache-Control"] = "no-store"
     return resp
 
@@ -1777,11 +619,11 @@ def api_failover_put():
     chain_raw = data.get("chain")
     # read-modify-write failover.json: chain-less PUT читает текущую цепочку,
     # поэтому чтение, зависящая от неё валидация и запись — под одним локом.
-    with _FAILOVER_LOCK:
+    with mon._FAILOVER_LOCK:
         if chain_raw is None:
             if enabled:
                 abort(400, description="chain required (non-empty list) when enabled")
-            chain_raw = _load_failover_conf()["chain"]
+            chain_raw = mon._load_failover_conf()["chain"]
         if not isinstance(chain_raw, list):
             abort(400, description="chain must be a list")
         if len(chain_raw) > FAILOVER_CHAIN_MAX:
@@ -1804,21 +646,21 @@ def api_failover_put():
         if auto_return and not enabled:
             abort(400, description="auto_return requires enabled chain")
         _ensure_dirs()
-        pres._save_json(FAILOVER_CONF, {"enabled": enabled, "chain": chain_raw,
+        pres._save_json(cfg.FAILOVER_CONF, {"enabled": enabled, "chain": chain_raw,
                                    "auto_return": auto_return})
-    return jsonify(_failover.snapshot())
+    return jsonify(mon._failover.snapshot())
 
 
 @app.route("/api/failover", methods=["DELETE"])
 def api_failover_delete():
-    with _FAILOVER_LOCK:
+    with mon._FAILOVER_LOCK:
         try:
-            FAILOVER_CONF.unlink()
+            cfg.FAILOVER_CONF.unlink()
         except FileNotFoundError:
             pass
         except OSError as exc:
             abort(500, description=f"cannot remove failover.json: {exc}")
-    return jsonify(_failover.snapshot())
+    return jsonify(mon._failover.snapshot())
 
 
 @app.route("/api/panel/restart", methods=["POST"])
@@ -1879,34 +721,8 @@ def api_password():
 
 # --- Self-update: проверка и установка обновлений из UI ---------------------
 
-def _http_get(url: str, timeout: float = 6.0) -> str:
-    """GET внешнего URL через curl/wget — как fetch() в install.sh.
-
-    python-urllib на Entware завязан на системный CA-бандл, которого часто
-    нет; curl же был обязателен при установке панели. Оба недоступны/упали —
-    RuntimeError: панель нередко стоит в сетях без прямого хода в GitHub,
-    это штатный отказ, а не авария.
-    """
-    last = ""
-    for cmd in (["curl", "-fsSL",
-                 "--connect-timeout", str(_HTTP_CONNECT_TIMEOUT),
-                 "--max-time", str(int(timeout)),
-                 "--max-filesize", str(_HTTP_MAX_BYTES), url],
-                ["wget", "-qO-", "-T", str(int(timeout)), url]):
-        try:
-            # cmd — фиксированный шаблон, url передаётся argv-элементом
-            r = subprocess.run(cmd, capture_output=True, text=True,
-                               timeout=timeout + 2)  # nosec B603
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            continue
-        if r.returncode == 0 and r.stdout.strip():
-            return r.stdout
-        last = f"{cmd[0]}: rc={r.returncode}"
-    raise RuntimeError(f"GET {url} failed ({last or 'curl and wget not found'})")
-
-
 def _http_download(url: str, dst: Path, timeout: float = 300.0) -> None:
-    """Скачивание бинарного файла через curl/wget — как _http_get, но в файл.
+    """Скачивание бинарного файла через curl/wget — как mon._http_get, но в файл.
 
     Архив бинарника (~3.5МБ) не проходит через stdout-подстановку; таймаут
     щедрый — на медленном линке роутера качается заметно дольше JSON.
@@ -1943,7 +759,7 @@ def _latest_release() -> dict[str, Any]:
     """
     rel: dict[str, Any] = {}
     try:
-        data = json.loads(_http_get(f"{UPDATE_API_BASE}/repos/{UPDATE_REPO}/releases/latest"))
+        data = json.loads(mon._http_get(f"{UPDATE_API_BASE}/repos/{UPDATE_REPO}/releases/latest"))
         tag = data.get("tag_name") or ""
         if _TAG_RE.match(tag):
             rel = {"tag": tag,
@@ -1953,7 +769,7 @@ def _latest_release() -> dict[str, Any]:
         pass  # релизов нет или API недоступен — решит список тегов
     best: str | None = None
     try:
-        tags = json.loads(_http_get(f"{UPDATE_API_BASE}/repos/{UPDATE_REPO}/tags?per_page=10"))
+        tags = json.loads(mon._http_get(f"{UPDATE_API_BASE}/repos/{UPDATE_REPO}/tags?per_page=10"))
         names = (t.get("name") or "" for t in tags if isinstance(t, dict))
         best = max((n for n in names if _TAG_RE.match(n)),
                    key=_ver_key, default=None)
@@ -2072,7 +888,7 @@ def api_update_check():
             out = dict(_update_check_cache["data"])
             out["cached"] = True
             return jsonify(out)
-    with _UPDATE_FETCH_LOCK:
+    with mon._UPDATE_FETCH_LOCK:
         # кэш, заполненный ПОСЛЕ нашего прихода, — результат соседа по
         # залпу: берём его, второй внешний ход не нужен (в т.ч. для force —
         # его смысл «свежее, чем у меня», а не «обязательно лично сходить»;
@@ -2081,7 +897,7 @@ def api_update_check():
             out = dict(_update_check_cache["data"])
             out["cached"] = True
             return jsonify(out)
-        if not _EXPENSIVE_SEM.acquire(blocking=False):
+        if not mon._EXPENSIVE_SEM.acquire(blocking=False):
             abort(429, description="too many concurrent checks, try later")
         try:
             checked = time.strftime("%Y-%m-%dT%H:%M:%S%z")
@@ -2108,7 +924,7 @@ def api_update_check():
                                         "ttl": _UPDATE_CHECK_TTL, "data": out})
             return jsonify(out)
         finally:
-            _EXPENSIVE_SEM.release()
+            mon._EXPENSIVE_SEM.release()
 
 
 @app.route("/api/update/apply", methods=["POST"])
@@ -2133,7 +949,7 @@ def api_update_apply():
         abort(502, description=str(exc))
     tag = rel["tag"]
     try:
-        installer = _http_get(f"{UPDATE_RAW_BASE}/{UPDATE_REPO}/{tag}/install.sh",
+        installer = mon._http_get(f"{UPDATE_RAW_BASE}/{UPDATE_REPO}/{tag}/install.sh",
                               timeout=30.0)
     except RuntimeError as exc:
         abort(502, description=f"cannot download install.sh@{tag}: {exc}")
@@ -2210,8 +1026,8 @@ def api_update_log():
     except ValueError:
         lines = 60
     resp = jsonify({"lines": lines,
-                    "content": _tail_path(UPDATE_LOG, lines),
-                    "panel": _tail_path(PANEL_LOG, 20),
+                    "content": mon._tail_path(UPDATE_LOG, lines),
+                    "panel": mon._tail_path(PANEL_LOG, 20),
                     "state": _update_state()})
     resp.headers["Cache-Control"] = "no-store"
     return resp
@@ -2357,7 +1173,7 @@ def _naive_pick_asset(assets: list[tuple[str, str]],
 
 def _naive_release() -> dict[str, Any]:
     """Последний релиз klzgrad/naiveproxy: тег + ассеты (+ заметка)."""
-    data = json.loads(_http_get(f"{NAIVE_SRC_API}/repos/{NAIVE_SRC_REPO}/releases/latest"))
+    data = json.loads(mon._http_get(f"{NAIVE_SRC_API}/repos/{NAIVE_SRC_REPO}/releases/latest"))
     tag = data.get("tag_name") or ""
     assets = [(a.get("name") or "", a.get("browser_download_url") or "")
               for a in data.get("assets") or [] if isinstance(a, dict)]
@@ -2480,7 +1296,7 @@ def _naive_update_worker() -> None:
                                "(wrong target?) — keeping the current one")
         new_ver = (rv.stdout or "").strip().splitlines()[0].strip()
         _naive_log(f"check ok: {new_ver}")
-        was_active = _status()["active"]
+        was_active = mon._status()["active"]
         if NAIVE_BIN.exists():
             backup = NAIVEPROXY_DIR / "backup" / "naive.previous"
             backup.parent.mkdir(parents=True, exist_ok=True)
@@ -2506,7 +1322,7 @@ def _naive_update_worker() -> None:
         restarted = False
         restart_rc = None
         if was_active and cfg.INIT_SCRIPT.exists():
-            with _SERVICE_LOCK:
+            with mon._SERVICE_LOCK:
                 rst = svc._service("restart")
             restart_rc = rst["rc"]
             restarted = restart_rc == 0  # как в rollback: rc==0 или честный провал
@@ -2540,13 +1356,13 @@ def api_naive_check():
             out = dict(_naive_check_cache["data"])
             out["cached"] = True
             return jsonify(out)
-    with _NAIVE_FETCH_LOCK:
-        # коалесцирование, как у /api/update/check (см. _UPDATE_FETCH_LOCK)
+    with mon._NAIVE_FETCH_LOCK:
+        # коалесцирование, как у /api/update/check (см. mon._UPDATE_FETCH_LOCK)
         if _naive_check_cache and _naive_check_cache["at"] >= arrived:
             out = dict(_naive_check_cache["data"])
             out["cached"] = True
             return jsonify(out)
-        if not _EXPENSIVE_SEM.acquire(blocking=False):
+        if not mon._EXPENSIVE_SEM.acquire(blocking=False):
             abort(429, description="too many concurrent checks, try later")
         try:
             checked = time.strftime("%Y-%m-%dT%H:%M:%S%z")
@@ -2576,7 +1392,7 @@ def api_naive_check():
                                        "ttl": _NAIVE_CHECK_TTL, "data": out})
             return jsonify(out)
         finally:
-            _EXPENSIVE_SEM.release()
+            mon._EXPENSIVE_SEM.release()
 
 
 @app.route("/api/naive/update", methods=["POST"])
@@ -2630,7 +1446,7 @@ def api_naive_status():
     except ValueError:
         lines = 40
     resp = jsonify({"lines": lines,
-                    "content": _tail_path(NAIVE_UPDATE_LOG, lines),
+                    "content": mon._tail_path(NAIVE_UPDATE_LOG, lines),
                     "state": _naive_state()})
     resp.headers["Cache-Control"] = "no-store"
     return resp
@@ -2710,7 +1526,7 @@ def _rollback_binary():
                                "keeping the current one")
     new_ver = out[0].strip()
     prev_tag = _naive_read(NAIVE_PREV_TAG)
-    was_active = _status()["active"]
+    was_active = mon._status()["active"]
     try:
         # тот же rename-паттерн, что обновление: работающий naive доживает
         # свой инод, ETXTBSY не бывает
@@ -2730,7 +1546,7 @@ def _rollback_binary():
     restarted = False
     restart_rc = None
     if was_active and cfg.INIT_SCRIPT.exists():
-        with _SERVICE_LOCK:
+        with mon._SERVICE_LOCK:
             rst = svc._service("restart")
         restart_rc = rst["rc"]
         restarted = restart_rc == 0  # «перезапущен» = только при rc==0 (REL-05)
@@ -2899,7 +1715,7 @@ def api_logs():
     except ValueError:
         lines = 100
     path = LOG_SOURCES.get(request.args.get("src", "proxy"), LOG_FILE)
-    resp = jsonify({"lines": lines, "content": _tail_path(path, lines)})
+    resp = jsonify({"lines": lines, "content": mon._tail_path(path, lines)})
     resp.headers["Cache-Control"] = "no-store"  # логи могут содержать креды
     return resp
 
@@ -3043,7 +1859,7 @@ if __name__ == "__main__":
             STOP_MARKER,
         )
         threading.Thread(
-            target=_watchdog_loop, name="naive-watchdog", daemon=True
+            target=mon._watchdog_loop, name="naive-watchdog", daemon=True
         ).start()
     else:
         app.logger.info("watchdog disabled by NAIVEPANEL_WATCHDOG=0")
@@ -3071,18 +1887,18 @@ if __name__ == "__main__":
         # монитор живёт всегда: проверяет активный пресет (история E2E для
         # спарклайна) и переключает по цепочке, если она задана из UI
         threading.Thread(
-            target=_failover_loop, name="naive-monitor", daemon=True
+            target=mon._failover_loop, name="naive-monitor", daemon=True
         ).start()
     else:
         app.logger.info(
             "monitor (e2e history + failover) disabled by NAIVEPANEL_FAILOVER=0")
-    channel = _notify_channel()
+    channel = mon._notify_channel()
     if channel:
         app.logger.info("notifications enabled: %s", channel)
     else:
         app.logger.info("notifications not configured — set up in the panel UI")
     threading.Thread(
-        target=_notify_loop, name="naive-notify", daemon=True
+        target=mon._notify_loop, name="naive-notify", daemon=True
     ).start()
     host, port = _parse_bind(PANEL_BIND)
     # host берётся из env/panel.conf: предупреждаем только для unspecified

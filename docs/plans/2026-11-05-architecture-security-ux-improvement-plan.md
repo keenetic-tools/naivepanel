@@ -16,10 +16,11 @@
 xz не меняется), валидация members — stdlib `tarfile` с fallback на
 `tar -tf` (только имена) для Entware-сборок без `python3-lzma`. Подпись
 релизов и trust-модель для naive-assets выделены в Task 8b и отложены до
-отдельного обсуждения. Остались: 15 (ARCH-01 модули — шаги 1–4/7 закоммичены:
-config b36d575, security 808fbc4, presets 210f6ca, service; `_status` остался
-в naivepanel.py до monitor-шага — агрегатор поверх watchdog/failover/notify;
-далее monitor/updates/app по модулю за коммит), 16 (CI gates), 8b;
+отдельного обсуждения. Остались: 15 (ARCH-01 модули — шаги 1–5/7 закоммичены:
+config b36d575, security 808fbc4, presets 210f6ca, service 9cf8087, monitor
+~1280 строк: e2e+история, watchdog, фейловер, notify, _status, активация;
+в naivepanel.py ~1920 строк — роуты, updates/rollback, log-trim, main;
+далее updates/app по модулю за коммит), 16 (CI gates), 8b;
 финальная release-validation из Task 17 — пререлизным шагом следующего
 релиза.
 
