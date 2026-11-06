@@ -105,8 +105,11 @@ mkdir -p /opt
 curl -fsSL https://bin.entware.net/$ENTWARE_ARCH/installer/alternative.sh | sh
 /opt/bin/opkg update
 # libgcc: openwrt-x86_64 сборка naive динамическая (musl + libgcc_s.so.1);
-# на реальном роутере её даёт Entware-рантайм, в чистом Debian её нет
+# на реальном роутере её даёт Entware-рантайм, в чистом Debian её нет.
+# musl ищет библиотеки по /etc/ld-musl-<arch>.path (дефолт /lib:/usr/lib),
+# а opkg кладёт всё в /opt/lib — учим интерпретатор этому пути.
 /opt/bin/opkg install libgcc
+echo /opt/lib >> /etc/ld-musl-$(uname -m).path
 export PATH=/opt/bin:/opt/sbin:\$PATH
 echo "==> install: curl -fsSL .../install.sh | sh -s -- $AUTH_FLAG \$EXTRA"
 curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/$REF/install.sh | sh -s -- $AUTH_FLAG \$EXTRA
