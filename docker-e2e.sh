@@ -104,6 +104,9 @@ echo "==> fake raw.githubusercontent.com: OK"
 mkdir -p /opt
 curl -fsSL https://bin.entware.net/$ENTWARE_ARCH/installer/alternative.sh | sh
 /opt/bin/opkg update
+# libgcc: openwrt-x86_64 сборка naive динамическая (musl + libgcc_s.so.1);
+# на реальном роутере её даёт Entware-рантайм, в чистом Debian её нет
+/opt/bin/opkg install libgcc
 export PATH=/opt/bin:/opt/sbin:\$PATH
 echo "==> install: curl -fsSL .../install.sh | sh -s -- $AUTH_FLAG \$EXTRA"
 curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/$REF/install.sh | sh -s -- $AUTH_FLAG \$EXTRA
