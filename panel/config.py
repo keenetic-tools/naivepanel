@@ -254,7 +254,7 @@ _ALLOWED_PROXY_SCHEMES = ("https://", "http://", "quic://")
 # Имена, занятые статическими маршрутами /api/configs/export|import:
 # такой пресет нельзя было бы получить через GET (роутинг отдаёт файл)
 RESERVED_NAMES = frozenset({"export", "import"})
-APP_VERSION = "0.20.0"
+APP_VERSION = "0.21.0"
 
 
 def _ensure_dirs() -> None:
