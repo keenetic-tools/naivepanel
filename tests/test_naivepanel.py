@@ -32,9 +32,13 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setenv("NAIVEPROXY_LOG", str(tmp_path / "naiveproxy.log"))
     monkeypatch.setenv("NAIVEPANEL_LOG", str(tmp_path / "naivepanel.log"))
     monkeypatch.setenv("NAIVEPROXY_PID", str(tmp_path / "naiveproxy.pid"))
-    # self-update пишет в каталог панели и свой лог — только в tmp
+    # self-update пишет в каталог панели и свой лог — только в tmp.
+    # NAIVEPROXY_UPDATE_LOG — отдельный лог обновления бинарника naive
+    # (заголовок пишет launch-путь /api/naive/update): без перенаправления
+    # storm-тесты клали его в реальный /opt/var/log (инцидент CI v0.20.0).
     monkeypatch.setenv("NAIVEPANEL_DIR", str(tmp_path / "panel"))
     monkeypatch.setenv("NAIVEPANEL_UPDATE_LOG", str(tmp_path / "update.log"))
+    monkeypatch.setenv("NAIVEPROXY_UPDATE_LOG", str(tmp_path / "naivepanel-naive.log"))
     monkeypatch.syspath_prepend(str(APP_DIR))
     return tmp_path
 
@@ -2085,6 +2089,18 @@ def test_install_sh_from_update_skips_python_checks(app):
 
 
 # --- периодическая обрезка логов ------------------------------------------------------
+
+def test_env_fixture_isolates_all_trim_targets(env):
+    # CI-инцидент (v0.20.0, run #41): storm-тест /api/naive/update писал
+    # заголовок обновления в реальный /opt/var/log/naivepanel-naive.log —
+    # fixture не перенаправлял NAIVEPROXY_UPDATE_LOG (насчёт панели есть
+    # NAIVEPANEL_UPDATE_LOG, это другой лог). На раннере файл создался, и
+    # trim-тесты подрезали чужой файл хоста. Все цели триммера обязаны
+    # жить внутри tmp.
+    m = _reload()
+    for p in (m.LOG_FILE, m.PANEL_LOG, m.UPDATE_LOG, m.NAIVE_UPDATE_LOG):
+        assert env in p.parents, f"{p} вне tmp — env fixture протекает"
+
 
 def test_trim_oversized_log_keeps_tail_and_inode(env, monkeypatch):
     monkeypatch.setenv("NAIVEPANEL_LOG_MAX", "100")
