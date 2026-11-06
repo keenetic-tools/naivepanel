@@ -465,6 +465,7 @@ install_naive() {  # ставит /opt/bin/naive из релиза klzgrad/naive
         # несовместимый таргет умирает с illegal instruction — ловим ДО
         # того, как сломали рабочий бинарник
         warn "downloaded naive fails to run (wrong target '$build'?) — NOT installed"
+        warn "  output: $(echo "$nout" | head -n 2)"
         naive_hint
         return 1
     fi
