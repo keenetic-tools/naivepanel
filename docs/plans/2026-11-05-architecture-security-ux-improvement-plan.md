@@ -19,12 +19,11 @@ fallback на `tar -tf` (только имена) для Entware-сборок б
 Task 8b и отложены до отдельного обсуждения. Task 16 (CI gates)
 закоммичен 47ad0cd: matrix 3.10–3.13, blocking `pip-audit --strict` по
 runtime-пинам, ShellCheck, SHA-pinned actions, nightly Docker E2E.
-Остались: 15 (ARCH-01 модули — шаги 1–6/7 закоммичены: config b36d575,
-security 808fbc4, presets 210f6ca, service 9cf8087, monitor a901e84,
-updates ~620 строк: self-update, naive-update, rollback; Task 16 —
-47ad0cd CI gates; в naivepanel.py ~1370 строк — роуты, log-trim, main;
-остался финальный app-шаг), 8b; финальная release-validation из Task 17 —
-пререлизным шагом следующего релиза.
+Остались: 8b; финальная release-validation из Task 17 — пререлизным
+шагом следующего релиза. ARCH-01 ЗАВЕРШЁН (7/7: config b36d575, security
+808fbc4, presets 210f6ca, service 9cf8087, monitor a901e84, updates
+bd1d8fb, app — Flask+роуты 1187 строк): naivepanel.py — тонкий entrypoint
+(~230 строк: reload-шим, log-trim, _serve/main); Task 16 — 47ad0cd.
 
 ---
 

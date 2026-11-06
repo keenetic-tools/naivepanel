@@ -784,7 +784,7 @@ def test_panel_restart_spawns_init(client, app, env):
     stub = env / "panel-init.sh"
     stub.write_text(f'#!/bin/sh\necho restart >> "{marker}"\n')
     stub.chmod(0o755)
-    app.PANEL_INIT = stub
+    app.cfg.PANEL_INIT = stub
     r = client.post("/api/panel/restart", headers=CSRF)
     assert r.status_code == 202
     for _ in range(50):  # endpoint спавнит sh после sleep 1
@@ -4362,7 +4362,7 @@ def test_rollback_panel_restores_files_backs_up_current_and_restarts(
     _rb_make_panel(m, code="# current panel code")
     _rb_make_backup(m, "v0.9.0", code="# old panel code", tmpl="old-tpl")
     stub, marker = _stub_init(env, "rb-restarts.txt")
-    monkeypatch.setattr(m, "PANEL_INIT", stub)
+    monkeypatch.setattr(m.cfg, "PANEL_INIT", stub)
     # INIT_SCRIPT тоже возвращается: своё имя, свой файл
     ninit = env / "ninit.sh"
     (m.PANEL_DIR / "backup" / "v0.9.0" / "ninit.sh").write_text("# naive init old\n")
@@ -5009,6 +5009,24 @@ def test_panel_package_updates_extraction(app, env, monkeypatch):
     assert d["latest"] == "0.99.0" and d["available"] is True  # v-префикс срезается
 
 
+def test_panel_package_app_extraction(app, env):
+    # шаг 7 (финал): Flask-app и все роуты — panel/app.py; naivepanel.py —
+    # тонкий entrypoint (шим + log-trim + _serve/main). Flask-объект тот же,
+    # имя приложения сохранено (логгер 'naivepanel'), шаблоны находятся.
+    import panel.app as appmod
+    assert appmod.app is app.app, "Flask-объект должен быть тем же"
+    assert app.app.name == "naivepanel", "имя приложения = имя логгера"
+    assert app._api_json_errors is appmod._api_json_errors
+    rules = {r.rule for r in app.app.url_map.iter_rules()}
+    for must in ("/api/status", "/api/configs", "/api/configs/import",
+                 "/api/failover", "/api/e2e/history", "/api/update/apply",
+                 "/api/naive/update", "/api/rollback", "/api/logs",
+                 "/api/password", "/api/notify/telegram"):
+        assert must in rules, must
+    r = app.app.test_client().get("/")
+    assert r.status_code == 200 and b"NaivePanel" in r.data  # шаблон найден
+
+
 def test_backup_and_restore_include_panel_package(app, env):
     # бэкап/откат обязаны знать о пакете: пропавший panel/*.py после
     # отката панели = нерабочая установка
@@ -5019,21 +5037,24 @@ def test_backup_and_restore_include_panel_package(app, env):
     (pkg / "presets.py").write_text("# current presets", encoding="utf-8")
     (pkg / "service.py").write_text("# current service", encoding="utf-8")
     (pkg / "monitor.py").write_text("# current monitor", encoding="utf-8")
+    (pkg / "app.py").write_text("# current app", encoding="utf-8")
     backup = app._backup_panel_files()
     assert (backup / "panel" / "config.py").read_text() == "# current config"
     assert (backup / "panel" / "security.py").read_text() == "# current security"
     assert (backup / "panel" / "presets.py").read_text() == "# current presets"
     assert (backup / "panel" / "service.py").read_text() == "# current service"
     assert (backup / "panel" / "monitor.py").read_text() == "# current monitor"
+    assert (backup / "panel" / "app.py").read_text() == "# current app"
     # симулируем «обновление», затёршее пакет, и откат
     (pkg / "config.py").write_text("# new version", encoding="utf-8")
     (pkg / "security.py").write_text("# new version", encoding="utf-8")
     (pkg / "presets.py").write_text("# new version", encoding="utf-8")
     (pkg / "service.py").write_text("# new version", encoding="utf-8")
     (pkg / "monitor.py").write_text("# new version", encoding="utf-8")
+    (pkg / "app.py").write_text("# new version", encoding="utf-8")
     import shutil as _sh
     for name in ("config.py", "security.py", "presets.py", "service.py",
-                 "monitor.py"):
+                 "monitor.py", "app.py"):
         src = backup / "panel" / name
         tmp = (pkg / name).with_name(name + ".restore")
         _sh.copy2(src, tmp)
@@ -5043,7 +5064,7 @@ def test_backup_and_restore_include_panel_package(app, env):
 
 def test_install_sh_ships_panel_package(app):
     src = (APP_DIR / "install.sh").read_text(encoding="utf-8")
-    assert 'PANEL_PKG="__init__.py config.py security.py presets.py service.py monitor.py updates.py"' in src, \
+    assert 'PANEL_PKG="__init__.py config.py security.py presets.py service.py monitor.py updates.py app.py"' in src, \
         "installer не качает пакет"
     assert '"$BASE/panel/$f"' in src, "нет загрузки файлов пакета"
     assert 'rm -rf "$PANEL_DIR/panel"' in src, "пакет не заменяется целиком"
@@ -5056,5 +5077,6 @@ def test_sha256sums_covers_panel_package(app):
     listed = {parts[1] for parts in (l.split(maxsplit=1) for l in lines) if len(parts) == 2}
     for f in ("naivepanel.py", "panel/__init__.py", "panel/config.py",
               "panel/security.py", "panel/presets.py", "panel/service.py",
-              "panel/monitor.py", "panel/updates.py", "templates/index.html"):
+              "panel/monitor.py", "panel/updates.py", "panel/app.py",
+              "templates/index.html"):
         assert f in listed, f"{f} нет в SHA256SUMS"

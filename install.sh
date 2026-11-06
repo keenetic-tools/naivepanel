@@ -498,7 +498,7 @@ fetch "$BASE/templates/index.html"    >"$STAGE/templates/index.html" || die "tem
 fetch "$BASE/S99naivepanel"           >"$STAGE/S99naivepanel"       || die "S99naivepanel"
 fetch "$BASE/S99naiveproxy"           >"$STAGE/S99naiveproxy"       || die "S99naiveproxy"
 # backend-пакет panel/ (ARCH-01): каждый модуль — отдельный файл релиза
-PANEL_PKG="__init__.py config.py security.py presets.py service.py monitor.py updates.py"
+PANEL_PKG="__init__.py config.py security.py presets.py service.py monitor.py updates.py app.py"
 mkdir -p "$STAGE/panel"
 for f in $PANEL_PKG; do
     fetch "$BASE/panel/$f" >"$STAGE/panel/$f" || die "panel/$f"
