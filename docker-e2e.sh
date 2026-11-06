@@ -83,7 +83,9 @@ cat > "$WORK/Dockerfile" <<'DOCKER'
 ARG BASE_IMAGE=debian:bookworm-slim
 FROM ${BASE_IMAGE}
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates curl wget xz-utils python3 openssl \
+ && apt-get install -y --no-install-recommends ca-certificates curl wget xz-utils python3 openssl musl \
+# musl: openwrt-x86_64 сборка naive динамическая (ld-musl-x86_64.so.1);
+#       aarch64-ассеты -static, а x86_64 static не выпускается
  && rm -rf /var/lib/apt/lists/*
 COPY certs/ca.crt /usr/local/share/ca-certificates/np-e2e-ca.crt
 RUN update-ca-certificates
