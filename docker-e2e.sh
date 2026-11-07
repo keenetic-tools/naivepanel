@@ -240,16 +240,27 @@ printf '#!/bin/sh\nDAEMON_OPTS=/opt/etc/naiveproxy/config.json\n[ -f /opt/etc/na
 printf 'OTHER_VAR="keep"\nNAIVEPANEL_BIND="10.9.9.9:1234"\n' > /opt/etc/init.d/rc.conf
 # SEC-01 preflight: явный LAN-bind без пароля установщик отвергает; для
 # позитивного апгрейд-сценария (flag wins) создаём admin.pass — префлайт
-# проверяет его существование
+# проверяет его существование.
+# Позитивный bind — 127.0.0.2: любой 127/8 в Linux доступен без настройки
+# интерфейса, поэтому панель реально стартует и smoke что-то проверяет.
+# 192.168.1.1 в контейнере не принадлежит интерфейсу: install.sh выживал
+# (restart/smoke — warning), но smoke ждал TCP-таймаут ~2 мин × 5.
 printf 'admin:dummy-for-preflight\n' > /opt/etc/naive/panel/admin.pass
-curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/$REF/install.sh | sh -s -- --yes --bind 192.168.1.1:8089
-if grep -q '^NAIVEPANEL_BIND="192.168.1.1:8089"' /opt/etc/naive/panel/panel.conf \
+curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/$REF/install.sh | sh -s -- --yes --bind 127.0.0.2:8089
+if grep -q '^NAIVEPANEL_BIND="127.0.0.2:8089"' /opt/etc/naive/panel/panel.conf \
    && ! grep -q 'NAIVEPANEL' /opt/etc/init.d/rc.conf \
    && grep -q '^OTHER_VAR=' /opt/etc/init.d/rc.conf; then
   echo "panel.conf migration: OK (flag wins, rc.conf cleaned, other keys kept)"
 else
   echo "FAIL: panel.conf migration"; cat /opt/etc/naive/panel/panel.conf /opt/etc/init.d/rc.conf; exit 1
 fi
+# миграция bind должна не только записать panel.conf, но и поднять панель
+code=\$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 2 --max-time 3 http://127.0.0.2:8089/api/status || true)
+case "\$code" in
+  200|401) echo "panel on migrated bind: OK (HTTP \$code)" ;;
+  *) echo "FAIL: panel did not start on migrated bind (HTTP \${code:-none})"
+     cat /opt/var/log/naivepanel.log; exit 1 ;;
+esac
 # а без пароля тот же флаг обязан валить установку (fail-closed)
 rm -f /opt/etc/naive/panel/admin.pass
 if curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/$REF/install.sh \

@@ -5070,6 +5070,16 @@ def test_install_sh_ships_panel_package(app):
     assert 'rm -rf "$PANEL_DIR/panel"' in src, "пакет не заменяется целиком"
 
 
+def test_install_smoke_curl_has_timeouts(app):
+    # недоступный bind (LAN-адрес не принадлежит интерфейсу) не должен
+    # вешать установку на дефолтный TCP-таймаут × 5 попыток
+    src = (APP_DIR / "install.sh").read_text(encoding="utf-8")
+    m = re.search(r"code=\$\(curl[^\n]*api/status[^\n]*\)", src)
+    assert m, "smoke-цикл install.sh не найден"
+    line = m.group(0)
+    assert "--connect-timeout" in line and "--max-time" in line, line
+
+
 def test_sha256sums_covers_panel_package(app):
     # установщик проверяет чексуммы SHA256SUMS: каждый файл пакета обязан
     # быть перечислен, иначе fresh-install падает на верификации

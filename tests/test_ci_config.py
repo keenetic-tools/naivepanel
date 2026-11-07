@@ -79,6 +79,18 @@ def test_docker_e2e_ships_panel_package_and_is_arch_aware():
     assert 'bin.entware.net/$ENTWARE_ARCH/' in script
 
 
+def test_docker_e2e_upgrade_bind_is_reachable():
+    # Позитивный upgrade-сценарий обязан ставить панель на реально
+    # доступный в контейнере адрес (любой 127/8), иначе restart падает,
+    # smoke ждёт TCP-таймаут, а сценарий ничего не проверяет.
+    script = (APP_DIR / "docker-e2e.sh").read_text(encoding="utf-8")
+    assert "--bind 127.0.0.2:8089" in script
+    assert 'NAIVEPANEL_BIND="127.0.0.2:8089"' in script
+    # LAN-bind без пароля остаётся негативным preflight-тестом
+    assert "--bind 192.168.1.1:8089" in script
+    assert "panel on migrated bind: OK" in script
+
+
 def test_dev_and_runtime_dependencies_are_exactly_pinned():
     runtime = dict(_pins(APP_DIR / "requirements-runtime.txt"))
     dev = dict(_pins(APP_DIR / "requirements-dev.txt"))

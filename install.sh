@@ -752,7 +752,9 @@ if command -v curl >/dev/null 2>&1; then
     # flask cold start on a slow router can exceed 1s — retry before warning
     code=""
     for _ in 1 2 3 4 5; do
-        code=$(curl -s -o /dev/null -w '%{http_code}' "http://$BIND_ADDR/api/status" 2>/dev/null || true)
+        # таймауты обязательны: bind может указывать на чужой/недоступный
+        # адрес, и дефолтный TCP-таймаут подвесил бы установку на минуты
+        code=$(curl -s --connect-timeout 2 --max-time 3 -o /dev/null -w '%{http_code}' "http://$BIND_ADDR/api/status" 2>/dev/null || true)
         case "$code" in 200|401) break ;; esac
         sleep 1
     done
