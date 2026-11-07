@@ -5151,13 +5151,28 @@ def test_connections_snapshot_counts_established_and_clients(app, tmp_path):
                    + _tcp_line("0100007F:1F90", "0501A8C0:1111")   # клиент A
                    + _tcp_line("0100007F:1F90", "0501A8C0:2222")   # клиент A, второй сокет
                    + _tcp_line("0100007F:1F90", "0601A8C0:3333")   # клиент B
-                   + _tcp_line("0100007F:1F90", "0100007F:4444")   # loopback — мимо
+                   + _tcp_line("0100007F:1F90", "0100007F:4444")   # loopback: в established
                    + _tcp_line("0100007F:1F90", "0501A8C0:5555", "06")  # TIME_WAIT
                    + _tcp_line("0100007F:2328", "0501A8C0:6666"),  # другой порт
                    encoding="utf-8")
     assert snapshot({0x1F90}, allow_loopback=False,
                     tcp_path=tcp, tcp6_path=tmp_path / "missing") == {
-        "established": 3, "clients": 2,
+        # loopback считается соединением (xray), но не клиентом
+        "established": 4, "clients": 2,
+    }
+
+
+def test_connections_snapshot_counts_local_forwarder_tunnels(app, tmp_path):
+    # Реальная картина с xray: 7 прямых сокетов + 12 туннелей с 127.0.0.1.
+    from panel.connections import snapshot
+    tcp = tmp_path / "tcp"
+    direct = [_tcp_line("0100007F:1F90", "5301A8C0:1111") for _ in range(7)]
+    local = [_tcp_line("0100007F:1F90", f"0100007F:{0x2000 + i:04X}")
+             for i in range(12)]
+    tcp.write_text(_PROC_HEADER + "".join(direct + local), encoding="utf-8")
+    assert snapshot({0x1F90}, allow_loopback=False,
+                    tcp_path=tcp, tcp6_path=tmp_path / "missing") == {
+        "established": 19, "clients": 1,
     }
 
 
@@ -5239,8 +5254,9 @@ def test_connections_ui_rows(app):
     assert m, "renderStatus() не найден в index.html"
     body = m.group(0)
     assert "st.connections" in body, "UI не читает connections из статуса"
-    assert "соединений" in body and "клиентов" in body, "нет строк счётчика"
-    assert "loopback" in body, "нет пояснения про loopback в title"
+    assert "соединений" in body, "нет строки счётчика"
+    assert "клиентов" not in body, "клиенты не считаются при локальном форвардере"
+    assert "локальный форвардер" in body, "нет пояснения про форвардер в title"
 
 
 @pytest.mark.skipif(not Path("/proc/net/tcp").exists(), reason="нет procfs")

@@ -757,14 +757,13 @@ function renderStatus(st) {
     : '<span class="off">'+dotOff+' остановлен</span>' + (st.current ? ' · пресет: '+escapeHtml(st.current) : ''))
     + ver;
   const conn = st.connections;
-  const connTip = 'ESTABLISHED на listen-порту активного пресета, loopback исключён';
+  const connTip = 'ESTABLISHED на listen-портах активного пресета, включая локальный форвардер';
   const rows = [
     ['состояние', st.active ? '<span class="on">'+dotOn+' работает</span>' : '<span class="off">'+dotOff+' остановлен</span>'],
     ['пресет', st.current ? escapeHtml(st.current) : '—'],
     ['uptime', st.active ? fmtUptime(st.uptime) : '—'],
     ['pid', st.active && st.pid != null ? String(st.pid) : '—'],
     ['соединений', conn ? '<span title="'+connTip+'">'+conn.established+'</span>' : '—'],
-    ['клиентов', conn ? String(conn.clients) : '—'],
     ['watchdog', st.watchdog
       ? (st.watchdog.tripped ? 'выкл (флаппинг)'
          : st.watchdog.enabled ? 'вкл' + (st.watchdog.restarts ? ' · ↻'+st.watchdog.restarts : '')

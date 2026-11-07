@@ -82,6 +82,12 @@ def snapshot(ports: set[int], allow_loopback: bool,
              tcp6_path: Path = Path("/proc/net/tcp6")) -> dict | None:
     """Снимок ESTABLISHED на listen-портах: {"established", "clients"}.
 
+    `established` считает все сокеты, включая loopback: за локальным
+    форвардером (xray и т.п.) реальные клиенты видны только как 127.0.0.1,
+    и без них счётчик терял бы нагрузку. `clients` — уникальные не-loopback
+    адреса (прямые клиенты), если allow_loopback=False; при loopback-only
+    listen loopback считается и клиентом.
+
     None — если портов нет или не читается ни один из файлов /proc
     (например, на macOS). Один доступный файл — уже достаточный результат.
     """
@@ -99,12 +105,12 @@ def snapshot(ports: set[int], allow_loopback: bool,
         for port, addr, state in parse_proc_net(text):
             if state != ESTABLISHED or port not in ports:
                 continue
+            established += 1
             if not allow_loopback:
                 try:
                     if ipaddress.ip_address(addr).is_loopback:
                         continue
                 except ValueError:
                     continue
-            established += 1
             clients.add(addr)
     return {"established": established, "clients": len(clients)}

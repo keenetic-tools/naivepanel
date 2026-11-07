@@ -56,10 +56,11 @@ HTML page — no CDN, no build step. MIT-licensed.
   в статус-карте (v0.13).
 - Watchdog (v0.12): панель сама поднимает упавший naive; состояние и счётчик
   рестартов — в статус-карте (см. ниже).
-- Счётчик активных соединений (2.2): ESTABLISHED на listen-порту активного
-  пресета и число уникальных клиентов — из `/proc/net/tcp{,6}`, без `ss`,
-  `netstat` и изменений в naive. Loopback-пробы панели исключены; если
-  `/proc` недоступен, строки показывают «—».
+- Счётчик активных соединений (2.2): ESTABLISHED на всех listen-портах
+  активного пресета, включая трафик локального форвардера (xray и т.п.), —
+  из `/proc/net/tcp{,6}`, без `ss`, `netstat` и изменений в naive. В API
+  также отдаются уникальные прямые клиенты (`clients`), в UI показывается
+  только счётчик соединений. Если `/proc` недоступен — «—».
 - Автофейловер (v0.12): цепочка пресетов «основной → запасные» — после
   порога неудачных E2E-проверок панель переключает на следующий (см. ниже).
   Управление — в списке пресетов (v0.17): бейдж роли (`осн.`/`№N`), тумблер
@@ -99,7 +100,7 @@ HTML page — no CDN, no build step. MIT-licensed.
 
 | Метод | Путь | Что делает |
 |-------|------|------------|
-| `GET` | `/api/status` | `{active, current, init_present, init_script, pid, uptime, version, watchdog, failover, connections}`; `connections` — `{established, clients}` или `null`, если счётчик недоступен |
+| `GET` | `/api/status` | `{active, current, init_present, init_script, pid, uptime, version, watchdog, failover, connections}`; `connections` — `{established, clients}` или `null`: `established` включает loopback (трафик локального форвардера), `clients` — только уникальные не-loopback адреса |
 | `GET` | `/api/configs` | список пресетов `{name, active, listen, proxy, username}`; `proxy` замаскирован (`https://user:***@host`), ответ `no-store` |
 | `GET` | `/api/configs/<name>` | полный JSON-конфиг пресета **без пароля** (upstream/username разобраны из proxy-URI для любой схемы https/http/quic, ответ `no-store`) |
 | `POST` | `/api/configs` | создать пресет |
