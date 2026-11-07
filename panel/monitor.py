@@ -12,6 +12,7 @@ _http_get — общий сетевой хелпер (нужен Telegram-вал
 с модульной ручкой cfg не затеняют её. Логгер — тот же 'naivepanel'.
 """
 
+import ipaddress
 import json
 import logging
 import os
@@ -30,6 +31,7 @@ from flask import abort, has_request_context, request
 from werkzeug.exceptions import HTTPException
 
 from panel import config as cfg
+from panel import connections
 from panel import presets as pres
 from panel import service as svc
 
@@ -377,18 +379,49 @@ def _proxy_e2e_check(listen_uri: str, timeout: float = cfg.E2E_TIMEOUT) -> dict[
                 pass
 
 
-def _active_listen() -> str | None:
-    """listen активного пресета из config.json (первый адрес, если массив)."""
+def _active_listen_uris() -> list[str]:
+    """Все listen-адреса активного пресета (строка или массив)."""
     try:
         cfgd = json.loads(cfg.ACTIVE_CONFIG.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return None
+        return []
     raw = cfgd.get("listen")
+    if isinstance(raw, str):
+        return [raw.strip()] if raw.strip() else []
     if isinstance(raw, list):
-        raw = raw[0] if raw else None
-    if isinstance(raw, str) and raw.strip():
-        return raw.strip()
-    return None
+        return [item.strip() for item in raw
+                if isinstance(item, str) and item.strip()]
+    return []
+
+
+def _active_listen() -> str | None:
+    """listen активного пресета из config.json (первый адрес, если массив)."""
+    uris = _active_listen_uris()
+    return uris[0] if uris else None
+
+
+def _host_is_loopback(host: str) -> bool:
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _active_listen_ports() -> tuple[set[int], bool]:
+    """Порты активного пресета и «весь listen привязан к loopback»."""
+    ports: set[int] = set()
+    hosts: list[str] = []
+    for uri in _active_listen_uris():
+        ep = _listen_endpoint(uri)
+        if ep is None:
+            continue
+        _scheme, host, port = ep
+        ports.add(port)
+        hosts.append(host)
+    allow_loopback = bool(ports) and all(_host_is_loopback(h) for h in hosts)
+    return ports, allow_loopback
 
 
 # --- История E2E-проверок: кольцевой буфер -----------------------------------
@@ -467,11 +500,19 @@ def _status() -> dict[str, Any]:
     # context request.authorization бросил бы RuntimeError.
     auth = request.authorization if has_request_context() else None
     channel = _notify_channel()
+    # Счётчик диагностический: сбой чтения /proc не должен ронять статус.
+    try:
+        ports, allow_loopback = _active_listen_ports()
+        conns = connections.snapshot(ports, allow_loopback)
+    except Exception:  # noqa: BLE001 — граница диагностического снимка
+        log.debug("connections snapshot failed", exc_info=True)
+        conns = None
     return {
         "version": cfg.APP_VERSION,
         "active": running,
         "pid": pid,
         "uptime": uptime,
+        "connections": conns,
         "current": active_name,
         "init_script": str(cfg.INIT_SCRIPT),
         "init_present": has_init,
@@ -1234,6 +1275,8 @@ __all__ = [
     "_Watchdog",
     "_activate_preset",
     "_active_listen",
+    "_active_listen_ports",
+    "_active_listen_uris",
     "_apply_active",
     "_bot_cache",
     "_e2e_history_append",

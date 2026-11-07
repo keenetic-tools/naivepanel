@@ -73,7 +73,9 @@ def test_docker_e2e_ships_panel_package_and_is_arch_aware():
     script = (APP_DIR / "docker-e2e.sh").read_text(encoding="utf-8")
     # Без panel/ установка с Entware падает: install.sh тянет модули пакета.
     assert 'cp "$REPO_DIR"/panel/*.py "$WWW/panel/"' in script
-    assert 'ENTWARE_ARCH=x86-64' in script
+    # c0f2715: x86_64-фид Entware — x64-k3.2 (x86-64 в фиде отсутствует)
+    assert 'x86_64|amd64)  ENTWARE_ARCH=x64-k3.2' in script
+    assert 'aarch64) ENTWARE_ARCH=aarch64-k3.10' in script
     assert 'bin.entware.net/$ENTWARE_ARCH/' in script
 
 

@@ -5064,7 +5064,7 @@ def test_backup_and_restore_include_panel_package(app, env):
 
 def test_install_sh_ships_panel_package(app):
     src = (APP_DIR / "install.sh").read_text(encoding="utf-8")
-    assert 'PANEL_PKG="__init__.py config.py security.py presets.py service.py monitor.py updates.py app.py"' in src, \
+    assert 'PANEL_PKG="__init__.py config.py security.py presets.py service.py connections.py monitor.py updates.py app.py"' in src, \
         "installer не качает пакет"
     assert '"$BASE/panel/$f"' in src, "нет загрузки файлов пакета"
     assert 'rm -rf "$PANEL_DIR/panel"' in src, "пакет не заменяется целиком"
@@ -5078,5 +5078,178 @@ def test_sha256sums_covers_panel_package(app):
     for f in ("naivepanel.py", "panel/__init__.py", "panel/config.py",
               "panel/security.py", "panel/presets.py", "panel/service.py",
               "panel/monitor.py", "panel/updates.py", "panel/app.py",
-              "templates/index.html"):
+              "panel/connections.py", "templates/index.html"):
         assert f in listed, f"{f} нет в SHA256SUMS"
+
+
+# --- 2.2: счётчик активных соединений -----------------------------------------
+
+_PROC_HEADER = (
+    "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt"
+    "   uid  timeout inode\n"
+)
+
+
+def test_connections_parse_proc_net_ipv4(app):
+    from panel.connections import parse_proc_net
+    text = _PROC_HEADER + (
+        "   0: 0100007F:1F90 0501A8C0:D431 01 00000000:00000000"
+        " 00:00000000 00000000  1000        0 12345 1 0000000000000000 100 0 0 10 0\n"
+    )
+    assert list(parse_proc_net(text)) == [(0x1F90, "192.168.1.5", "01")]
+
+
+def test_connections_parse_proc_net_ipv6_and_mapped(app):
+    from panel.connections import parse_proc_net
+    text = _PROC_HEADER + (
+        "   0: 00000000000000000000000000000000:0438"
+        " 00000000000000000000000001000000:9C40 01 00000000:00000000"
+        " 00:00000000 00000000  1000        0 12345 1 0000000000000000 100 0 0 10 0\n"
+        "   1: 00000000000000000000000000000000:0438"
+        " 0000000000000000FFFF00000501A8C0:9C41 01 00000000:00000000"
+        " 00:00000000 00000000  1000        0 12346 1 0000000000000000 100 0 0 10 0\n"
+    )
+    assert list(parse_proc_net(text)) == [
+        (0x438, "::1", "01"),
+        (0x438, "192.168.1.5", "01"),
+    ]
+
+
+def test_connections_parse_proc_net_skips_malformed(app):
+    from panel.connections import parse_proc_net
+    text = _PROC_HEADER + (
+        "   0: broken\n"
+        "   1: 0100007F:ZZZZ 0501A8C0:D431 01\n"
+        "   2: 0100007F:1F90 ZZZZ:D431 01\n"
+        "   3: 0100007F:1F90 0501A8C0:D431 01 00000000:00000000"
+        " 00:00000000 00000000  1000        0 12347 1 0000000000000000 100 0 0 10 0\n"
+    )
+    assert list(parse_proc_net(text)) == [(0x1F90, "192.168.1.5", "01")]
+
+
+def _tcp_line(local: str, remote: str, state: str = "01") -> str:
+    return (
+        f"   0: {local} {remote} {state} 00000000:00000000"
+        " 00:00000000 00000000  1000        0 12345 1 0000000000000000 100 0 0 10 0\n"
+    )
+
+
+def test_connections_snapshot_counts_established_and_clients(app, tmp_path):
+    from panel.connections import snapshot
+    tcp = tmp_path / "tcp"
+    tcp.write_text(_PROC_HEADER
+                   + _tcp_line("0100007F:1F90", "0501A8C0:1111")   # клиент A
+                   + _tcp_line("0100007F:1F90", "0501A8C0:2222")   # клиент A, второй сокет
+                   + _tcp_line("0100007F:1F90", "0601A8C0:3333")   # клиент B
+                   + _tcp_line("0100007F:1F90", "0100007F:4444")   # loopback — мимо
+                   + _tcp_line("0100007F:1F90", "0501A8C0:5555", "06")  # TIME_WAIT
+                   + _tcp_line("0100007F:2328", "0501A8C0:6666"),  # другой порт
+                   encoding="utf-8")
+    assert snapshot({0x1F90}, allow_loopback=False,
+                    tcp_path=tcp, tcp6_path=tmp_path / "missing") == {
+        "established": 3, "clients": 2,
+    }
+
+
+def test_connections_snapshot_loopback_only_listen(app, tmp_path):
+    from panel.connections import snapshot
+    tcp = tmp_path / "tcp"
+    tcp.write_text(_PROC_HEADER
+                   + _tcp_line("0100007F:1F90", "0100007F:1111")
+                   + _tcp_line("0100007F:1F90", "0100007F:2222"),
+                   encoding="utf-8")
+    assert snapshot({0x1F90}, allow_loopback=True,
+                    tcp_path=tcp, tcp6_path=tmp_path / "missing") == {
+        "established": 2, "clients": 1,
+    }
+
+
+def test_connections_snapshot_without_proc(app, tmp_path):
+    from panel.connections import snapshot
+    assert snapshot({0x1F90}, allow_loopback=False,
+                    tcp_path=tmp_path / "missing",
+                    tcp6_path=tmp_path / "missing2") is None
+    assert snapshot(set(), allow_loopback=False,
+                    tcp_path=tmp_path / "missing",
+                    tcp6_path=tmp_path / "missing2") is None
+
+
+def _write_active(env, listen) -> None:
+    proxy = env / "proxy"
+    proxy.mkdir(parents=True, exist_ok=True)
+    (proxy / "config.json").write_text(json.dumps({"listen": listen}), encoding="utf-8")
+
+
+def test_connections_active_listen_ports_mixed(app, env):
+    _write_active(env, ["socks://127.0.0.1:1080", "http://0.0.0.0:8080"])
+    assert app.mon._active_listen_ports() == ({1080, 8080}, False)
+
+
+def test_connections_active_listen_ports_loopback_defaults(app, env):
+    _write_active(env, ["socks://127.0.0.1", "http://[::1]"])
+    assert app.mon._active_listen_ports() == ({1080, 8080}, True)
+
+
+def test_connections_active_listen_ports_invalid(app, env):
+    _write_active(env, ["ftp://127.0.0.1:21", "http://:8080"])
+    assert app.mon._active_listen_ports() == (set(), False)
+
+
+def test_connections_status_includes_snapshot(app, env, monkeypatch):
+    _write_active(env, "127.0.0.1:1080")
+    monkeypatch.setattr(app.svc, "_proxy_running", lambda: (True, 4242, 99))
+    seen = {}
+
+    def fake(ports, allow_loopback):
+        seen["args"] = (ports, allow_loopback)
+        return {"established": 3, "clients": 2}
+
+    monkeypatch.setattr(app.mon.connections, "snapshot", fake)
+    st = app.app.test_client().get("/api/status").get_json()
+    assert st["connections"] == {"established": 3, "clients": 2}
+    assert seen["args"] == ({1080}, True)
+
+
+def test_connections_status_survives_snapshot_failure(app, env, monkeypatch):
+    _write_active(env, "127.0.0.1:1080")
+    monkeypatch.setattr(app.svc, "_proxy_running", lambda: (True, 4242, 99))
+
+    def boom(ports, allow_loopback):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(app.mon.connections, "snapshot", boom)
+    r = app.app.test_client().get("/api/status")
+    assert r.status_code == 200
+    assert r.get_json()["connections"] is None
+
+
+def test_connections_ui_rows(app):
+    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    m = re.search(r"function renderStatus\(st\) \{.*?\n\}", html, re.S)
+    assert m, "renderStatus() не найден в index.html"
+    body = m.group(0)
+    assert "st.connections" in body, "UI не читает connections из статуса"
+    assert "соединений" in body and "клиентов" in body, "нет строк счётчика"
+    assert "loopback" in body, "нет пояснения про loopback в title"
+
+
+@pytest.mark.skipif(not Path("/proc/net/tcp").exists(), reason="нет procfs")
+def test_connections_snapshot_real_socket(app):
+    # Linux-only: настоящий listen-сокет + клиент должны попасть в снимок.
+    import socket as _socket
+    from panel.connections import snapshot
+    srv = _socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    port = srv.getsockname()[1]
+    cli = _socket.create_connection(("127.0.0.1", port), timeout=2)
+    conn, _ = srv.accept()
+    try:
+        snap = snapshot({port}, allow_loopback=True)
+        assert snap is not None
+        assert snap["established"] >= 1
+        assert snap["clients"] >= 1
+    finally:
+        conn.close()
+        cli.close()
+        srv.close()

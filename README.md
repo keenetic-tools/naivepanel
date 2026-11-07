@@ -22,7 +22,8 @@ HTML page — no CDN, no build step. MIT-licensed.
 
 ## Возможности UI
 
-- Карточка статуса: состояние, активный пресет, uptime, PID, версия панели.
+- Карточка статуса: состояние, активный пресет, uptime, PID, соединения/клиенты,
+  версия панели.
 - Поиск по пресетам (клавиша `/`), дублирование пресета в один клик (⧉ —
   пароль переносится, руками вводить не нужно).
 - Экспорт/импорт всех пресетов JSON-файлом (бэкап/миграция между роутерами).
@@ -55,6 +56,10 @@ HTML page — no CDN, no build step. MIT-licensed.
   в статус-карте (v0.13).
 - Watchdog (v0.12): панель сама поднимает упавший naive; состояние и счётчик
   рестартов — в статус-карте (см. ниже).
+- Счётчик активных соединений (2.2): ESTABLISHED на listen-порту активного
+  пресета и число уникальных клиентов — из `/proc/net/tcp{,6}`, без `ss`,
+  `netstat` и изменений в naive. Loopback-пробы панели исключены; если
+  `/proc` недоступен, строки показывают «—».
 - Автофейловер (v0.12): цепочка пресетов «основной → запасные» — после
   порога неудачных E2E-проверок панель переключает на следующий (см. ниже).
   Управление — в списке пресетов (v0.17): бейдж роли (`осн.`/`№N`), тумблер
@@ -94,7 +99,7 @@ HTML page — no CDN, no build step. MIT-licensed.
 
 | Метод | Путь | Что делает |
 |-------|------|------------|
-| `GET` | `/api/status` | `{active, current, init_present, init_script, pid, uptime, version, watchdog, failover}` |
+| `GET` | `/api/status` | `{active, current, init_present, init_script, pid, uptime, version, watchdog, failover, connections}`; `connections` — `{established, clients}` или `null`, если счётчик недоступен |
 | `GET` | `/api/configs` | список пресетов `{name, active, listen, proxy, username}`; `proxy` замаскирован (`https://user:***@host`), ответ `no-store` |
 | `GET` | `/api/configs/<name>` | полный JSON-конфиг пресета **без пароля** (upstream/username разобраны из proxy-URI для любой схемы https/http/quic, ответ `no-store`) |
 | `POST` | `/api/configs` | создать пресет |
