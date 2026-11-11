@@ -5,6 +5,7 @@ import, поэтому фикстура делает importlib.reload на ка�
 """
 import base64
 import importlib
+import io
 import json
 import os
 import re
@@ -5576,3 +5577,64 @@ def test_ui_uptime_stats_row(app):
     body = m.group(0)
     assert "st.uptime_stats" in body, "UI не читает uptime_stats"
     assert "аптайм 24ч/7д" in body, "нет строки аптайм-статистики"
+
+
+# --- busybox-тар без -J (фид 1.38): распаковка naive-тарболла -------------------
+
+class _ProcResult:
+    def __init__(self, rc=0, out="", err=""):
+        self.returncode, self.stdout, self.stderr = rc, out, err
+
+
+class _PipeProc:
+    """Popen-заглушка для конвейера xz -dc | tar -xf -."""
+    def __init__(self):
+        self.stdout = io.StringIO("stream")
+        self.rc = 0
+    def wait(self, timeout=None):
+        return self.rc
+
+
+def test_untar_xz_direct_path(app, monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(app.upd.subprocess, "run",
+                        lambda cmd, **kw: calls.append(cmd) or _ProcResult(0))
+    app.upd._untar_xz(tmp_path / "a.tar.xz", tmp_path)
+    assert calls[0][:2] == ["tar", "-xJf"]  # прямой путь — без opkg/pipeline
+
+
+def test_untar_xz_busybox_fallback(app, monkeypatch, tmp_path):
+    # busybox-тар отверг -J → opkg install xz → конвейер xz -dc | tar -xf -
+    def fake_run(cmd, **kw):
+        if cmd[:2] == ["tar", "-xJf"]:
+            return _ProcResult(1, err="tar: invalid option -- 'J'")
+        assert cmd[:2] == ["opkg", "install"], cmd
+        return _ProcResult(0)
+    pipe = _PipeProc()
+    monkeypatch.setattr(app.upd.subprocess, "run", fake_run)
+    monkeypatch.setattr(app.upd.subprocess, "Popen",
+                        lambda cmd, **kw: (_ for _ in ()).throw(AssertionError(cmd))
+                        if cmd[0] != "xz" else pipe)
+    seen = {}
+    def run2(cmd, **kw):
+        if cmd[:2] == ["tar", "-xf"]:
+            seen["tar_stdin"] = bool(kw.get("stdin"))
+            return _ProcResult(0)
+        return fake_run(cmd, **kw)
+    monkeypatch.setattr(app.upd.subprocess, "run", run2)
+    app.upd._untar_xz(tmp_path / "a.tar.xz", tmp_path)
+    assert seen["tar_stdin"]  # tar читает поток xz, не файл
+
+
+def test_untar_xz_pipeline_failure_raises(app, monkeypatch, tmp_path):
+    pipe = _PipeProc()
+    monkeypatch.setattr(app.upd.subprocess, "Popen", lambda cmd, **kw: pipe)
+    def run2(cmd, **kw):
+        if cmd[:2] == ["tar", "-xJf"]:
+            return _ProcResult(1, err="invalid option -- 'J'")
+        if cmd[:2] == ["tar", "-xf"]:
+            return _ProcResult(1, err="tar: short read")
+        return _ProcResult(0)
+    monkeypatch.setattr(app.upd.subprocess, "run", run2)
+    with pytest.raises(RuntimeError, match="xz -dc"):
+        app.upd._untar_xz(tmp_path / "a.tar.xz", tmp_path)

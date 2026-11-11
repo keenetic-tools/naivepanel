@@ -412,6 +412,41 @@ def _validate_tar_members(tgz: Path) -> None:
             raise RuntimeError(f"unsafe archive path: {name!r}")
 
 
+def _untar_xz(tgz: Path, dest: Path) -> None:
+    """Распаковка .tar.xz: `tar -xJf`, при неудаче — `xz -dc | tar -xf -`.
+
+    busybox-тар новых фидов Entware (1.38) не умеет -J, и пакет xz опцию в
+    таре не появляется — распаковываем по частям: настоящий xz наружу
+    (best-effort `opkg install xz`, как в install.sh), plain tar из stdin.
+    """
+    # nosec на последних строках вызовов (bandit привязывает их так);
+    # частичный PATH ("tar"/"xz") осознан: busybox или GNU выбирает окружение
+    r = subprocess.run(["tar", "-xJf", str(tgz), "-C", str(dest)],
+                       capture_output=True, text=True, timeout=120)  # nosec B603
+    if r.returncode == 0:
+        return
+    why = r.stderr.strip() or f"rc={r.returncode}"
+    subprocess.run(["opkg", "install", "xz"], capture_output=True,
+                   timeout=120)  # nosec B603 — best-effort, xz мог уже стоять
+    try:
+        xz = subprocess.Popen(["xz", "-dc", str(tgz)],
+                              stdout=subprocess.PIPE)  # nosec B603
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"tar -xJf failed ({why}); xz not found either") from exc
+    try:
+        tar = subprocess.run(["tar", "-xf", "-", "-C", str(dest)],
+                             stdin=xz.stdout, capture_output=True, text=True,
+                             timeout=120)  # nosec B603
+    finally:
+        if xz.stdout:
+            xz.stdout.close()
+        xz_rc = xz.wait(timeout=120)
+    if tar.returncode != 0 or xz_rc != 0:
+        raise RuntimeError("xz -dc | tar -xf failed: "
+                           + (tar.stderr.strip()
+                              or f"tar rc={tar.returncode}, xz rc={xz_rc}"))
+
+
 def _naive_update_worker() -> None:
     """Фоновое обновление /opt/bin/naive (запускается потоком из apply).
 
@@ -438,11 +473,7 @@ def _naive_update_worker() -> None:
         _naive_log(f"downloading {url}")
         _http_download(url, tgz)
         _validate_tar_members(tgz)  # до распаковки: вне stage писать нельзя
-        r = subprocess.run(["tar", "-xJf", str(tgz), "-C", str(stage)],
-                           capture_output=True, text=True, timeout=120)  # nosec B603
-        if r.returncode != 0:
-            raise RuntimeError("tar -xJf failed (xz missing? opkg install xz): "
-                               + (r.stderr.strip() or f"rc={r.returncode}"))
+        _untar_xz(tgz, stage)  # busybox-тар без -J — см. фолбэк внутри
         bins = sorted(stage.glob("naiveproxy-*/naive"))
         if not bins:
             raise RuntimeError("tarball contains no naiveproxy-*/naive")
@@ -615,6 +646,7 @@ __all__ = [
     "_update_state",
     "_update_state_read",
     "_update_state_write",
+    "_untar_xz",
     "_validate_tar_members",
     "_ver_key",
 ]

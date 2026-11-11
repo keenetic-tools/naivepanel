@@ -451,9 +451,12 @@ install_naive() {  # ставит /opt/bin/naive из релиза klzgrad/naive
         return 1
     fi
     if ! tar -xJf "$STAGE/naive.tar.xz" -C "$STAGE" 2>/dev/null; then
-        opkg install xz >/dev/null 2>&1
-        tar -xJf "$STAGE/naive.tar.xz" -C "$STAGE" || {
-            warn "tar -xJf failed (xz missing? try: opkg install xz)"
+        # busybox-тар новых фидов (1.38) не умеет -J, и пакет xz этого не
+        # чинит (опция lives в таре): распаковываем по частям — xz наружу,
+        # plain tar из stdin
+        opkg install xz >/dev/null 2>&1 || true
+        xz -dc "$STAGE/naive.tar.xz" | tar -xf - -C "$STAGE" || {
+            warn "cannot extract naive.tar.xz (tar without -J; tried: opkg install xz, xz -dc | tar -xf)"
             return 1
         }
     fi
@@ -694,11 +697,11 @@ EOF
     info "created $PANEL_CONF (settings template — uncomment what you need)"
 else
     # апгрейд с версий до v0.18.0: conf создавался 0644, а внутри могут
-    # быть токены уведомлений — закрываем group/other
-    if [ "$(stat -c %a "$PANEL_CONF" 2>/dev/null || echo 600)" != "600" ]; then
-        chmod 0600 "$PANEL_CONF" 2>/dev/null \
-            && info "panel.conf: chmod 0600 (notification tokens are private)"
-    fi
+    # быть токены уведомлений — закрываем group/other. chmod идемпотентен и
+    # безусловен: stat-guard молча пропускал бы ужесточение на новых фидах
+    # (busybox 1.38: stat-апплет не умеет -c)
+    chmod 0600 "$PANEL_CONF" 2>/dev/null \
+        && info "panel.conf: chmod 0600 (notification tokens are private)"
 fi
 
 # legacy: перенести NAIVEPANEL_BIND/HOSTS из rc.conf (v0.4.0 и раньше писали

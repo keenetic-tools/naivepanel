@@ -16,7 +16,7 @@
 set -eu
 
 REPO_DIR=$(cd "$(dirname "$0")" && pwd)
-REF=v0.22.1
+REF=v0.23.0
 BASE_IMAGE="${BASE_IMAGE:-debian:bookworm-slim}"
 AUTH_FLAG=""
 MODE_FLAGS="--yes"
@@ -173,7 +173,9 @@ echo "scheme reject=\$bad (expect 400)"
 echo "server: \$(curl -sI http://127.0.0.1:8089/api/status | tr -d '\r' | sed -n 's/^[Ss]erver: //p')"
 
 echo "==> SEC-04/05: panel.conf mode + stale-pid safety"
-pc_mode=\$(stat -c %a /opt/etc/naive/panel/panel.conf 2>/dev/null || echo '?')
+# /usr/bin/stat — именно GNU-стат Debian: /opt/bin/stat ссылается на busybox
+# (фид 1.38), чей stat-апплет не умеет -c
+pc_mode=\$(/usr/bin/stat -c %a /opt/etc/naive/panel/panel.conf 2>/dev/null || echo '?')
 echo "panel.conf mode: \$pc_mode (expect 600)"
 [ "\$pc_mode" = "600" ] || { echo "FAIL: panel.conf is \$pc_mode, not 0600"; exit 1; }
 # протухший pidfile: чужой процесс под pid naive — stop не должен его убить
