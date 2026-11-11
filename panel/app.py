@@ -90,6 +90,25 @@ def api_status():
     return jsonify(mon._status())
 
 
+@app.route("/proxy.pac")
+def proxy_pac():
+    """PAC-файл для устройств LAN (3.1): прокси = listen активного пресета.
+
+    Публичный путь (cfg._PUBLIC_GET_PATHS): устройства не могут предъявить
+    HTTP Basic, поэтому роут освобождён от _require_auth; Host-allowlist
+    (анти-DNS-rebinding) и SEC-01 fail-closed продолжают действовать.
+    Хост из Host-заголовка подставляется вместо listen на 0.0.0.0/:: —
+    устройство достигнет прокси по адресу, по которому получило сам PAC.
+    `?direct=1` добавляет DIRECT в конец (фолбэк «если прокси упал — ходить
+    напрямую»; без параметра падение прокси = явная ошибка соединения).
+    """
+    direct = request.args.get("direct") in ("1", "true")
+    body = mon._pac_body(request.host, direct)
+    resp = Response(body, mimetype="application/x-ns-proxy-autoconfig")
+    resp.headers["Cache-Control"] = "no-cache"  # пресет переключился — PAC другой
+    return resp
+
+
 @app.route("/api/notify")
 def api_notify_get():
     cfgd = mon._notify_snapshot()
@@ -220,6 +239,21 @@ def api_configs_get(name: str):
     cfgd = pres._load_json(cfg.CONF_D / f"{name}.json")
     resp = jsonify(pres._for_edit(cfgd))
     # username и структура ответа не для кеша (SEC-02)
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@app.route("/api/configs/parse", methods=["POST"])
+def api_configs_parse():
+    """Строка подключения → поля редактора («→ пресет» в UI, 3.2).
+
+    Разложение делает сервер одним парсером (pres.parse_connection_uri):
+    правила идентичны чтению конфигов — креды до последнего `@`,
+    percent-декодирование. Ответ может содержать пароль из ТЕЛА ЗАПРОСА
+    (ввод пользователя, не хранимый секрет) — no-store, как у config-GET.
+    """
+    data = request.get_json(silent=True) or {}
+    resp = jsonify(pres.parse_connection_uri(str(data.get("uri") or "")))
     resp.headers["Cache-Control"] = "no-store"
     return resp
 
@@ -1156,6 +1190,7 @@ __all__ = [
     "api_configs_get",
     "api_configs_import",
     "api_configs_list",
+    "api_configs_parse",
     "api_configs_update",
     "api_e2e",
     "api_e2e_history",
@@ -1184,4 +1219,5 @@ __all__ = [
     "api_update_log",
     "app",
     "index",
+    "proxy_pac",
 ]

@@ -311,11 +311,20 @@
       <button class="ghost" data-action="svc" data-arg="restart">Рестарт</button>
       <button class="ghost" data-action="e2e" id="btnE2e"
               title="Реальный запрос через listen-порт активного пресета: туннель до echo-сервера и exit-IP. TCP-пинг upstream есть в редакторе">Проверить прокси</button>
+      <button class="ghost" data-action="copyPac" id="btnPac"
+              title="Скопировать адрес PAC-файла — вставьте его в настройки автопрокси устройства (прокси = listen активного пресета; адрес, по которому открыта панель, должен быть достижим с устройства)">Скопировать PAC</button>
     </div>
     <div id="e2eInfo" style="font-size:12px;color:var(--mut);margin-top:8px">проверка: ещё не выполнялась</div>
     <h2 class="sect">Пресеты</h2>
     <input id="search" placeholder="Поиск пресета — /" aria-label="Поиск пресета"
            autocomplete="off" spellcheck="false">
+    <div style="display:flex;gap:6px;margin-top:6px;margin-bottom:10px">
+      <input id="quickUri" placeholder="Строка подключения — https://user:pass@host"
+             aria-label="Импорт пресета одной строкой" autocomplete="off" spellcheck="false"
+             style="flex:1;min-width:0">
+      <button type="button" class="ghost" data-action="quickImport" id="btnQuickUri"
+              title="Разложить URI по полям редактора: имя, upstream, username, пароль (https; http/quic остаются в upstream целиком)">→</button>
+    </div>
     <ul class="presets" id="presets" aria-busy="true">
       <li class="skel"></li><li class="skel"></li><li class="skel"></li>
     </ul>
@@ -758,10 +767,19 @@ function renderStatus(st) {
     + ver;
   const conn = st.connections;
   const connTip = 'ESTABLISHED на listen-портах активного пресета, включая локальный форвардер';
+  // аптайм 24ч/7д из журнала переходов; (Nч) — если наблюдений меньше окна
+  const us = st.uptime_stats;
+  const fmtUpPct = (w) => w == null ? '—'
+    : w.pct + '%' + (w.observed_s < 0.95*86400 ? ' ('+fmtSpan(w.observed_s)+')' : '');
+  const upTip = 'доля времени с работающим процессом naive'
+    + (us && us.restarts_day ? '; рестартов за сутки: '+us.restarts_day : '');
+  const upVal = us == null ? '—'
+    : '<span title="'+upTip+'">'+fmtUpPct(us.day)+' / '+fmtUpPct(us.week)+'</span>';
   const rows = [
     ['состояние', st.active ? '<span class="on">'+dotOn+' работает</span>' : '<span class="off">'+dotOff+' остановлен</span>'],
     ['пресет', st.current ? escapeHtml(st.current) : '—'],
     ['uptime', st.active ? fmtUptime(st.uptime) : '—'],
+    ['аптайм 24ч/7д', upVal],
     ['pid', st.active && st.pid != null ? String(st.pid) : '—'],
     ['соединений', conn ? '<span title="'+connTip+'">'+conn.established+'</span>' : '—'],
     ['watchdog', st.watchdog
@@ -1005,6 +1023,34 @@ async function newPreset() {
   setEditorState();
   renderPresets(lastPresets); // снять подсветку выбора
   $('f_name').focus();
+}
+
+// Импорт пресета одной строкой (3.2): вставил https://user:pass@host —
+// сервер разложил URI по полям (парсер один, см. /api/configs/parse),
+// редактор открыт и помечен «изменено». Имя — предложение из хоста;
+// занятое получает суффикс -2/-3 (как duplicate).
+async function quickImport() {
+  const raw = $('quickUri').value.trim();
+  if (!raw) { $('quickUri').focus(); return; }
+  let d;
+  try { d = await jpost('/api/configs/parse', {uri: raw}); }
+  catch (e) { flash(e.message, false); return; }
+  await newPreset();
+  let name = d.name || 'preset';
+  const taken = new Set((lastPresets || []).map(p => p.name));
+  for (let n = 2; taken.has(name); n++) name = (d.name || 'preset') + n;
+  $('f_name').value = name;
+  $('f_upstream').value = d.upstream || '';
+  $('f_username').value = d.username || '';
+  $('f_password').value = d.password || '';
+  dirty = true; // заполненный черновик: maybeDiscard спросит при уходе с редактора
+  $('quickUri').value = '';
+  if (!d.decomposed)
+    flash('URI не разложен по полям: схема '+d.scheme+':// осталась в upstream целиком — проверьте форму', false);
+  else if (!d.creds)
+    flash('Разложено, но кредов в строке не было — заполните username и пароль', false);
+  else flash('Разложено в редактор — проверьте имя и listen', true);
+  $('f_listen').focus();
 }
 
 // Единственная точка фактического закрытия редактора: del() переиспользует,
@@ -1824,24 +1870,38 @@ function downloadLog() {
   setTimeout(() => URL.revokeObjectURL(a.href), 0);
 }
 
+async function copyText(text) {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+  } else {
+    // http-LAN: Clipboard API недоступен вне secure context — fallback
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand('copy');
+    ta.remove();
+    if (!ok) throw new Error('execCommand copy failed');
+  }
+}
+
 async function copyLog() {
-  const text = lastLog || '';
   try {
-    if (navigator.clipboard?.writeText) {
-      await navigator.clipboard.writeText(text);
-    } else {
-      // http-LAN: Clipboard API недоступен вне secure context — fallback
-      const ta = document.createElement('textarea');
-      ta.value = text;
-      ta.style.position = 'fixed';
-      ta.style.opacity = '0';
-      document.body.appendChild(ta);
-      ta.select();
-      const ok = document.execCommand('copy');
-      ta.remove();
-      if (!ok) throw new Error('execCommand copy failed');
-    }
+    await copyText(lastLog || '');
     flash('Лог скопирован', true);
+  } catch (e) { flash('Не удалось скопировать: ' + e.message, false); }
+}
+
+// Адрес PAC для настроек устройства: панели достаточно знать свой origin —
+// путь фиксированный. URL показываем во flash: если панель открыта по
+// 127.0.0.1, для чужих устройств он бесполезен (нужен адрес роутера).
+async function copyPac() {
+  const url = location.origin + '/proxy.pac';
+  try {
+    await copyText(url);
+    flash('Скопировано: ' + url + ' — вставьте в настройки автопрокси устройства', true);
   } catch (e) { flash('Не удалось скопировать: ' + e.message, false); }
 }
 
@@ -1941,6 +2001,8 @@ const ACTIONS = {
   svc: (arg) => svc(arg),
   newPreset: () => newPreset(),
   closeEditor: () => closeEditor(),
+  quickImport: () => quickImport(),
+  copyPac: () => copyPac(),
   import: () => $('importFile').click(),
   foOrder: () => foToggleOrder(),
   foToggle: (arg) => foToggle(arg),
@@ -1985,6 +2047,10 @@ document.addEventListener('click', (e) => {
 });
 
 $('editor').addEventListener('submit', save);
+// Enter в строке подключения — тот же «→ пресет» (paste → Enter → редактор)
+$('quickUri').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') { e.preventDefault(); quickImport(); }
+});
 $('foEnabled').addEventListener('change', (e) => {
   if (!foChainArr.length) { e.target.checked = false; return; }
   foSaveState(e.target.checked, foChainArr,

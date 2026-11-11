@@ -43,6 +43,7 @@ CONF_KEYS = frozenset({
     "NAIVEPANEL_FAILOVER_THRESHOLD", "NAIVEPANEL_FAILOVER_FAST",
     "NAIVEPANEL_FAILOVER_RETURN_ALIVE", "NAIVEPANEL_FAILOVER_RETURN_COOLDOWN",
     "NAIVEPANEL_E2E_HISTORY", "NAIVEPANEL_E2E_KEEP",
+    "NAIVEPANEL_UPTIME_HISTORY",
     "NAIVEPANEL_TG_TOKEN", "NAIVEPANEL_TG_CHAT", "NAIVEPANEL_NOTIFY_URL",
 })
 
@@ -193,6 +194,16 @@ E2E_KEEP, _E2E_KEEP_INVALID = _int_or_default(_E2E_KEEP_RAW, 2880)
 E2E_KEEP = max(60, E2E_KEEP)
 _E2E_TRIM_EVERY = 100  # аппендов между обрезками буфера до E2E_KEEP
 
+# --- Статистика аптайма (2.3) -------------------------------------------------
+# Журнал ПЕРЕХОДОВ процесса naive up/down (JSONL, по записи на переход) —
+# переходы редки, файл крошечный. % за 24ч/7д и рестарты считаются на лету
+# из журнала + текущего состояния. Храним 30 дней (окно 7д с запасом);
+# дольше — бессмысленно для роутера.
+UPTIME_HISTORY = Path(os.environ.get("NAIVEPANEL_UPTIME_HISTORY",
+                                     str(NAIVEPROXY_DIR / "uptime-history.jsonl")))
+_UPTIME_KEEP_S = 30 * 86400
+_UPTIME_MIN_SPAN_S = 60  # меньше минуты наблюдений — проценты врут, показываем «—»
+
 # --- Автофейловер пресетов ---------------------------------------------------
 # Цепочка «основной → запасной» в /opt/etc/naive/proxy/failover.json: фоновый
 # поток раз в NAIVEPANEL_FAILOVER_INTERVAL секунд делает E2E-проверку активного
@@ -249,12 +260,17 @@ _UPDATE_ERR_TTL = 10 * 60.0     # расходовать лимит GitHub API; 
 _UPDATE_STALE_S = 15 * 60       # GitHub не долбим чаще раза в 10 минут
 
 NAME_RE = re.compile(r"^[a-zA-Z0-9_\-.]{1,64}$")
+
+# GET-пути без HTTP Basic auth: LAN-устройства не умеют предъявлять креды.
+# PAC отдаёт только адрес прокси (порт и так достижим из LAN — в этом смысл
+# PAC). Host-allowlist и SEC-01 (LAN-bind без пароля) на эти пути остаются.
+_PUBLIC_GET_PATHS = frozenset({"/proxy.pac"})
 # Разрешённые схемы proxy-URI: только реально поддерживаемые naive.
 _ALLOWED_PROXY_SCHEMES = ("https://", "http://", "quic://")
 # Имена, занятые статическими маршрутами /api/configs/export|import:
 # такой пресет нельзя было бы получить через GET (роутинг отдаёт файл)
 RESERVED_NAMES = frozenset({"export", "import"})
-APP_VERSION = "0.22.1"
+APP_VERSION = "0.23.0"
 
 
 def _ensure_dirs() -> None:
@@ -377,6 +393,7 @@ __all__ = [
     "WATCHDOG_INTERVAL", "_WATCHDOG_INTERVAL_INVALID", "WATCHDOG_FLAP_MAX", "WATCHDOG_FLAP_WINDOW",
     "WATCHDOG_RECHECK_S",
     "E2E_URL", "E2E_TIMEOUT", "E2E_HISTORY", "_E2E_KEEP_RAW", "E2E_KEEP",
+    "UPTIME_HISTORY", "_UPTIME_KEEP_S", "_UPTIME_MIN_SPAN_S",
     "_E2E_KEEP_INVALID", "_E2E_TRIM_EVERY",
     "FAILOVER_CONF", "_FAILOVER_RAW", "FAILOVER_ENABLED",
     "_FAILOVER_INTERVAL_RAW", "FAILOVER_INTERVAL", "_FAILOVER_INTERVAL_INVALID",
@@ -389,7 +406,7 @@ __all__ = [
     "UPDATE_REPO", "UPDATE_API_BASE", "UPDATE_RAW_BASE",
     "PANEL_DIR", "UPDATE_LOG", "UPDATE_STATE", "PANEL_UPDATE_FILES",
     "_TAG_RE", "_UPDATE_CHECK_TTL", "_UPDATE_ERR_TTL", "_UPDATE_STALE_S",
-    "NAME_RE", "_ALLOWED_PROXY_SCHEMES", "RESERVED_NAMES",
+    "NAME_RE", "_ALLOWED_PROXY_SCHEMES", "_PUBLIC_GET_PATHS", "RESERVED_NAMES",
     "APP_VERSION",
     "_ensure_dirs", "_parse_bind", "_default_allowed_hosts",
     "_bind_is_loopback",

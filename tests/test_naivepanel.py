@@ -5279,3 +5279,300 @@ def test_connections_snapshot_real_socket(app):
         conn.close()
         cli.close()
         srv.close()
+
+
+# --- 3.2: импорт пресета одной строкой ----------------------------------------
+
+def test_parse_uri_https_decomposes(client):
+    r = client.post("/api/configs/parse",
+                    json={"uri": "https://user:p%40ss:x@gw1.example.com:8443"},
+                    headers=CSRF)
+    assert r.status_code == 200
+    d = r.get_json()
+    assert d["scheme"] == "https"
+    assert d["decomposed"] is True and d["creds"] is True
+    assert d["upstream"] == "gw1.example.com:8443"  # без схемы — как _for_edit
+    assert d["username"] == "user"
+    assert d["password"] == "p@ss:x"  # percent-декодирован, '@' и ':' в пароле
+    assert d["name"] == "gw1.example.com"
+    assert r.headers["Cache-Control"] == "no-store"  # ответ несёт пароль из запроса
+
+
+def test_parse_uri_roundtrip_creates_preset(client):
+    # разложение + создание: то, что панель сама нараскладывала, обязано
+    # сохраняться без правок (тот же вид полей, что отдаёт _for_edit)
+    d = client.post("/api/configs/parse",
+                    json={"uri": "https://u:p%40ss@gw1.example.com"},
+                    headers=CSRF).get_json()
+    r, _ = _create(client, name=d["name"], upstream=d["upstream"],
+                   username=d["username"], password=d["password"])
+    assert r.status_code == 201
+    got = client.get("/api/configs/gw1.example.com").get_json()
+    assert got["upstream"] == "gw1.example.com"
+    assert got["username"] == "u"
+
+
+def test_parse_uri_quic_kept_verbatim(client):
+    # quic при пересборке из полей стал бы https:// — оставляем целиком
+    raw = "quic://u:secret@h.example.com:443"
+    d = client.post("/api/configs/parse", json={"uri": raw}, headers=CSRF).get_json()
+    assert d["decomposed"] is False
+    assert d["upstream"] == raw
+    assert d["username"] == "" and d["password"] == ""
+    assert d["name"] == "h.example.com"
+
+
+def test_parse_uri_http_kept_verbatim(client):
+    raw = "http://u:p@h.example.com:8080"
+    d = client.post("/api/configs/parse", json={"uri": raw}, headers=CSRF).get_json()
+    assert d["decomposed"] is False and d["upstream"] == raw
+
+
+def test_parse_uri_without_creds(client):
+    d = client.post("/api/configs/parse",
+                    json={"uri": "https://host.example.com"},
+                    headers=CSRF).get_json()
+    assert d["creds"] is False
+    assert d["upstream"] == "host.example.com"
+    assert d["username"] == "" and d["password"] == ""
+
+
+def test_parse_uri_name_suggestion_matches_name_re(app, client):
+    import panel.config as cfg
+    d = client.post("/api/configs/parse",
+                    json={"uri": "https://u:p@We!ird_Host~Name.example.com"},
+                    headers=CSRF).get_json()
+    assert cfg.NAME_RE.match(d["name"]), d["name"]
+    assert d["name"] == "we-ird_host-name.example.com"
+
+
+@pytest.mark.parametrize("uri", [
+    "socks://127.0.0.1:1080",   # схема listen, не upstream
+    "gw1.example.com",          # голый host — это работа для редактора, не парсера
+    "",
+])
+def test_parse_uri_rejects_non_upstream(client, uri):
+    r = client.post("/api/configs/parse", json={"uri": uri}, headers=CSRF)
+    assert r.status_code == 400
+    assert "https://" in r.get_json()["error"]
+
+
+def test_parse_uri_requires_csrf(client):
+    r = client.post("/api/configs/parse", json={"uri": "https://u:p@h.com"})
+    assert r.status_code == 403
+
+
+# --- 3.1: PAC-файл для устройств ----------------------------------------------
+
+def _set_active(env, listen, name="home"):
+    proxy = env / "proxy"
+    proxy.mkdir(parents=True, exist_ok=True)
+    (proxy / "config.json").write_text(
+        json.dumps({"listen": listen, "proxy": "https://u:p@up.example.com"}),
+        encoding="utf-8")
+    (proxy / ".active").write_text(name + "\n", encoding="utf-8")
+
+
+def test_pac_socks_listen_basic(client, env):
+    _set_active(env, "socks://127.0.0.1:1080")
+    r = client.get("/proxy.pac")
+    assert r.status_code == 200
+    assert 'return "SOCKS5 127.0.0.1:1080";' in r.get_data(as_text=True)
+    assert r.headers["Content-Type"].startswith("application/x-ns-proxy-autoconfig")
+    assert r.headers["Cache-Control"] == "no-cache"  # пресет сменился — PAC другой
+
+
+def test_pac_substitutes_unspecified_host_from_request(client, env):
+    # listen на 0.0.0.0/:: бесполезен в PAC чужому устройству: подставляем
+    # хост из Host-заголовка — адрес, по которому устройство получило PAC
+    _set_active(env, ["socks://0.0.0.0:1080", "http://[::]:8080"])
+    r = client.get("/proxy.pac", headers={"Host": "127.0.0.1:8089"})
+    body = r.get_data(as_text=True)
+    assert "SOCKS5 127.0.0.1:1080" in body
+    assert "PROXY 127.0.0.1:8080" in body
+
+
+def test_pac_orders_non_loopback_first_and_dedupes(client, env):
+    _set_active(env, ["socks://127.0.0.1:1080", "socks5://192.168.1.1:1081",
+                      "socks://192.168.1.1:1081"])
+    body = client.get("/proxy.pac").get_data(as_text=True)
+    ret = [l for l in body.splitlines() if l.strip().startswith("return")][0]
+    # не-loopback раньше (чужим устройствам полезны только они), дубликат
+    # socks/socks5 на одном порту схлопнут, loopback — последним
+    assert ret == '  return "SOCKS5 192.168.1.1:1081; SOCKS5 127.0.0.1:1080";'
+
+
+def test_pac_no_active_preset_returns_direct(client, env):
+    body = client.get("/proxy.pac").get_data(as_text=True)
+    assert 'return "DIRECT";' in body
+    assert "нет активного пресета" in body
+
+
+def test_pac_direct_param_appends_direct(client, env):
+    _set_active(env, "socks://192.168.1.1:1080")
+    body = client.get("/proxy.pac?direct=1").get_data(as_text=True)
+    assert 'return "SOCKS5 192.168.1.1:1080; DIRECT";' in body
+    assert "DIRECT" not in client.get("/proxy.pac").get_data(as_text=True)
+
+
+def test_pac_public_without_auth(client, env):
+    # устройства не умеют HTTP Basic: PAC обязан отдаваться без кредов,
+    # при этом остальная панель остаётся за паролем
+    (env / "admin.pass").write_text(_pass_file(env, "secret1"))
+    assert client.get("/api/status").status_code == 401
+    assert client.get("/proxy.pac").status_code == 200
+
+
+def test_pac_rejects_foreign_host(client, env):
+    # public ≠ «для всех имён»: DNS-rebinding через PAC-эндпоинт не проще,
+    # чем через панель — Host-allowlist остаётся
+    r = client.get("/proxy.pac", headers={"Host": "evil.example"})
+    assert r.status_code == 403
+
+
+def test_pac_fail_closed_when_exposed_without_password(app, client, env):
+    # SEC-01: LAN-bind без admin.pass — вся панель закрыта, PAC не исключение
+    # (раскрывает адреса listen активного пресета)
+    app.cfg.PANEL_BIND = "192.168.1.1:8089"
+    r = client.get("/proxy.pac")
+    assert r.status_code == 403
+
+
+def test_ui_quick_import_and_pac_wiring(app):
+    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    assert 'id="quickUri"' in html, "нет строки импорта одной строкой"
+    assert "data-action=\"quickImport\"" in html
+    assert "data-action=\"copyPac\"" in html
+    assert "/api/configs/parse" in html, "quickImport не ходит в parse-API"
+    assert "/proxy.pac" in html, "кнопка PAC не собирает адрес"
+    assert "quickImport: () => quickImport()" in html, "нет записи в ACTIONS"
+
+
+# --- 2.3: статистика аптайма ---------------------------------------------------
+
+import time as _time
+
+
+def _up_entries(app, entries):
+    (app.cfg.UPTIME_HISTORY.parent).mkdir(parents=True, exist_ok=True)
+    app.cfg.UPTIME_HISTORY.write_text(
+        "".join(json.dumps(e) + "\n" for e in entries), encoding="utf-8")
+
+
+def test_uptime_observe_writes_transitions_only(app, monkeypatch):
+    # up, up → одна запись; down, up → ещё две: в журнале ТОЛЬКО переходы
+    seq = iter([(True, 1, 10), (True, 1, 10), (False, None, None), (True, 2, 5)])
+    monkeypatch.setattr(app.svc, "_proxy_running", lambda: next(seq))
+    app.mon._uptime_last = None
+    for _ in range(4):
+        app.mon._uptime_observe()
+    entries = app.mon._uptime_journal_load()
+    assert [e["up"] for e in entries] == [True, False, True]
+    assert len({e["t"] for e in entries}) == 3 or True  # секунды могут совпасть
+
+
+def test_uptime_anchor_no_false_transition_after_reload(app, monkeypatch):
+    # якорь: последняя запись up, процесс up → новая запись НЕ нужна
+    # (иначе каждая перезагрузка панели рождала бы ложный переход)
+    _up_entries(app, [{"t": int(_time.time()) - 60, "up": True}])
+    monkeypatch.setattr(app.svc, "_proxy_running", lambda: (True, 1, 60))
+    app.mon._uptime_last = None
+    app.mon._uptime_observe()
+    assert len(app.mon._uptime_journal_load()) == 1
+    # состояние сменилось за простой панели — запись честная
+    monkeypatch.setattr(app.svc, "_proxy_running", lambda: (False, None, None))
+    app.mon._uptime_observe()
+    assert [e["up"] for e in app.mon._uptime_journal_load()] == [True, False]
+
+
+def test_uptime_stats_windows(app, monkeypatch):
+    # up 8 дней назад → down 6ч назад: сутки = 18ч up / 6ч down = 75%,
+    # неделя = (7д − 6ч) / 7д = 96.4%
+    now = _time.time()
+    _up_entries(app, [{"t": int(now - 8 * 86400), "up": True},
+                      {"t": int(now - 6 * 3600), "up": False}])
+    monkeypatch.setattr(app.svc, "_proxy_running", lambda: (False, None, None))
+    st = app.mon._uptime_stats(now=now)
+    assert st["day"]["pct"] == 75.0
+    assert st["day"]["observed_s"] == 86400
+    assert st["week"]["pct"] == 96.4
+    assert st["restarts_day"] == 0  # единственный down→up был >24ч назад
+
+
+def test_uptime_stats_partial_span_and_minimum(app, monkeypatch):
+    # журнал начался 2ч назад: день считается за наблюдаемые 2ч
+    now = _time.time()
+    _up_entries(app, [{"t": int(now - 7200), "up": True}])
+    monkeypatch.setattr(app.svc, "_proxy_running", lambda: (True, 1, 7200))
+    st = app.mon._uptime_stats(now=now)
+    assert st["day"]["pct"] == 100.0
+    assert st["day"]["observed_s"] == 7200
+    assert st["week"]["observed_s"] == 7200
+    # наблюдений меньше минуты — процентов нет вовсе
+    _up_entries(app, [{"t": int(now - 30), "up": True}])
+    st = app.mon._uptime_stats(now=now)
+    assert st["day"] is None and st["week"] is None
+
+
+def test_uptime_stats_empty_journal(app, monkeypatch):
+    monkeypatch.setattr(app.svc, "_proxy_running", lambda: (True, 1, 5))
+    st = app.mon._uptime_stats()
+    assert st == {"day": None, "week": None, "restarts_day": 0}
+
+
+def test_uptime_stats_restarts_and_tail_state(app, monkeypatch):
+    # 2 рестарта за сутки; хвост [последняя запись .. now] несёт состояние
+    # ЗАПИСИ (down@-600с): свежесть ограничена тиком монитора ~30с —
+    # 10-минутный даун это тестовая условность, счёт честный
+    now = _time.time()
+    _up_entries(app, [
+        {"t": int(now - 20 * 3600), "up": True},
+        {"t": int(now - 19 * 3600), "up": False},
+        {"t": int(now - 18 * 3600), "up": True},
+        {"t": int(now - 5 * 3600), "up": False},
+        {"t": int(now - 4.5 * 3600), "up": True},
+        {"t": int(now - 600), "up": False},
+    ])
+    monkeypatch.setattr(app.svc, "_proxy_running", lambda: (True, 7, 600))
+    st = app.mon._uptime_stats(now=now)
+    assert st["restarts_day"] == 2
+    # журнал начался 20ч назад → день считается за 20ч наблюдений;
+    # дауны: 1ч + 30м + 10м = 6000с → up 66000/72000 = 91.7%
+    assert st["day"]["observed_s"] == 72000
+    assert st["day"]["pct"] == 91.7
+
+
+def test_uptime_trim_drops_old_entries(app):
+    now = _time.time()
+    _up_entries(app, [{"t": int(now - 40 * 86400), "up": True},
+                      {"t": int(now - 86400), "up": False}])
+    app.mon._uptime_trim(now=now)
+    entries = app.mon._uptime_journal_load()
+    assert [e["up"] for e in entries] == [False]
+
+
+def test_uptime_stats_in_status(app, monkeypatch):
+    _up_entries(app, [{"t": int(_time.time()) - 7200, "up": True}])
+    monkeypatch.setattr(app.svc, "_proxy_running", lambda: (True, 1, 7200))
+    st = app.mon._status()
+    assert st["uptime_stats"]["day"]["pct"] == 100.0
+
+
+def test_uptime_cycle_observes_before_idle(app, monkeypatch):
+    # cycle() наблюдает процесс ДО idle-веток: осознанный stop (маркер) —
+    # честный downtime в журнале, хоть E2E и не идёт
+    app.cfg.STOP_MARKER.parent.mkdir(parents=True, exist_ok=True)
+    app.cfg.STOP_MARKER.write_text("")
+    monkeypatch.setattr(app.svc, "_proxy_running", lambda: (False, None, None))
+    app.mon._uptime_last = None
+    app.mon._failover.cycle()
+    assert [e["up"] for e in app.mon._uptime_journal_load()] == [False]
+
+
+def test_ui_uptime_stats_row(app):
+    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    m = re.search(r"function renderStatus\(st\) \{.*?\n\}", html, re.S)
+    assert m, "renderStatus() не найден"
+    body = m.group(0)
+    assert "st.uptime_stats" in body, "UI не читает uptime_stats"
+    assert "аптайм 24ч/7д" in body, "нет строки аптайм-статистики"

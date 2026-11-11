@@ -174,10 +174,17 @@ def _require_auth():
     на строку. Создание: `htpasswd -B -c admin.pass user` (или python3-bcrypt —
     в Entware htpasswd отсутствует, см. README).
 
+    Исключение — public GET-пути (cfg._PUBLIC_GET_PATHS, сейчас только
+    /proxy.pac): устройства LAN не умеют HTTP Basic, а PAC раскрывает лишь
+    адрес прокси, который и так достижим из LAN. Host-allowlist и SEC-01
+    на них продолжают работать.
+
     Без пакета python3-bcrypt auth fail-closed (401 на любой запрос), в лог
     пишется ошибка. Это намеренно: лучше сломанная панель, чем открытая.
     """
     global _admin_pass_stamp
+    if request.path in cfg._PUBLIC_GET_PATHS:
+        return  # PAC: без auth по дизайну (см. докстринг)
     if not cfg.PANEL_ADMIN_PASS.exists():
         return  # auth выключен — только 127.0.0.1, публично не торчим
     ip = request.remote_addr or ""

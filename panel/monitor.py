@@ -424,6 +424,56 @@ def _active_listen_ports() -> tuple[set[int], bool]:
     return ports, allow_loopback
 
 
+# --- PAC-файл для устройств LAN (3.1) ----------------------------------------
+
+def _pac_directives(host_header: str) -> list[str]:
+    """PAC-директивы listen'ов активного пресета: PROXY/SOCKS5 host:port.
+
+    Неопределённые хосты listen (0.0.0.0, ::, пустой) заменяются на хост из
+    Host-заголовка запроса: устройство получило PAC по адресу панели — по
+    нему же оно достигнет listen, привязанный ко «всем интерфейсам». Порядок:
+    не-loopback сначала (чужим устройствам полезны только они), loopback в
+    конце — бесполезны, но не мешают как последний фолбэк. Дубликаты
+    (socks:// и socks5:// на одном порту) схлопываются.
+    """
+    # Host: 192.168.1.1:8089 | router.lan | [::1]:8089 → хост без порта
+    own = host_header.rpartition(":")[0].strip("[]") or host_header
+    direct_: list[str] = []
+    loopback_: list[str] = []
+    for uri in _active_listen_uris():
+        ep = _listen_endpoint(uri)
+        if ep is None:
+            continue
+        scheme, host, port = ep
+        if host in ("0.0.0.0", "::", ""):  # nosec B104 — сравнение, не bind
+            host = own
+        entry = f"{'PROXY' if scheme == 'http' else 'SOCKS5'} {host}:{port}"
+        (loopback_ if _host_is_loopback(host) else direct_).append(entry)
+    return list(dict.fromkeys(direct_ + loopback_))
+
+
+def _pac_body(host_header: str, direct_fallback: bool = False) -> str:
+    """Тело /proxy.pac. Без активного listen — честный DIRECT (устройство
+    продолжает ходить напрямую, а не падает с ошибкой PAC)."""
+    active = pres._active_name()
+    directives = _pac_directives(host_header)
+    if not directives:
+        directives = ["DIRECT"]
+    elif direct_fallback:
+        directives.append("DIRECT")
+    head = [
+        "// NaivePanel PAC — автогенерация, не редактировать",
+        f"// активный пресет: {active or '—'} · {time.strftime('%Y-%m-%d %H:%M:%S')}",
+    ]
+    if not _active_listen_uris():
+        head.append("// нет активного пресета с listen — только DIRECT")
+    return "\n".join(head) + "\n" + (
+        "function FindProxyForURL(url, host) {\n"
+        f'  return "{"; ".join(directives)}";\n'
+        "}\n"
+    )
+
+
 # --- История E2E-проверок: кольцевой буфер -----------------------------------
 
 _e2e_since_trim = 0
@@ -490,6 +540,134 @@ def _e2e_history_load(last: int) -> list[dict[str, Any]]:
             continue  # обрыв записи (панель упала посреди append) — пропускаем
     return out[-last:]
 
+
+# --- Статистика аптайма: журнал переходов up/down (2.3) -----------------------
+
+# Последнее наблюдённое состояние процесса; None = ещё не наблюдали (первый
+# тик монитора после старта панели). Модульный глобал: поток монитора один.
+_uptime_last: bool | None = None
+
+
+def _uptime_journal_append(up: bool) -> None:
+    """Один переход {t, up} в JSONL-журнал; ошибка записи не роняет монитор."""
+    try:
+        cfg.UPTIME_HISTORY.parent.mkdir(parents=True, exist_ok=True)
+        with cfg.UPTIME_HISTORY.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"t": int(time.time()), "up": bool(up)}) + "\n")
+    except OSError as exc:
+        log.warning("uptime journal append failed: %s", exc)
+
+
+def _uptime_journal_load() -> list[dict[str, Any]]:
+    """Записи журнала, старые → новые; битые строки пропускаем."""
+    out: list[dict[str, Any]] = []
+    try:
+        lines = cfg.UPTIME_HISTORY.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return out
+    for line in lines:
+        try:
+            entry = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if (isinstance(entry, dict) and isinstance(entry.get("t"), int)
+                and isinstance(entry.get("up"), bool)):
+            out.append({"t": entry["t"], "up": entry["up"]})
+    return out
+
+
+def _uptime_trim(now: float | None = None) -> None:
+    """Дроп записей старее _UPTIME_KEEP_S (30д) — окна 24ч/7д с запасом."""
+    now = time.time() if now is None else now
+    try:
+        entries = _uptime_journal_load()
+    except OSError:
+        return
+    kept = [e for e in entries if now - e["t"] <= cfg._UPTIME_KEEP_S]
+    if len(kept) == len(entries):
+        return
+    tmp = cfg.UPTIME_HISTORY.with_suffix(".jsonl.tmp")
+    try:
+        with tmp.open("w", encoding="utf-8") as fh:
+            fh.write("".join(json.dumps(e) + "\n" for e in kept))
+        tmp.replace(cfg.UPTIME_HISTORY)
+    except OSError as exc:
+        log.warning("uptime journal trim failed: %s", exc)
+
+
+def _uptime_observe(running: bool | None = None) -> None:
+    """Тик наблюдения за процессом naive: пишет в журнал только ПЕРЕХОДЫ.
+
+    Вызывается из начала каждого цикла монитора (до idle-веток: осознанный
+    stop — честный downtime). Первый тик после старта панели — «якорь»:
+    если последняя запись журнала совпадает с текущим состоянием, НЕ пишем
+    (считаем, что состояние пережило простой панели; иначе каждая
+    перезагрузка панели рождала бы ложный переход).
+    """
+    global _uptime_last
+    if running is None:
+        running = svc._proxy_running()[0]
+    if _uptime_last is None:
+        entries = _uptime_journal_load()
+        last_up = entries[-1]["up"] if entries else None
+        if last_up is None or last_up != running:
+            _uptime_journal_append(running)
+            _uptime_trim()
+    elif _uptime_last != running:
+        _uptime_journal_append(running)
+        _uptime_trim()  # переходы редки — обрезка на каждом дёшева
+    _uptime_last = running
+
+
+def _uptime_stats(now: float | None = None) -> dict[str, Any]:
+    """% аптайма за 24ч и 7д + рестарты за сутки, из журнала переходов.
+
+    Каждая запись — «с этого момента состояние up»; интервал до следующей
+    записи несёт состояние ПРЕДЫДУЩЕЙ. Хвост [последняя запись .. now] тоже
+    несёт её состояние — свежесть ограничена тиком монитора (~30с), на окнах
+    в сутки это неощутимо. До первой записи данных нет: знаменатель —
+    наблюдаемый отрезок (мин(окно, now − t первой записи)), поэтому свежая
+    установка не показывает «неделю нулей»; отрезок короче минуты → null.
+    """
+    now = time.time() if now is None else now
+    entries = _uptime_journal_load()
+    running = svc._proxy_running()[0]
+    points = entries + [{"t": now, "up": running}]  # sentинель для хвоста
+    day_from = now - 86400
+    week_from = now - 7 * 86400
+
+    def window(from_ts: float) -> dict[str, Any] | None:
+        first_in = points[0]["t"]
+        if now - first_in < cfg._UPTIME_MIN_SPAN_S:
+            return None
+        span_start = max(from_ts, first_in)
+        up_s = 0.0
+        prev_t = max(span_start, first_in)
+        # интервал до первой записи — состояние первой записи (данных раньше нет)
+        state = points[0]["up"]
+        for p in points[1:]:
+            if p["t"] <= span_start:
+                state = p["up"]
+                continue
+            seg_start = max(prev_t, span_start)
+            seg_end = min(p["t"], now)
+            if seg_end > seg_start and state:
+                up_s += seg_end - seg_start
+            state = p["up"]
+            prev_t = p["t"]
+            if prev_t >= now:
+                break
+        observed = now - span_start
+        return {"pct": round(100.0 * up_s / observed, 1),
+                "observed_s": int(observed)}
+
+    day = window(day_from)
+    week = window(week_from)
+    restarts = sum(1 for i in range(1, len(points) - 1)
+                   if not points[i - 1]["up"] and points[i]["up"]
+                   and points[i]["t"] > day_from)
+    return {"day": day, "week": week, "restarts_day": restarts}
+
 # --- Service control ------------------------------------------------------
 
 def _status() -> dict[str, Any]:
@@ -518,6 +696,7 @@ def _status() -> dict[str, Any]:
         "init_present": has_init,
         "watchdog": _watchdog.snapshot(),
         "failover": _failover.snapshot(),
+        "uptime_stats": _uptime_stats(),
         "notify": {"enabled": channel is not None,
                    "channel": channel,
                    "pending": len(_notify_pending_all())},
@@ -944,6 +1123,9 @@ class _Failover:
         настроена и активный пресет в ней. idle_reason выставляется только
         когда проверки НЕ идут (прокси остановлен / нет пресета).
         """
+        # до idle-веток: осознанный stop — тоже downtime, журнал обязан его
+        # видеть; пишутся только переходы (см. _uptime_observe)
+        _uptime_observe()
         conf = _load_failover_conf()
         if not cfg.FAILOVER_ENABLED:
             self._idle("монитор выключен")
@@ -1267,6 +1449,14 @@ __all__ = [
     "_IPV4_RE",
     "_IPV6_RE",
     "_NAIVE_FETCH_LOCK",
+    "_pac_body",
+    "_pac_directives",
+    "_uptime_journal_append",
+    "_uptime_journal_load",
+    "_uptime_last",
+    "_uptime_observe",
+    "_uptime_stats",
+    "_uptime_trim",
     "_NOTIFY_PENDING_CAP",
     "_SERVICE_LOCK",
     "_TG_CHAT_RE",

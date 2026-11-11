@@ -351,6 +351,64 @@ def _validate_cfg(cfgd: dict[str, Any], name: str) -> None:
         abort(400, description=f"{name}: " + "; ".join(errors))
 
 
+def _name_suggest(host: str) -> str:
+    """Хост из строки подключения → кандидат в имена пресета.
+
+    Порт и IPv6-скобки отрезаем, символы вне NAME_RE меняем на '-', лимит 64
+    (как у NAME_RE). Получившаяся строка обязана матчить NAME_RE — иначе
+    quickImport в UI положил бы в форму имя, которое save отвергнет.
+    """
+    host = host.split(":", 1)[0].strip().strip("[]")
+    cleaned = re.sub(r"[^a-zA-Z0-9_.\-]", "-", host).strip("-.").lower()
+    cleaned = cleaned[:64].rstrip("-.") or "preset"
+    if not cfg.NAME_RE.match(cleaned):  # страховка на случай смены NAME_RE
+        cleaned = "preset"
+    return cleaned
+
+
+def parse_connection_uri(raw: str) -> dict[str, Any]:
+    """Строка подключения `https://user:pass@host[:port]` → поля редактора (3.2).
+
+    Один парсер на сервере: правила те же, что при чтении конфигов
+    (_split_proxy — креды до последнего `@`, percent-декодирование), JS-копия
+    на них разъехалась бы. https раскладывается по полям (upstream без схемы —
+    в том же виде его отдаёт _for_edit); http/quic остаются в upstream целиком:
+    _build_payload при пересборке из полей всегда строит `https://…`, и quic-
+    пресет молча превратился бы в https. Кредов может не быть — поля пустые,
+    creds=false (UI попросит заполнить username/password).
+
+    Ответ повторяет пароль из запроса: это ввод пользователя, а не секрет из
+    хранилища (SEC-02 про GET хранимых конфигов).
+    """
+    raw = (raw or "").strip()
+    idx = raw.find("://")
+    scheme = raw[:idx].lower() if idx != -1 else ""
+    if scheme not in ("https", "http", "quic"):
+        abort(400, description="expected user:pass@host URI with https://, "
+                               "http:// or quic:// scheme (socks:// — это "
+                               "схема listen, не upstream)")
+    host_part, username, password = _split_proxy(raw)
+    creds = password is not None
+    if not creds:
+        host_part = raw[idx + 3:]
+        username, password = "", ""
+    if scheme == "https":
+        upstream, username_out, password_out = host_part, username, password or ""
+        decomposed = True
+    else:
+        upstream, username_out, password_out = raw, "", ""
+        decomposed = False
+    return {
+        "scheme": scheme,
+        "upstream": upstream,
+        "username": username_out,
+        "password": password_out,
+        "creds": creds,
+        "decomposed": decomposed,
+        "name": _name_suggest(host_part),
+    }
+
+
 def _upstream_endpoint(upstream: str) -> tuple[str, int] | None:
     """Upstream (host, host:port или полный/неполный URI) → (host, port).
 
@@ -381,6 +439,7 @@ def _upstream_endpoint(upstream: str) -> tuple[str, int] | None:
 __all__ = [
     "_LISTEN_MAX", "_LISTEN_SCHEMES", "_active_name", "_build_payload",
     "_for_edit", "_listen_problem", "_list_presets", "_load_json",
-    "_mask_creds", "_normalize_listen", "_save_json", "_split_proxy",
-    "_summary", "_upstream_endpoint", "_validate_cfg", "_write_active",
+    "_mask_creds", "_name_suggest", "_normalize_listen", "_save_json",
+    "_split_proxy", "_summary", "_upstream_endpoint", "_validate_cfg",
+    "_write_active", "parse_connection_uri",
 ]
