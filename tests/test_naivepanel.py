@@ -5576,7 +5576,9 @@ def test_ui_uptime_stats_row(app):
     assert m, "renderStatus() не найден"
     body = m.group(0)
     assert "st.uptime_stats" in body, "UI не читает uptime_stats"
-    assert "аптайм 24ч/7д" in body, "нет строки аптайм-статистики"
+    assert "['аптайм', upVal]" in body, "нет объединённой строки аптайма"
+    assert "fmtUptime(st.uptime)" in body, "строка не показывает серию текущего запуска"
+    assert "'аптайм 24ч/7д'" not in body, "осталась отдельная строка процентов"
 
 
 # --- busybox-тар без -J (фид 1.38): распаковка naive-тарболла -------------------
