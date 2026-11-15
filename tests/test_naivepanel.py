@@ -5785,3 +5785,56 @@ def test_p0_editor_close_returns_focus(app):
     assert del_fn.index("refreshAll") < del_fn.index("focusFirstPresetRow")
     assert "$('search').focus()" in del_fn
     assert "!isEditorOpen()" in del_fn
+
+
+def test_p0_service_buttons_state(app):
+    html = _ui_html()
+    for bid in ("btnStart", "btnStop", "btnRestart", "btnE2e"):
+        assert f'id="{bid}"' in html
+    assert 'id="btnStart" disabled' in html
+    assert 'id="btnStop" disabled' in html
+    assert 'id="btnRestart" disabled' in html
+    assert 'id="btnE2e" disabled' in html
+    fn = _ui_fn(html, "renderServiceButtons")
+    assert "$('btnStart').hidden" in fn
+    assert "$('btnStop').hidden" in fn
+    assert "$('btnStart').disabled" in fn
+    assert "st.current" in fn and "st.active" in fn
+    assert "init_present" in fn
+    assert "svcBusy" in fn and "e2eBusy" in fn
+    assert "focused.hidden" in fn, "фокус не должен теряться при скрытии кнопки"
+
+
+def test_p0_stop_confirm_and_activate_guard(app):
+    html = _ui_html()
+    svc = _ui_fn(html, "svc")
+    assert "askConfirm" in svc
+    assert "Остановить прокси" in svc
+    assert "соединений" in svc
+    assert "focusStart" in svc
+    assert "svcBusy" in svc
+    act = _ui_fn(html, "activate")
+    assert "n === activeName" in act
+    assert "isActivePreset(p)" in act
+    assert "askConfirm" in act
+
+
+def test_p0_save_pristine_and_active_guards(app):
+    html = _ui_html()
+    chrome = _ui_fn(html, "renderEditorChrome")
+    assert "btnActivate" in chrome and "btnDelete" in chrome
+    assert "btnSave" in chrome and "dirty" in chrome
+    assert "isActivePreset(row)" in chrome
+    assert "editorTitle" in chrome
+    assert "activating" in chrome
+    assert "editorApplyHint" in html
+    save = _ui_fn(html, "save")
+    assert "current && !dirty" in save
+    assert "renderEditorChrome()" in save, "finally обязан пересчитать disabled"
+    assert "btn.disabled = false" not in save
+    act = _ui_fn(html, "activate")
+    assert "renderEditorChrome()" in act
+    delete = _ui_fn(html, "del")
+    assert "foChainArr.includes" in delete
+    assert "Активный пресет" in delete
+    assert "isActivePreset(p)" in delete

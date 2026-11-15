@@ -205,6 +205,8 @@
   input:focus, textarea:focus { border-color:var(--acc); box-shadow:0 0 0 3px var(--dot-halo); outline:none; }
   textarea { min-height:120px; resize:vertical; }
   .row { display:flex; gap:8px; flex-wrap:wrap; margin-top:14px; }
+  .apply-hint { margin-top:12px; color:var(--warn); font-size:12px; }
+  .row #btnDelete { margin-left:auto; }
   .actions { display:flex; gap:8px; flex-wrap:wrap; margin-top:14px; }
   pre.log { background:var(--log-bg); color:var(--log-fg); padding:var(--sp-3); border:1px solid var(--border);
             border-radius:var(--r-m); box-shadow:inset 0 1px 4px rgba(0,0,0,.12);
@@ -338,10 +340,10 @@
     <div class="svcinfo" id="svcinfo"></div>
     <div id="e2eSpark" class="spark" hidden></div>
     <div class="actions">
-      <button data-action="svc" data-arg="start">Запуск</button>
-      <button class="ghost" data-action="svc" data-arg="stop">Стоп</button>
-      <button class="ghost" data-action="svc" data-arg="restart">Рестарт</button>
-      <button class="ghost" data-action="e2e" id="btnE2e"
+      <button data-action="svc" data-arg="start" id="btnStart" disabled>Запуск</button>
+      <button class="ghost" data-action="svc" data-arg="stop" id="btnStop" disabled>Стоп</button>
+      <button class="ghost" data-action="svc" data-arg="restart" id="btnRestart" disabled>Рестарт</button>
+      <button class="ghost" data-action="e2e" id="btnE2e" disabled
               title="Реальный запрос через listen-порт активного пресета: туннель до echo-сервера и exit-IP. TCP-пинг upstream есть в редакторе">Проверить прокси</button>
       <button class="ghost" data-action="copyPac" id="btnPac"
               title="Скопировать адрес PAC-файла — вставьте его в настройки автопрокси устройства (прокси = listen активного пресета; адрес, по которому открыта панель, должен быть достижим с устройства)">Скопировать PAC</button>
@@ -447,10 +449,16 @@
         <input id="f_insecure_concurrency" type="number" min="1" max="4" inputmode="numeric">
       </details>
 
+      <p id="editorApplyHint" class="apply-hint" hidden>
+        Изменения активного пресета применятся сразу: прокси перезапустится,
+        соединения оборвутся.
+      </p>
       <div class="row">
         <button type="submit" id="btnSave" title="Ctrl+S">Сохранить</button>
-        <button type="button" class="ghost" data-action="activate">Сделать активным</button>
-        <button type="button" class="danger" data-action="del">Удалить</button>
+        <button type="button" class="ghost" id="btnActivate"
+                data-action="activate">Сделать активным</button>
+        <button type="button" class="danger" id="btnDelete"
+                data-action="del">Удалить</button>
       </div>
       </form>
     </div>
@@ -607,6 +615,7 @@ let current = null; // выбранный пресет (имя) или null
 let dirty = false;  // есть несохранённые правки в редакторе
 let selectSeq = 0;  // монотонный токен выбора: поздний ответ A не пишет форму, когда выбран B
 let saving = false; // guard от повторного входа (Ctrl+S во время активного PUT)
+let activating = false; // guard от повторного activate, пока летит POST
 let authChanged = false; // пароль сменён: поллинг старыми кредами не шлём
 
 const CSRF = {'X-Requested-With': 'naivepanel'}; // мутации без него сервер отбивает 403
@@ -832,7 +841,50 @@ function fmtUptime(s) {
   return s+'с';
 }
 
+let lastStatus = null;
+let svcKey = '';
+let svcBusy = false; // идёт POST /api/service — не перерисовывать кнопки включёнными
+let e2eBusy = false; // идёт POST /api/e2e
+
+// Состояние приходит из /api/status; 3-секундный поллинг не должен трогать
+// кнопки без изменений (это сбрасывало бы фокус). init-скрипта может не быть —
+// тогда действия остаются видимыми, но выключенными (title объясняет почему).
+function renderServiceButtons(st, force) {
+  const has = !!st.current;
+  const init = st.init_present !== false;
+  const running = !!st.active;
+  const key = [running, has, init].join('|');
+  if (!force && key === svcKey) return;
+  svcKey = key;
+
+  // Если фокус стоял на кнопке, которую сейчас скроем (Start после старта,
+  // Stop после остановки), уводим его на следующее доступное действие, а не
+  // на body.
+  const focused = document.activeElement;
+  const keepFocus = !!(focused && focused.matches('[data-action="svc"]'));
+
+  // Кнопки не «мертвые»: в каждом состоянии видно только применимое действие.
+  $('btnStart').hidden = running || !has;
+  $('btnStop').hidden = !running;
+  $('btnRestart').hidden = !running;
+  $('btnStart').disabled = !init || svcBusy;
+  $('btnStop').disabled = !init || svcBusy;
+  $('btnRestart').disabled = !init || svcBusy;
+  $('btnE2e').disabled = !has || e2eBusy;
+
+  if (keepFocus && focused.hidden) {
+    const next = [$('btnStop'), $('btnRestart'), $('btnStart'), $('btnE2e')]
+      .find(b => b && !b.hidden && !b.disabled);
+    if (next) next.focus();
+  }
+
+  const why = init ? '' : 'init-скрипт не найден';
+  for (const b of [$('btnStart'), $('btnStop'), $('btnRestart')]) b.title = why;
+}
+
 function renderStatus(st) {
+  lastStatus = st;
+  renderServiceButtons(st);
   // смена активного пресета (в т.ч. автофейловером) отражается в списке пресетов
   if (st.current !== activeName) { activeName = st.current; foRerender(); }
   // а свежие цифры фейловера приходят в каждом статусе — обновляем строку,
@@ -891,6 +943,7 @@ function renderStatus(st) {
   $('svcinfo').innerHTML = rows.map(([k, v], i) =>
     '<div class="kv'+(i === 0 ? ' wide' : '')+'"><span>'+k+'</span><b>'+v+'</b></div>').join('');
   $('svcinfo').title = 'обновлено ' + new Date().toLocaleTimeString();
+  renderEditorChrome();
 }
 
 let tgConfigured = false;
@@ -1224,6 +1277,7 @@ async function quickImport() {
   $('f_username').value = d.username || '';
   $('f_password').value = d.password || '';
   dirty = true; // заполненный черновик: maybeDiscard спросит при уходе с редактора
+  setEditorState();
   $('quickUri').value = '';
   if (!d.decomposed)
     flash('URI не разложен по полям: схема '+d.scheme+':// осталась в upstream целиком — проверьте форму', false);
@@ -1250,11 +1304,46 @@ function hideEditor() {
 // «сохранено». Пустой = черновик нового пресета без правок.
 function setEditorState() {
   const el = $('editorState');
-  if (!current) { el.textContent = ''; el.className = 'edstate'; return; }
-  if (dirty) { el.textContent = 'изменено'; el.className = 'edstate dirty'; }
-  else if (activeName && current === activeName) {
-    el.textContent = 'активен'; el.className = 'edstate active';
-  } else { el.textContent = 'сохранено'; el.className = 'edstate'; }
+  if (!current) {
+    el.textContent = '';
+    el.className = 'edstate';
+  } else if (dirty) {
+    el.textContent = 'изменено';
+    el.className = 'edstate dirty';
+  } else if (activeName && current === activeName) {
+    el.textContent = 'активен';
+    el.className = 'edstate active';
+  } else {
+    el.textContent = 'сохранено';
+    el.className = 'edstate';
+  }
+  renderEditorChrome();
+}
+
+// Кнопки редактора по состоянию: активный пресет нельзя ни активировать
+// повторно, ни удалить (сервер такие операции всё равно отклонит), а
+// «Сохранить» без правок не дёргает restart активного пресета.
+function renderEditorChrome() {
+  const has = !!current;
+  const row = lastPresets.find(p => p.name === current);
+  // Свежий activeName важнее поля active в кэше списка: после автофейловера
+  // пресеты приходят с сервера со старым active, и OR с ним заблокировал бы
+  // ручной возврат на основной.
+  const isActive = has && (current === activeName || !!(row && isActivePreset(row)));
+  // Перед переключением запоминаем фокус: скрытая/выключенная кнопка уронила
+  // бы его на <body> — уводим на заголовок редактора (tabindex="-1").
+  const focused = document.activeElement;
+  const chromeFocused = !!(focused
+    && focused.matches('#btnActivate, #btnDelete, #btnSave'));
+  $('btnActivate').hidden = !has || isActive;
+  $('btnDelete').hidden = !has || isActive;
+  $('btnSave').disabled = saving || (has && !dirty);
+  // Единственное место, где выключается Activate: activate() включает флаг
+  // ДО вызова chrome, чтобы capture/rescue ниже успели увести фокус.
+  $('btnActivate').disabled = activating;
+  $('editorApplyHint').hidden = !(isActive && dirty);
+  if (chromeFocused && isEditorOpen() && (focused.hidden || focused.disabled))
+    $('editorTitle').focus({preventScroll:true});
 }
 
 async function closeEditor() {
@@ -1299,6 +1388,7 @@ async function probeUpstream() {
 // «прокси действительно проксирует»: креды, форвардинг, remote-DNS.
 async function checkProxy() {
   const b = $('btnE2e'), info = $('e2eInfo');
+  e2eBusy = true;
   b.disabled = true; b.textContent = 'Проверяю…';
   info.textContent = 'проверка: запрос через прокси…';
   try {
@@ -1310,7 +1400,11 @@ async function checkProxy() {
     info.textContent = 'проверка: '+short;
     flash(d.ok ? 'Прокси работает: '+short : 'Прокси '+short, !!d.ok);
   } catch (e) { info.textContent = 'проверка: '+e.message; flash(e.message, false); }
-  finally { b.disabled = false; b.textContent = 'Проверить прокси'; }
+  finally {
+    e2eBusy = false;
+    b.textContent = 'Проверить прокси';
+    renderServiceButtons(lastStatus || {}, true);
+  }
 }
 
 // Спарклайн истории E2E: полоска зелёный/красный по проверкам монитора +
@@ -1537,6 +1631,7 @@ function applyMsg(base, rst) {
 async function save(ev) {
   if (ev) ev.preventDefault();
   if (saving) return; // Ctrl+S во время активного PUT не создаёт второй запрос
+  if (current && !dirty) return; // нечего сохранять: не дёргаем restart активного
   saving = true;
   const btn = $('btnSave');
   const payload = formPayload();
@@ -1556,7 +1651,7 @@ async function save(ev) {
     setEditorState();
     await refreshAll();
   } catch (e) { flash(e.message, false); }
-  finally { saving = false; btn.disabled = false; btn.textContent = 'Сохранить'; }
+  finally { saving = false; renderEditorChrome(); btn.textContent = 'Сохранить'; }
 }
 
 function formPayload() {
@@ -1576,18 +1671,47 @@ function formPayload() {
 async function activate(name) {
   const n = name || current;
   if (!n) return;
-  if (dirty && !(await askConfirm('В форме есть несохранённые правки — активируется последняя СОХРАНЁННАЯ версия пресета. Продолжить?', {ok:'Активировать'}))) return;
+  const p = lastPresets.find(x => x.name === n);
+  if (n === activeName || (p && isActivePreset(p))) {
+    flash('Пресет уже активен', true);
+    return;
+  }
+  let msg = '';
+  if (dirty) msg += 'В форме есть несохранённые правки — активируется последняя сохранённая версия пресета.\n';
+  if (lastStatus && lastStatus.active)
+    msg += 'Прокси перезапустится, соединения оборвутся на несколько секунд.';
+  if (msg && !(await askConfirm(msg, {ok: 'Активировать'}))) return;
+  // Пока диалог был открыт, автофейловер мог уже сделать пресет активным:
+  // повторный activate дал бы лишний restart.
+  if (n === activeName || (p && isActivePreset(p))) {
+    flash('Пресет уже активен', true);
+    return;
+  }
+  if (activating) return;
+  activating = true;
+  renderEditorChrome(); // capture фокуса и disable — до запроса, одной точкой
   try {
     const d = await jpost('/api/configs/'+encodeURIComponent(n)+'/activate', null);
     flash(applyMsg('Активирован: '+n, d.restart), !restartFailed(d.restart));
     await refreshAll();
   } catch (e) { flash(e.message, false); }
+  finally {
+    activating = false;
+    renderEditorChrome();
+  }
 }
 
 async function del(name) {
   const n = name || current;
   if (!n) return;
-  if (!(await askConfirm('Удалить пресет ' + n + '?', {ok:'Удалить', danger:true}))) return;
+  const p = lastPresets.find(x => x.name === n);
+  if (n === activeName || (p && isActivePreset(p))) {
+    flash('Активный пресет нельзя удалить — сначала переключитесь на другой.', false);
+    return;
+  }
+  let msg = 'Удалить пресет ' + n + '?';
+  if (foChainArr.includes(n)) msg += '\nОн также будет убран из цепочки фейловера.';
+  if (!(await askConfirm(msg, {ok: 'Удалить', danger: true}))) return;
   try {
     await jdel('/api/configs/'+encodeURIComponent(n));
     // current читаем после ответа, а не до: пока DELETE летел, могли открыть
@@ -1605,18 +1729,55 @@ async function del(name) {
 
 const SVC_VERBS = {start:'запущен', stop:'остановлен', restart:'перезапущен'};
 async function svc(action) {
+  // Фокус запоминаем до confirm/disabled: клик по действию мог уронить его на
+  // <body>, когда все кнопки выключатся на время запроса.
+  const focusStart = document.activeElement;
+  const wasSvcFocus = !!(focusStart && focusStart.matches('[data-action="svc"]'));
+  // Статус ещё не загружен: не знаем, запущен ли сервис, — destructive
+  // действие вслепую не отправляем (кнопки до первого статуса disabled).
+  if (!lastStatus) { flash('Статус сервиса ещё не загружен', false); return; }
+  // Повторный старт уже работающего сервиса — не ошибка пользователя, а
+  // недоступное действие: кнопка Start в этом состоянии скрыта, вызов тихо
+  // игнорируем.
+  if (action === 'start' && lastStatus.active) return;
+  if (action !== 'start' && lastStatus.active) {
+    const n = lastStatus.connections ? lastStatus.connections.established : null;
+    const head = action === 'stop'
+      ? 'Остановить прокси? Интернет через прокси пропадёт у всех устройств, которые им пользуются.'
+      : 'Перезапустить прокси? Соединения через прокси оборвутся на несколько секунд.';
+    const tail = n == null ? '' : '\nСейчас соединений через прокси: ' + n + '.';
+    const ok = await askConfirm(head + tail, {
+      ok: action === 'stop' ? 'Остановить' : 'Перезапустить',
+      danger: action === 'stop',
+    });
+    if (!ok) return;
+  }
   const buttons = Array.from(document.querySelectorAll('[data-action="svc"]'));
+  svcBusy = true;
   buttons.forEach(b => { b.disabled = true; });
   try {
-    const d = await jpost('/api/service/'+action, null);
-    // rc!==0 — команда упала: сообщение про успех без проверки врало (REL-05)
+    const d = await jpost('/api/service/' + action, null);
     const failed = restartFailed(d);
     flash('Сервис ' + (SVC_VERBS[action] || action)
           + (failed ? ' — НЕ удался: ' + (d.stderr || d.stdout || ('rc=' + d.rc)) : ''),
           !failed);
     await refreshAll();
   } catch (e) { flash(e.message, false); }
-  finally { buttons.forEach(b => { b.disabled = false; }); }
+  finally {
+    svcBusy = false;
+    renderServiceButtons(lastStatus || {}, true);
+    // Фокус мог упасть на body, пока все кнопки были disabled; возвращаем
+    // его, только если пользователь не ушёл сам и не открыт диалог.
+    const ae = document.activeElement;
+    const focusLost = !ae || ae === document.body || ae === focusStart;
+    if (wasSvcFocus && focusLost && !document.querySelector('dialog[open]')) {
+      const next = (focusStart && !focusStart.hidden && !focusStart.disabled)
+        ? focusStart
+        : [$('btnStart'), $('btnRestart'), $('btnStop'), $('btnE2e')]
+            .find(b => b && !b.hidden && !b.disabled);
+      if (next) next.focus();
+    }
+  }
 }
 
 async function panelRestart() {
