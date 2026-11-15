@@ -14,6 +14,7 @@
     --btn-fg:#0f1115; --card:#181b22; --border:#2a2f38; --border-sel:#57606e;
     --sel-bg:rgba(255,255,255,.04); --hov:rgba(255,255,255,.07);
     --acc-tint:rgba(93,210,164,.07); --badge-bg:rgba(93,210,164,.18); --mut-tint:rgba(154,170,170,.18);
+    --badge-mut:#aab3bf;
     --input-bg:#0f1115; --log-bg:#000; --log-fg:#bfe;
     --bg-glow:rgba(93,210,164,.045); --bg-glow2:rgba(97,140,255,.035);
     --hdr-bg:rgba(15,17,21,.96); --hdr-blur:rgba(15,17,21,.78);
@@ -27,7 +28,8 @@
     --bg:#f4f5f7; --fg:#1c2128; --mut:#69707a; --acc:#0b7a53; --err:#c43e3e; --warn:#8a6a1d;
     --btn-fg:#ffffff; --card:#ffffff; --border:#d6dae0; --border-sel:#9aa3ad;
     --sel-bg:rgba(0,0,0,.04); --hov:rgba(0,0,0,.06);
-    --acc-tint:rgba(11,122,83,.08); --badge-bg:rgba(11,122,83,.14); --mut-tint:rgba(105,112,122,.14);
+    --acc-tint:rgba(11,122,83,.04); --badge-bg:#e8f5ef; --mut-tint:#eef0f2;
+    --badge-mut:#4f5762;
     --input-bg:#ffffff; --log-bg:#fbfcfd; --log-fg:#24292f;
     --bg-glow:rgba(11,122,83,.05); --bg-glow2:rgba(58,106,255,.05);
     --hdr-bg:#ffffff; --hdr-blur:rgba(255,255,255,.72);
@@ -44,7 +46,7 @@
     --font-mono:ui-monospace,Menlo,monospace;
     --r-s:8px; --r-m:10px; --r-l:12px;
     --z-header:5; --z-nav:6; --z-banner:9; --z-toast:10;
-    --conn-banner-h:66px;
+    --conn-banner-h:66px; --hdr-h:53px; --nav-h:0px;
     --focus-ring:2px solid var(--acc);
     --status-ok:var(--acc); --status-err:var(--err); --status-warn:var(--warn);
   }
@@ -74,7 +76,9 @@
           background:linear-gradient(135deg, var(--acc), #4a8cf7);
           display:inline-flex; align-items:center; justify-content:center;
           color:#fff; font-weight:800; font-size:13px; box-shadow:var(--shadow-1); }
-  #status { color:var(--mut); margin-left:auto; font-variant-numeric:tabular-nums; }
+  #status { color:var(--mut); margin-left:auto; min-width:0; max-width:52%;
+            overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+            font-variant-numeric:tabular-nums; }
   .on { color:var(--acc); } .off { color:var(--err); }
   /* Живая точка статуса: пульс только на transform/opacity, один элемент.
      prefers-reduced-motion — без анимации (доступность). */
@@ -152,7 +156,7 @@
   ul.presets .pbadges { display:flex; align-items:center; gap:4px; flex:none; margin-left:auto; }
   ul.presets .badge { font-size:11px; font-weight:600; padding:2px 7px; border-radius:999px;
                       background:var(--badge-bg); color:var(--acc); white-space:nowrap; }
-  ul.presets .badge.listen { background:var(--mut-tint); color:var(--mut); }
+  ul.presets .badge.listen { background:var(--mut-tint); color:var(--badge-mut); }
   ul.presets .kebab { width:36px; height:36px; padding:0; margin-right:4px;
                       display:inline-flex; align-items:center; justify-content:center;
                       background:none; border:none; border-radius:8px; color:var(--mut);
@@ -271,6 +275,10 @@
   .rbrow .del { background:none; border:none; color:var(--err); cursor:pointer;
                 padding:0 4px; font-size:14px; }
   .rbrow .del:hover { background:var(--hov); }
+  /* radio в строке отката: без flex:none base-правило width:100% растягивало
+     его на всю строку и ломало подпись версии. */
+  .rbrow input[type="radio"] { flex:none; width:18px; height:18px; margin:0;
+                               accent-color:var(--acc); }
   /* Визуально скрытый aria-live: текст flash() анонсируется скринридером,
      а пользователь видит toast (двойной вывод был бы шумным). */
   .sr-only { position:absolute; width:1px; height:1px; margin:-1px; overflow:hidden;
@@ -291,7 +299,6 @@
              border-bottom:1px solid var(--border); margin-bottom:14px; }
   #mainCard.no-editor #sec-diag { margin-top:0; padding-top:0; border-top:0; }
   #editorTitle { scroll-margin-top:64px; }
-  @media (max-width:800px) { #editorTitle { scroll-margin-top:118px; } }
   /* Телефон (≤800px): пальцы вместо мыши — цели ≥44px; поля 16px, иначе
      iOS приближает страницу при фокусе (UX-02). Блок обязан идти ПОСЛЕ
      базовых input/button правил — cascade. */
@@ -309,18 +316,29 @@
        кликабельной/тапабельной целью */
     .toast-x { min-height:0; min-width:0; }
   }
-  /* sticky-табы групп под шапкой — только на телефоне */
+  /* sticky-табы групп под шапкой — только на телефоне. Высоты берутся из
+     переменных: JS меряет реальную шапку (--hdr-h), --nav-h — высота табов. */
   @media (max-width:800px) {
-    #secNav { display:flex; position:sticky; top:53px; z-index:var(--z-nav);
+    :root { --nav-h:53px; }
+    #status { font-size:12px; }
+    #secNav { display:flex; position:sticky; top:var(--hdr-h); z-index:var(--z-nav);
               gap:var(--sp-1); padding:var(--sp-1) 14px; overflow-x:auto;
               background:var(--hdr-blur); backdrop-filter:blur(8px);
               -webkit-backdrop-filter:blur(8px);
               border-bottom:1px solid var(--border); }
-    #secNav a { flex:none; padding:8px var(--sp-3); border-radius:999px;
+    #secNav a { display:flex; align-items:center; flex:none; min-height:44px;
+                padding:8px 10px; border-radius:999px;
                 font-size:var(--fs-13); font-weight:600; text-decoration:none;
                 color:var(--mut); }
     #secNav a:hover { color:var(--fg); background:var(--hov); }
-    section[id] { scroll-margin-top:118px; }
+    /* #sec-diag/#sec-settings — h2, а не <section>: селектор по id покрывает
+       все четыре якоря, иначе два из них уезжали под sticky-табы. */
+    section[id], h2[id^="sec-"], #editorTitle { scroll-margin-top:calc(var(--hdr-h) + var(--nav-h) + 8px); }
+    /* цели 44px: крест редактора и импорт URI — самые мелкие кнопки */
+    #btnCloseEditor { min-width:44px; }
+    #btnQuickUri { min-width:44px; }
+    /* поля: чекбоксы/радио — исключения, у них своя геометрия */
+    input:not([type="checkbox"]):not([type="radio"]), textarea, select { min-height:44px; }
   }
   @media (prefers-reduced-motion: no-preference) { html { scroll-behavior:smooth; } }
 </style>
@@ -487,7 +505,7 @@
       <button class="ghost iconbtn" id="btnSrcPanel" data-action="logSrc" data-arg="panel"
               aria-pressed="false" title="naivepanel.log — события самой панели: безопасность, обновление, обслуживание">панель</button>
     </div>
-    <pre class="log" id="log" tabindex="0" role="log" aria-label="Лог панели (последние записи)">…</pre>
+    <pre class="log" id="log" tabindex="0" role="log" aria-label="Лог (последние записи)">…</pre>
     <div class="actions">
       <button class="ghost" data-action="loadLog">Обновить</button>
       <button class="ghost" id="btnLogFilter" data-action="logFilter" aria-pressed="false">Только ошибки</button>
@@ -578,7 +596,7 @@
   </form>
 </dialog>
 <dialog id="updDlg" aria-labelledby="updMsg">
-  <p id="updMsg" style="margin:0 0 10px"></p>
+  <p id="updMsg" role="status" style="margin:0 0 10px"></p>
   <pre class="log" id="updLog" style="max-height:180px"></pre>
   <p id="updPanelLogTitle" style="margin:10px 0 4px;font-size:12px;color:var(--mut)">Лог панели (naivepanel.log)</p>
   <pre class="log" id="updPanelLog" style="max-height:140px"></pre>
@@ -789,6 +807,17 @@ matchMedia('(prefers-color-scheme: light)').addEventListener('change', (e) => {
   }
 });
 
+// Высота шапки: sticky-табы и scroll-margin считаются от реальной высоты, а
+// не от захардкоженных 53px — шрифт/перенос/зум меняют её. ResizeObserver —
+// основной путь, resize — fallback для старых браузеров.
+const HEADER = document.querySelector('header');
+function syncHeaderHeight() {
+  document.documentElement.style.setProperty('--hdr-h', HEADER.offsetHeight + 'px');
+}
+syncHeaderHeight();
+if (window.ResizeObserver) new ResizeObserver(syncHeaderHeight).observe(HEADER);
+else window.addEventListener('resize', syncHeaderHeight);
+
 function setHash(name) {
   history.replaceState(null, '', name ? '#preset='+encodeURIComponent(name) : location.pathname);
 }
@@ -889,6 +918,7 @@ let pollFails = 0;
 let offline = false;
 let retrying = false;
 let lastStatusHtml = '';
+let lastSvcHtml = '';
 let svcKey = '';
 let svcBusy = false; // идёт POST /api/service — не перерисовывать кнопки включёнными
 let e2eBusy = false; // идёт POST /api/e2e
@@ -1048,12 +1078,19 @@ function renderStatus(st) {
       + (st.notify.pending ? ' · отложено: '+st.notify.pending : '');
   }
   if (st.auth) $('btnPwChange').hidden = !st.auth.enabled;
-  const ver = st.version ? ' · v'+escapeHtml(st.version) : '';
   const dotOn = '<span class="dot on" aria-hidden="true"></span>', dotOff = '<span class="dot off" aria-hidden="true"></span>';
-  $('status').innerHTML = (st.active
-    ? '<span class="on">'+dotOn+' работает</span> · пресет: <b>'+escapeHtml(st.current||'?')+'</b>'
-    : '<span class="off">'+dotOff+' остановлен</span>' + (st.current ? ' · пресет: '+escapeHtml(st.current) : ''))
-    + ver;
+  // Шапка без версии и без «пресет:» — на телефоне она уходила в ellipsis.
+  // innerHTML трогаем только при изменении: 3-секундный поллинг с одинаковой
+  // строкой дёргал aria-live="polite" и скринридер перечитывал статус.
+  const statusHtml = st.active
+    ? '<span class="on">' + dotOn + ' работает</span>'
+      + (st.current ? ' · ' + escapeHtml(st.current) : '')
+    : '<span class="off">' + dotOff + ' остановлен</span>'
+      + (st.current ? ' · ' + escapeHtml(st.current) : '');
+  if (statusHtml !== lastStatusHtml) {
+    $('status').innerHTML = statusHtml;
+    lastStatusHtml = statusHtml;
+  }
   const conn = st.connections;
   const connTip = 'ESTABLISHED на listen-портах активного пресета, включая локальный форвардер';
   // аптайм: серия текущего запуска + доступность 24ч/7д из журнала переходов;
@@ -1079,9 +1116,13 @@ function renderStatus(st) {
       : '—'],
     ['панель', 'v'+escapeHtml(st.version || '?')],
   ];
-  $('svcinfo').innerHTML = rows.map(([k, v], i) =>
+  const svcHtml = rows.map(([k, v], i) =>
     '<div class="kv'+(i === 0 ? ' wide' : '')+'"><span>'+k+'</span><b>'+v+'</b></div>').join('');
-  $('svcinfo').title = 'обновлено ' + new Date().toLocaleTimeString();
+  if (svcHtml !== lastSvcHtml) {
+    $('svcinfo').innerHTML = svcHtml;
+    $('svcinfo').title = 'обновлено ' + new Date().toLocaleTimeString();
+    lastSvcHtml = svcHtml;
+  }
   renderEditorChrome();
 }
 
@@ -2345,6 +2386,12 @@ function renderLogSrc() {
     b.setAttribute('aria-pressed', String(on));
     b.classList.toggle('on', on);
   }
+  // Источник меняется без перезагрузки: статическая подпись «Лог» уточняется
+  // здесь, иначе скринридер считает оба лога одним и тем же.
+  $('log').setAttribute('aria-label',
+    logSrc === 'panel'
+      ? 'Лог панели (naivepanel.log), последние записи'
+      : 'Лог прокси (naiveproxy.log), последние записи');
 }
 
 function setLogSrc(src) {
@@ -2478,13 +2525,16 @@ $('f_upstream').addEventListener('input', validateUpstream);
 window.addEventListener('beforeunload', (e) => { if (dirty) { e.preventDefault(); e.returnValue = ''; } });
 
 // Горячие клавиши: Ctrl/Cmd+S — сохранить, «/» — поиск, Esc — закрыть редактор.
+// e.code — физическая клавиша: Ctrl+S работает и в русской раскладке («ы»),
+// e.key остаётся fallback для браузеров без KeyboardEvent.code.
 let escSawDialog = false;
 document.addEventListener('keydown', (e) => {
-  if ((e.ctrlKey || e.metaKey) && (e.key === 's' || e.key === 'S')) {
+  if ((e.ctrlKey || e.metaKey) && (e.code === 'KeyS' || e.key.toLowerCase() === 's')) {
     if (isEditorOpen()) { e.preventDefault(); save(null); }
     return;
   }
-  if (e.key === '/' && !e.ctrlKey && !e.metaKey && !/^(INPUT|TEXTAREA)$/.test(e.target.tagName)) {
+  if ((e.code === 'Slash' || e.key === '/') && !e.ctrlKey && !e.metaKey
+      && !/^(INPUT|TEXTAREA)$/.test(e.target.tagName)) {
     e.preventDefault(); $('search').focus();
     return;
   }

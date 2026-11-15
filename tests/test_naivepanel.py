@@ -5884,3 +5884,60 @@ def test_p0_offline_banner_and_error_state(app):
     assert "pollFails >= 2" in _ui_fn(html, "noteFail")
     assert 'data-action="retry"' in _ui_fn(html, "renderPresetsError")
     assert "--conn-banner-h" in html
+
+
+# --- UI P0 (Task 8): контраст, тап-цели, aria-live, шапка, shortcuts ---------
+
+def _composite_hex(fg: str, alpha: float, bg: str = "ffffff") -> str:
+    out = []
+    for i in (0, 2, 4):
+        c = round(int(fg[i:i + 2], 16) * alpha + int(bg[i:i + 2], 16) * (1 - alpha))
+        out.append(f"{c:02x}")
+    return "".join(out)
+
+
+def test_p0_badge_contrast(app):
+    html = _ui_html()
+    light = re.search(r'\[data-theme="light"\]\s*\{([^}]*)\}', html, re.S).group(1)
+    def tok(name):
+        m = re.search(rf"--{name}:#([0-9a-fA-F]{{6}})", light)
+        assert m, name
+        return m.group(1)
+    assert _wcag_contrast(tok("acc"), tok("badge-bg")) >= 4.5
+    assert _wcag_contrast(tok("badge-mut"), tok("mut-tint")) >= 4.5
+    m = re.search(r"--acc-tint:rgba\(11,122,83,([0-9.]+)\)", light)
+    assert m, "light --acc-tint"
+    bg = _composite_hex(tok("acc"), float(m.group(1)))
+    assert _wcag_contrast(tok("mut"), bg) >= 4.5
+
+
+def test_p0_mobile_targets_and_radio(app):
+    html = _ui_html()
+    mobile = "\n".join(re.findall(r"@media \(max-width:800px\) \{.*?\n  \}", html, re.S))
+    for rule in ("#btnCloseEditor", "#btnQuickUri"):
+        assert re.search(re.escape(rule) + r" \{[^}]*min-width:44px", mobile), rule
+    assert re.search(r"#secNav a \{[^}]*min-height:44px", mobile)
+    assert re.search(
+        r"input:not\(\[type=\"checkbox\"\]\):not\(\[type=\"radio\"\]\)[^{]*\{[^}]*min-height:44px",
+        mobile)
+    assert re.search(r"\.rbrow input\[type=\"radio\"\][^{]*\{[^}]*flex:none", html)
+
+
+def test_p0_aria_live_and_log_labels(app):
+    html = _ui_html()
+    rs = _ui_fn(html, "renderStatus")
+    assert "lastStatusHtml" in rs and "lastSvcHtml" in rs
+    assert "const ver" not in rs
+    src = _ui_fn(html, "renderLogSrc")
+    assert "aria-label" in src
+    assert "Лог прокси" in html and "Лог панели" in html
+    assert re.search(r'<p id="updMsg"[^>]*role="status"', html)
+
+
+def test_p0_shortcuts_header_and_hidden(app):
+    html = _ui_html()
+    assert "e.code === 'KeyS'" in html
+    assert "e.code === 'Slash'" in html
+    assert "--hdr-h" in html
+    assert "ResizeObserver" in html
+    assert re.search(r"\[hidden\] \{[^}]*display:none", html)
