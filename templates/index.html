@@ -268,6 +268,14 @@
              padding:1px 8px; margin-left:var(--sp-2); }
   .edstate.dirty { color:var(--warn); border-color:var(--warn); }
   .edstate.active { color:var(--status-ok); border-color:var(--acc); }
+  /* Пустое состояние центральной карточки: редактор закрыт, но пресеты есть.
+     Закрытый редактор не оставляет пустой заголовок с линией. */
+  .edempty { display:flex; align-items:center; flex-wrap:wrap; gap:10px;
+             font-size:13px; color:var(--mut); padding:2px 0 14px;
+             border-bottom:1px solid var(--border); margin-bottom:14px; }
+  #mainCard.no-editor #sec-diag { margin-top:0; padding-top:0; border-top:0; }
+  #editorTitle { scroll-margin-top:64px; }
+  @media (max-width:800px) { #editorTitle { scroll-margin-top:118px; } }
   /* Телефон (≤800px): пальцы вместо мыши — цели ≥44px; поля 16px, иначе
      iOS приближает страницу при фокусе (UX-02). Блок обязан идти ПОСЛЕ
      базовых input/button правил — cascade. */
@@ -378,11 +386,16 @@
     </label>
   </section>
 
-  <section class="card" style="grid-area:main">
-    <h2 id="editorTitle"><span id="editorTitleText">Редактор</span><span id="editorState" class="edstate"></span><button type="button"
-        class="close" id="btnCloseEditor" data-action="closeEditor" hidden
-        aria-label="Закрыть редактор" title="Закрыть (Esc)"><svg class="ic" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8"/></svg></button></h2>
-    <form id="editor" style="display:none">
+  <section class="card no-editor" id="mainCard" style="grid-area:main">
+    <div id="editorEmpty" class="edempty" hidden>
+      <span>Пресет не выбран — выберите в списке.</span>
+      <button type="button" class="ghost" data-action="newPreset">Создать пресет</button>
+    </div>
+    <div id="editorBlock" hidden>
+      <h2 id="editorTitle" tabindex="-1"><span id="editorTitleText">Редактор</span><span id="editorState" class="edstate"></span><button type="button"
+          class="close" id="btnCloseEditor" data-action="closeEditor" hidden
+          aria-label="Закрыть редактор" title="Закрыть (Esc)"><svg class="ic" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8"/></svg></button></h2>
+      <form id="editor">
       <label for="f_name">Имя пресета (латиница, цифры, _ - .; до 64 символов)</label>
       <input id="f_name" pattern="[a-zA-Z0-9_\-.]{1,64}" autocomplete="off" spellcheck="false">
 
@@ -439,7 +452,8 @@
         <button type="button" class="ghost" data-action="activate">Сделать активным</button>
         <button type="button" class="danger" data-action="del">Удалить</button>
       </div>
-    </form>
+      </form>
+    </div>
     <div id="msg" class="sr-only" aria-live="polite"></div>
 
     <h2 class="sect" id="sec-diag">Диагностика</h2>
@@ -1014,6 +1028,7 @@ function restoreFocus(f) {
 
 function renderPresets(presets) {
   lastPresets = presets;
+  syncEditorChrome();
   setEditorState(); // activeName приходит из статуса — чип должен поспевать
   const ordered = orderedPresets(presets);
   const q = ($('search').value || '').trim().toLowerCase();
@@ -1090,16 +1105,63 @@ function openPresetMenu(name) {
 
 function escapeHtml(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 
+// Редактор открыт/закрыт: единственный признак — видимость обёртки.
+// У формы #editor своего display нет, иначе два источника истины разъедутся.
+function isEditorOpen() { return !$('editorBlock').hidden; }
+
+// Мгновенный переход без smooth-анимации. behavior:'instant' поддерживают не
+// все движки: неизвестное значение enum бросает TypeError. Без фолбэка это
+// исключение попадало бы в catch selectPreset и показывало сырой текст ошибки.
+function scrollInstant(el, block) {
+  try { el.scrollIntoView({block, behavior:'instant'}); }
+  catch (e) { el.scrollIntoView({block}); }
+}
+
+// Возврат фокуса на строку пресета (после Esc/✕): без этого фокус падал бы
+// на <body>, и клавиатурный пользователь терял место в списке.
+function focusPresetRow(name) {
+  if (!name) return false;
+  const row = [...document.querySelectorAll('ul.presets .sel')]
+    .find(b => b.dataset.arg === name);
+  if (!row) return false;
+  scrollInstant(row, 'center');
+  row.focus({preventScroll:true});
+  return true;
+}
+
+// После удаления выбранного пресета строки с этим именем уже нет: фокус
+// возвращаем на первую строку списка, иначе он упал бы на <body>.
+function focusFirstPresetRow() {
+  const row = document.querySelector('ul.presets .sel');
+  if (!row) return false;
+  scrollInstant(row, 'center');
+  row.focus({preventScroll:true});
+  return true;
+}
+
+// Оболочка центральной карточки по состоянию редактора: пустая установка —
+// ничего, открытый редактор — без пустого состояния, закрытый при наличии
+// пресетов — одна строка «Пресет не выбран» вместо пустого заголовка.
+function syncEditorChrome() {
+  const noPresets = !lastPresets.length;
+  $('editorEmpty').hidden = noPresets || isEditorOpen();
+  $('mainCard').classList.toggle('no-editor', !isEditorOpen());
+}
+
 async function selectPreset(name) {
   if (name !== current && !(await maybeDiscard())) return;
   const seq = ++selectSeq;
-  current = name;
   try {
     const cfg = await jget('/api/configs/'+encodeURIComponent(name));
     if (seq !== selectSeq) return; // выбрали другой пресет, пока шли данные
+    // current — только после успешного ответа: упавший GET не должен
+    // оставлять current на пресете, чья форма не загружена (от current
+    // зависят закрытие, удаление и возврат фокуса).
+    current = name;
     const listen = Array.isArray(cfg.listen) ? cfg.listen.join('\n') : (cfg.listen || '');
     $('editorTitleText').textContent = 'Редактор — '+name;
-    $('editor').style.display = 'block';
+    $('editorBlock').hidden = false;
+    syncEditorChrome();
     $('btnCloseEditor').hidden = false;
     $('f_name').value = name;
     $('f_name').disabled = true;
@@ -1118,6 +1180,11 @@ async function selectPreset(name) {
     setEditorState();
     renderPresets(lastPresets); // подсветить выбранный
     $('msg').textContent = '';
+    // Телефон: строка списка далеко внизу — сразу переходим к редактору
+    // и отдаём фокус заголовку (tabindex="-1"), а не оставляем его на <body>.
+    const title = $('editorTitle');
+    scrollInstant(title, 'start');
+    title.focus({preventScroll:true});
   } catch (e) { flash(e.message, false); }
 }
 
@@ -1125,7 +1192,8 @@ async function newPreset() {
   if (!(await maybeDiscard())) return;
   current = null;
   $('editorTitleText').textContent = 'Редактор — новый';
-  $('editor').style.display = 'block';
+  $('editorBlock').hidden = false;
+  syncEditorChrome();
   $('btnCloseEditor').hidden = false;
   $('f_name').disabled = false;
   ['f_name','f_listen','f_upstream','f_username','f_password','f_log','f_host_resolver_rules','f_extra_headers','f_insecure_concurrency']
@@ -1165,15 +1233,16 @@ async function quickImport() {
   $('f_listen').focus();
 }
 
-// Единственная точка фактического закрытия редактора: del() переиспользует,
-// ведь пресета уже нет — спрашивать «отбросить?» не нужно.
+// Единственная точка фактического закрытия редактора: closeEditor/del
+// переиспользуют. Фокус не трогаем — его возвращает вызывающий: closeEditor
+// после перерисовки списка, del — на первую строку после refreshAll.
 function hideEditor() {
   current = null;
   dirty = false;
-  $('editor').style.display = 'none';
-  $('btnCloseEditor').hidden = true;
+  $('editorBlock').hidden = true;
   setHash(null);
   setEditorState();
+  syncEditorChrome();
 }
 
 // Чип состояния редактора (UX-04): ровно три состояния — «активен»
@@ -1190,8 +1259,10 @@ function setEditorState() {
 
 async function closeEditor() {
   if (!(await maybeDiscard())) return;
+  const name = current;
   hideEditor();
   renderPresets(lastPresets);
+  if (!focusPresetRow(name)) $('search').focus();
 }
 
 async function dupPreset(name) {
@@ -1519,9 +1590,16 @@ async function del(name) {
   if (!(await askConfirm('Удалить пресет ' + n + '?', {ok:'Удалить', danger:true}))) return;
   try {
     await jdel('/api/configs/'+encodeURIComponent(n));
-    if (current === n) hideEditor();
+    // current читаем после ответа, а не до: пока DELETE летел, могли открыть
+    // другой пресет или новый черновик — такой редактор не закрываем.
+    const wasCurrent = current === n;
+    if (wasCurrent) hideEditor();
     flash('Удалён: '+n, true);
     await refreshAll();
+    // Список перерисован без удалённой строки: фокус — на первую строку,
+    // иначе он падал бы на <body>; пустой список уводит в поиск. Редактор,
+    // открытый во время refreshAll, фокус не отбираем.
+    if (wasCurrent && !isEditorOpen() && !focusFirstPresetRow()) $('search').focus();
   } catch (e) { flash(e.message, false); }
 }
 
@@ -2086,7 +2164,7 @@ window.addEventListener('beforeunload', (e) => { if (dirty) { e.preventDefault()
 let escSawDialog = false;
 document.addEventListener('keydown', (e) => {
   if ((e.ctrlKey || e.metaKey) && (e.key === 's' || e.key === 'S')) {
-    if ($('editor').style.display !== 'none') { e.preventDefault(); save(null); }
+    if (isEditorOpen()) { e.preventDefault(); save(null); }
     return;
   }
   if (e.key === '/' && !e.ctrlKey && !e.metaKey && !/^(INPUT|TEXTAREA)$/.test(e.target.tagName)) {
@@ -2101,9 +2179,9 @@ document.addEventListener('keydown', (e) => {
 // confirm, открытый при dirty-форме из keydown (замер: cancel через +0.3мс)
 document.addEventListener('keyup', (e) => {
   if (e.key !== 'Escape' || escSawDialog || document.querySelector('dialog[open]')) return;
-  // Условие — видимость формы, а не current: Esc работает и в режиме нового
-  // пресета (current === null); SUMMARY — Esc там закрыл <details> на keydown
-  if ($('editor').style.display !== 'none' && e.target.tagName !== 'SUMMARY') closeEditor();
+  // Условие — видимость редактора, а не current: Esc работает и в режиме
+  // нового пресета (current === null); SUMMARY — Esc там закрыл <details>
+  if (isEditorOpen() && e.target.tagName !== 'SUMMARY') closeEditor();
 });
 
 // Следим за «прилипанием»: пользователь у самого низа → автоскролл включён,

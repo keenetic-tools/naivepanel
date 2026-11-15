@@ -1056,6 +1056,10 @@ def test_select_preset_guards_stale_response(app):
     assert m, "selectPreset не найден"
     body = m.group(0)
     assert "selectSeq" in body, "нет монотонного токена выбора"
+    # current переключается только после успешного ответа и проверки токена:
+    # иначе упавший/устаревший GET оставил бы current на незагруженной форме.
+    assert body.index("seq !== selectSeq") < body.index("current = name")
+    assert body.index("await jget") < body.index("current = name")
 
 
 def test_save_is_reentry_guarded(app):
@@ -1203,11 +1207,11 @@ def test_ui_has_single_light_palette_definition(app):
 
 def test_ui_editor_closable_by_button_and_esc(app):
     # Редактор закрывается ✕ в заголовке и по Esc; Esc проверяет видимость
-    # формы, а не current — работает и в режиме нового пресета (current === null)
+    # редактора, а не current — работает и в режиме нового пресета (current === null)
     html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
     for marker in ('data-action="closeEditor"', 'id="btnCloseEditor"',
                    'id="editorTitleText"', 'closeEditor: () => closeEditor(),',
-                   "if ($('editor').style.display !== 'none'"):
+                   "if (isEditorOpen()"):
         assert marker in html, marker
     assert "&& current &&" not in html  # Esc не привязан к выбранному пресету
 
@@ -5740,3 +5744,44 @@ def test_p0_empty_state_layout(app):
     assert "IC.empty" in body and "IC.search" in body
     assert "Вставьте строку подключения" in body
     assert "focusQuick" in body
+
+
+def test_p0_editor_opens_visible_and_focuses_title(app):
+    # Тап по строке пресета на телефоне открывает редактор: страница
+    # переходит к заголовку, заголовок получает программный фокус.
+    html = _ui_html()
+    assert 'id="editorBlock" hidden' in html
+    assert 'id="editorEmpty"' in html
+    assert "$('editor').style.display" not in html
+    assert 'id="editor" style=' not in html
+    assert re.search(r'<h2 id="editorTitle"[^>]*tabindex="-1"', html), \
+        "заголовок редактора должен принимать программный фокус"
+    sel = _ui_fn(html, "selectPreset")
+    assert "editorBlock" in sel
+    assert "scrollInstant(" in sel
+    assert ".focus(" in sel
+    sync = _ui_fn(html, "syncEditorChrome")
+    assert "$('editorEmpty').hidden" in sync and "no-editor" in sync
+    assert "function isEditorOpen(" in html
+    assert "function scrollInstant(" in html
+    si = _ui_fn(html, "scrollInstant")
+    assert "catch" in si and si.count("scrollIntoView") >= 2
+
+
+def test_p0_editor_close_returns_focus(app):
+    # Закрытие возвращает фокус на строку пресета, а не на <body>.
+    html = _ui_html()
+    close = _ui_fn(html, "closeEditor")
+    assert "hideEditor" in close and "focusPresetRow" in close
+    assert "hideEditor()" in close
+    assert close.index("renderPresets") < close.index("focusPresetRow")
+    assert "focusPresetRow" in close
+    assert "focusPresetRow(name)" in close
+    hide = _ui_fn(html, "hideEditor")
+    assert "editorBlock" in hide
+    del_fn = _ui_fn(html, "del")
+    assert "hideEditor()" in del_fn
+    assert del_fn.index("await jdel") < del_fn.index("wasCurrent")
+    assert del_fn.index("refreshAll") < del_fn.index("focusFirstPresetRow")
+    assert "$('search').focus()" in del_fn
+    assert "!isEditorOpen()" in del_fn
