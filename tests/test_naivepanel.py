@@ -5832,6 +5832,9 @@ def test_p0_save_pristine_and_active_guards(app):
     assert "current && !dirty" in save
     assert "renderEditorChrome()" in save, "finally обязан пересчитать disabled"
     assert "btn.disabled = false" not in save
+    # Save выключается через chrome, пока фокус ещё на кнопке: прямая
+    # установка disabled уронила бы фокус на <body>.
+    assert "btn.disabled = true" not in save
     act = _ui_fn(html, "activate")
     assert "renderEditorChrome()" in act
     delete = _ui_fn(html, "del")
@@ -5874,6 +5877,11 @@ def test_p0_offline_banner_and_error_state(app):
     assert "Promise.all" not in refresh
     assert "await jget('/api/status')" in refresh
     assert "renderPresets(await jget('/api/configs'))" in refresh
+    # loadFailover перерисовывает пресеты: без await он стирал бы фокус,
+    # который del ставит сразу после refreshAll.
+    assert "await loadFailover()" in refresh
+    assert "foCount" in _ui_fn(html, "renderPresets")
+    assert "syncEditorChrome()" in _ui_fn(html, "renderPresetsError")
     cfg = refresh[refresh.index("renderPresets(await jget('/api/configs'))"):]
     assert "renderPresetsError" in cfg
     call = cfg.index("loadFailover();")

@@ -897,9 +897,11 @@ async function refreshAll() {
         return;
       }
     }
-    loadFailover();
+    // Ждём фейловер: он перерисовывает пресеты. Без await его поздний
+    // renderPresets стирал бы фокус, который del ставит после refreshAll.
+    await loadFailover();
     loadSpark();
-    loadLog();   // каждый сам гасит свои сетевые ошибки
+    loadLog();   // оставшиеся сами гасят свои сетевые ошибки
   } catch (e) { flash(e.message, false); }
 }
 
@@ -985,6 +987,8 @@ function renderPresetsError(msg) {
     + '<b>Не удалось загрузить пресеты</b>'
     + '<span class="hint">' + escapeHtml(msg || 'нет связи с панелью') + '</span>'
     + '<button type="button" class="ghost" data-action="retry">Повторить</button></li>';
+  // Кэш пресетов пуст: экспорт и фейловер без данных не показываем.
+  syncEditorChrome();
 }
 
 async function retryAll() {
@@ -1272,6 +1276,9 @@ function restoreFocus(f) {
 function renderPresets(presets) {
   lastPresets = presets;
   syncEditorChrome();
+  // Счётчик цепочки зависит и от списка: после восстановления связи
+  // refreshPresets не трогает renderFailover, и «N из 0» залипал бы.
+  $('foCount').textContent = foChainArr.length + ' из ' + presets.length;
   setEditorState(); // activeName приходит из статуса — чип должен поспевать
   const ordered = orderedPresets(presets);
   const q = ($('search').value || '').trim().toLowerCase();
@@ -1828,7 +1835,10 @@ async function save(ev) {
   saving = true;
   const btn = $('btnSave');
   const payload = formPayload();
-  btn.disabled = true; btn.textContent = 'Сохранение…';
+  btn.textContent = 'Сохранение…';
+  // Выключаем Save через chrome, пока он ещё видит фокус: иначе Chromium
+  // сбросит его на <body>, а renderEditorChrome уведёт на заголовок.
+  renderEditorChrome();
   try {
     if (current) {
       const d = await jput('/api/configs/'+encodeURIComponent(current), payload);
@@ -2395,6 +2405,9 @@ function renderLogSrc() {
 }
 
 function setLogSrc(src) {
+  // Без связи новый источник не загрузится, а старый контент остался бы
+  // под новой подписью — источник не переключаем.
+  if (offline) { flash('Нет связи с панелью — источник лога недоступен', false); return; }
   if (src === logSrc) return;
   logSrc = src;
   try { localStorage.setItem(LOG_SRC_KEY, src); } catch (e) { /* приватный режим */ }
