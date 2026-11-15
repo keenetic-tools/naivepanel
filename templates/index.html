@@ -364,28 +364,30 @@
     </ul>
     <div class="actions" style="margin-top:10px">
       <button class="ghost" data-action="newPreset">+ Новый</button>
-      <a class="btn" href="/api/configs/export" title="Скачать все пресеты одним JSON. ВНИМАНИЕ: файл содержит пароли upstream!">Экспорт</a>
+      <a class="btn" id="btnExport" href="/api/configs/export" title="Скачать все пресеты одним JSON. ВНИМАНИЕ: файл содержит пароли upstream!">Экспорт</a>
       <button class="ghost" data-action="import"
               title="Загрузить пресеты из ранее экспортированного JSON">Импорт</button>
       <input type="file" id="importFile" accept=".json,application/json" style="display:none" aria-hidden="true" tabindex="-1">
     </div>
-    <h2 class="sect">Фейловер <span id="foCount" class="hint"></span></h2>
-    <div id="foInfo" style="font-size:12px;color:var(--mut);margin-top:8px">фейловер: …</div>
-    <div class="actions" style="margin-top:8px">
-      <button class="ghost" data-action="foOrder" id="btnFoOrder"
-              aria-haspopup="dialog"
-              title="Изменить порядок пресетов в цепочке">Порядок</button>
-      <button class="ghost" data-action="foAll" id="btnFoAll"
-              title="Добавить все пресеты в цепочку (не больше 8)">Все в цепочку</button>
+    <div id="foSection" hidden>
+      <h2 class="sect">Фейловер <span id="foCount" class="hint"></span></h2>
+      <div id="foInfo" style="font-size:12px;color:var(--mut);margin-top:8px">фейловер: …</div>
+      <div class="actions" style="margin-top:8px">
+        <button class="ghost" data-action="foOrder" id="btnFoOrder"
+                aria-haspopup="dialog"
+                title="Изменить порядок пресетов в цепочке">Порядок</button>
+        <button class="ghost" data-action="foAll" id="btnFoAll"
+                title="Добавить все пресеты в цепочку (не больше 8)">Все в цепочку</button>
+      </div>
+      <label class="chk" style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--mut);margin-top:10px;cursor:pointer">
+        <input type="checkbox" id="foEnabled" aria-label="Автофейловер включён" disabled>
+        автофейловер включён
+      </label>
+      <label class="chk" style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--mut);margin-top:6px;cursor:pointer">
+        <input type="checkbox" id="foAuto" aria-label="Возвращать на основной" disabled>
+        возвращать на основной
+      </label>
     </div>
-    <label class="chk" style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--mut);margin-top:10px;cursor:pointer">
-      <input type="checkbox" id="foEnabled" aria-label="Автофейловер включён" disabled>
-      автофейловер включён
-    </label>
-    <label class="chk" style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--mut);margin-top:6px;cursor:pointer">
-      <input type="checkbox" id="foAuto" aria-label="Возвращать на основной" disabled>
-      возвращать на основной
-    </label>
   </section>
 
   <section class="card no-editor" id="mainCard" style="grid-area:main">
@@ -1192,11 +1194,14 @@ function focusFirstPresetRow() {
   return true;
 }
 
-// Оболочка центральной карточки по состоянию редактора: пустая установка —
-// ничего, открытый редактор — без пустого состояния, закрытый при наличии
-// пресетов — одна строка «Пресет не выбран» вместо пустого заголовка.
+// Оболочка по состоянию пресетов: фейловер нужен только при 2+ пресетах,
+// экспорт — при хотя бы одном; пустая установка — без пустого редактора,
+// открытый редактор — без пустого состояния, закрытый при наличии пресетов —
+// одна строка «Пресет не выбран» вместо пустого заголовка.
 function syncEditorChrome() {
   const noPresets = !lastPresets.length;
+  $('foSection').hidden = lastPresets.length < 2;
+  $('btnExport').hidden = noPresets;
   $('editorEmpty').hidden = noPresets || isEditorOpen();
   $('mainCard').classList.toggle('no-editor', !isEditorOpen());
 }

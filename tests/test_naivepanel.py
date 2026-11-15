@@ -5838,3 +5838,13 @@ def test_p0_save_pristine_and_active_guards(app):
     assert "foChainArr.includes" in delete
     assert "Активный пресет" in delete
     assert "isActivePreset(p)" in delete
+
+
+def test_p0_first_run_hides_failover_and_export(app):
+    html = _ui_html()
+    assert 'id="foSection"' in html
+    assert 'id="btnExport"' in html
+    sync = _ui_fn(html, "syncEditorChrome")
+    assert "foSection" in sync and "btnExport" in sync
+    assert "lastPresets.length < 2" in sync
+    assert "noPresets" in sync
