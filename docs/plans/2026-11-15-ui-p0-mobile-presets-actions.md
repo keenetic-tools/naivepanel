@@ -101,8 +101,16 @@ Ruff, Bandit, Node (`node --check` только если есть в PATH).
 4. Тексты ошибок наружу — только через `ruError()`/`humanError()`.
 5. Не менять `panel/app.py` в этом плане, кроме случая, если тест покажет, что
    клиентской локализации недостаточно.
-6. `APP_VERSION`, `SHA256SUMS`, релизные заметки — отдельным release-шагом
-   после приёмки, не в task-коммитах.
+6. `APP_VERSION` и релизные заметки — отдельным release-шагом. **`SHA256SUMS`
+   — манифест поставляемых файлов, а не только release-артефакт:** meta-тест
+   `test_sha256sums_matches_every_shipped_file` падает при любом изменении
+   `templates/index.html`/`panel/*.py`/скриптов. Поэтому каждый task-коммит,
+   меняющий поставляемый файл, обязан обновить и закоммитить `SHA256SUMS`:
+   ```bash
+   shasum -a 256 naivepanel.py templates/index.html S99naivepanel \
+     S99naiveproxy panel/*.py > SHA256SUMS
+   ```
+   На release-шаге манифест пересоздаётся ещё раз после bump `APP_VERSION`.
 
 **Live-стенд для скриншотов:** панель на роутере или локальный запуск с
 `NAIVEPANEL_*`/`NAIVEPROXY_*` на временные пути; 4–6 пресетов, цепочка из 3,
@@ -133,6 +141,11 @@ offline.
 ---
 
 ### Task 1: Локализация ошибок API и сети (`ruError`, `humanError`)
+
+> **Статус: реализовано** (commit `3c26ac8`) с уточнениями code-quality review:
+> тест расширен проверками русских строк/401/403/429/humanError/httpStatus;
+> `invalid name` приведён к `^[a-zA-Z0-9_\-.]{1,64}$`; 429-fallback
+> duration-neutral; `humanError()` сохраняет префикс составного сообщения.
 
 **Files:**
 - Modify: `templates/index.html` — `handle()`, `flash()`, новый `ruError()`/`humanError()`.
