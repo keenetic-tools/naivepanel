@@ -3156,9 +3156,8 @@ def test_ui_failover_lives_with_presets(app):
     for marker in ('id="foInfo"', 'id="foEnabled"', 'id="foAuto"',
                    'id="foCount"', 'data-action="foOrder"',
                    'data-action="foAll"', 'data-action="foToggle"',
-                   'data-action="foUp"', 'data-action="foDown"',
-                   "foOrderMode", "FO_CHAIN_MAX", "orderedPresets",
-                   "captureFocus", "restoreFocus", 'aria-label="Добавить',
+                   "FO_CHAIN_MAX", "orderedPresets",
+                   "captureFocus", "restoreFocus",
                    'id="foEnabled" aria-label="Автофейловер включён" disabled',
                    'id="foAuto" aria-label="Возвращать на основной" disabled',
                    "d.failover",
@@ -5685,3 +5684,44 @@ def test_p0_api_errors_are_localized(app):
     flash = _ui_fn(html, "flash")
     assert "humanError(" in flash
     assert flash.index("humanError(") < flash.index("textContent")
+
+
+def test_p0_preset_row_two_lines_and_menu(app):
+    html = _ui_html()
+    body = _ui_fn(html, "renderPresets")
+    assert 'class="ptop"' in body
+    assert 'class="pmeta"' in body
+    assert 'class="kebab"' in body
+    assert 'data-action="presetMenu"' in body
+    assert 'data-action="foUp"' not in body, "стрелки порядка должны жить в диалоге"
+    assert 'class="acts"' not in body, "старый столбик иконок остался"
+    assert "isActivePreset" in body
+    assert "orderedPresets" in body
+
+    css = re.search(r"ul\.presets li \{[^}]*\}", html, re.S)
+    assert css and "display:grid" in css.group(0)
+    assert "grid-template-columns:minmax(0,1fr) auto" in css.group(0)
+    for cls in (r"\.ptop", r"\.pmeta", r"\.kebab"):
+        assert re.search(cls + r" \{[^}]*\}", html), cls
+
+
+def test_p0_preset_menu_has_labelled_actions(app):
+    html = _ui_html()
+    assert 'id="presetMenuDlg"' in html
+    assert 'id="pmActions"' in html
+    menu = _ui_fn(html, "openPresetMenu")
+    for label in ("Сделать активным", "Дублировать",
+                  "Добавить в цепочку", "Убрать из цепочки", "Удалить"):
+        assert label in menu, label
+    assert "isActivePreset" in menu
+    assert "presetMenuDlg" in menu or "showModal" in menu
+
+
+def test_p0_empty_state_layout(app):
+    html = _ui_html()
+    css = re.search(r"ul\.presets \.empty \{[^}]*\}", html, re.S)
+    assert css and "flex-direction:column" in css.group(0)
+    body = _ui_fn(html, "renderPresets")
+    assert "IC.empty" in body and "IC.search" in body
+    assert "Вставьте строку подключения" in body
+    assert "focusQuick" in body

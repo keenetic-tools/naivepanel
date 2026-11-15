@@ -48,6 +48,9 @@
     --status-ok:var(--acc); --status-err:var(--err); --status-warn:var(--warn);
   }
   * { box-sizing:border-box; }
+  /* Авторские display-правила (например .spark) сильнее UA-правила [hidden];
+     атрибут обязан скрывать элемент всегда, пока его не снимут из JS. */
+  [hidden] { display:none !important; }
   /* Фон на html красит канву напрямую, включая зону overscroll («резинку»).
      Распространение фона body на канву Safari ломает на композитных слоях
      (backdrop-filter шапки, fixed body::before) — внизу мигала полоса цвета
@@ -123,39 +126,44 @@
                    font-variant-numeric:tabular-nums; }
   ul.presets { list-style:none; padding:0; margin:0; }
   #search { margin-bottom:10px; }
+  /* Строка пресета — две строки: имя+статус сверху, host/роли снизу;
+     действия спрятаны в одно меню ⋯, а не столбиком иконок. */
   ul.presets li { border:1px solid var(--border); border-radius:var(--r-m); margin-bottom:6px;
-                  display:flex; align-items:center; background:var(--input-bg);
-                  min-width:0; /* grid-item: без этого min-content строки (кнопки+имя)
-                                  раздувает колонку main и рвёт mobile-вьюпорт */
+                  display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:center;
+                  background:var(--input-bg); min-width:0;
                   transition:border-color .14s ease, transform .14s ease, box-shadow .14s ease; }
   ul.presets li:hover { border-color:var(--acc); transform:translateY(-1px); box-shadow:var(--shadow-1); }
   ul.presets li.selected { border-color:var(--border-sel); background:var(--sel-bg); }
   /* active (запущенный) важнее selected — его зелёная рамка переопределяет */
   ul.presets li.active { border-color:var(--acc); background:var(--acc-tint); }
-  ul.presets .sel { flex:1 1 auto; min-width:0; display:flex; align-items:center; gap:8px;
-                    padding:7px 4px 7px 11px; background:none; border:none; color:inherit;
-                    font:inherit; text-align:left; cursor:pointer; border-radius:9px; }
-  ul.presets .sel:hover { background:var(--hov); }
-  ul.presets .name { font-weight:600; flex:0 1 auto; max-width:55%;
+  ul.presets .sel { display:flex; flex-direction:column; align-items:flex-start; gap:2px;
+                    min-width:0; padding:9px 6px 9px 12px; background:none; border:none;
+                    color:inherit; font:inherit; text-align:left; cursor:pointer;
+                    border-radius:9px; width:100%; box-shadow:none; }
+  ul.presets .sel:hover { background:var(--hov); filter:none; box-shadow:none; }
+  ul.presets .ptop { display:flex; align-items:center; gap:6px; min-width:0; width:100%; }
+  ul.presets .name { font-weight:600; min-width:0; flex:0 1 auto;
                      overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  ul.presets .proxy { flex:1 1 0; min-width:0; color:var(--mut); font-size:12px;
-                      overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  ul.presets .pmeta { display:flex; align-items:center; gap:6px; min-width:0; width:100%;
+                      color:var(--mut); font-size:12px; }
+  ul.presets .proxy { min-width:0; flex:1 1 auto; overflow:hidden;
+                      text-overflow:ellipsis; white-space:nowrap; }
+  ul.presets .pbadges { display:flex; align-items:center; gap:4px; flex:none; margin-left:auto; }
   ul.presets .badge { font-size:11px; font-weight:600; padding:2px 7px; border-radius:999px;
                       background:var(--badge-bg); color:var(--acc); white-space:nowrap; }
   ul.presets .badge.listen { background:var(--mut-tint); color:var(--mut); }
-  ul.presets .acts { margin-left:auto; display:flex; gap:4px; padding-right:8px; }
-  ul.presets .act { font-size:12px; color:var(--acc); background:none; border:none; cursor:pointer;
-                    padding:4px 6px; border-radius:6px; }
-  ul.presets .del { background:none; border:none; color:var(--err); cursor:pointer;
-                    padding:4px 6px; border-radius:6px; }
-  ul.presets .act:hover, ul.presets .del:hover { background:var(--hov); }
-  ul.presets .act:disabled, ul.presets .del:disabled { opacity:.35; cursor:default; }
-  ul.presets .act:disabled:hover, ul.presets .del:disabled:hover { background:none; }
-  /* Пустое состояние списка — мягкая заглушка вместо голого текста */
-  .empty { text-align:center; color:var(--mut); font-size:13px; padding:26px 12px;
-           border:1px dashed var(--border); border-radius:10px; }
-  .empty .ico { display:block; font-size:22px; opacity:.55; margin-bottom:6px; }
-  .empty .hint { display:block; font-size:12px; opacity:.75; margin-top:4px; }
+  ul.presets .kebab { width:36px; height:36px; padding:0; margin-right:4px;
+                      display:inline-flex; align-items:center; justify-content:center;
+                      background:none; border:none; border-radius:8px; color:var(--mut);
+                      box-shadow:none; cursor:pointer; }
+  ul.presets .kebab:hover { background:var(--hov); color:var(--fg); filter:none; }
+  ul.presets .empty { display:flex; flex-direction:column; align-items:center; gap:6px;
+                      text-align:center; padding:26px 12px; border-style:dashed; }
+  ul.presets li.empty:hover { border-color:var(--border); transform:none; box-shadow:none; }
+  ul.presets .empty .ic { width:22px; height:22px; opacity:.55; }
+  ul.presets .empty b { font-weight:600; color:var(--fg); }
+  ul.presets .empty .hint { display:block; font-size:12px; opacity:.85; margin:0; }
+  ul.presets .empty button { margin-top:6px; }
   .skel { list-style:none; height:38px; border-radius:10px; margin-bottom:6px;
           border:1px solid var(--border); background:var(--sel-bg); }
   @media (prefers-reduced-motion: no-preference) {
@@ -222,6 +230,10 @@
            box-shadow:var(--shadow-2); }
   dialog::backdrop { background:rgba(0,0,0,.45); }
   #confirmMsg { margin:0; white-space:pre-line; }
+  .dlgtitle { margin:0; font-weight:600; }
+  .dlgsub { margin:4px 0 0; font-size:12px; color:var(--mut); }
+  .pmenu { display:flex; flex-direction:column; gap:8px; margin-top:14px; }
+  .pmenu button { width:100%; text-align:left; }
   .dlg-actions { display:flex; gap:8px; justify-content:flex-end; margin-top:16px; }
   /* Строка версии в диалоге отката */
   .rbrow { display:flex; align-items:center; gap:8px; padding:5px 6px;
@@ -252,11 +264,13 @@
   @media (max-width:800px) {
     input, textarea, select { font-size:16px; }
     button { min-height:44px; }
-    ul.presets .act, ul.presets .del, .iconbtn { min-height:44px; min-width:44px; }
+    .iconbtn { min-height:44px; min-width:44px; }
+    /* ⋯ — единственная цель строки, поэтому строго 44×44; сама строка
+       остаётся ≤72px: 9 + 21 + 18 + 2 + 9 + рамка */
+    ul.presets .kebab { width:44px; height:44px; min-width:44px; min-height:44px; margin-right:0; }
     /* кликабельные подписи-чекбоксы: строка целиком — цель, но и высоту
        держим пальцеприемлемой */
     label.chk { min-height:44px; }
-    ul.presets .acts { flex-wrap:wrap; justify-content:flex-end; }
     /* мини-крест закрытия тоста — исключение: сам тост остаётся большой
        кликабельной/тапабельной целью */
     .toast-x { min-height:0; min-width:0; }
@@ -338,7 +352,9 @@
     <h2 class="sect">Фейловер <span id="foCount" class="hint"></span></h2>
     <div id="foInfo" style="font-size:12px;color:var(--mut);margin-top:8px">фейловер: …</div>
     <div class="actions" style="margin-top:8px">
-      <button class="ghost" data-action="foOrder" id="btnFoOrder"
+      <!-- Временно скрыта: строки больше не рисуют стрелки, порядок
+           переедет в диалог (Task 3); неработающий режим не показываем -->
+      <button class="ghost" data-action="foOrder" id="btnFoOrder" hidden
               aria-pressed="false"
               title="Показать цепочку в порядке приоритета и включить ↑↓">Порядок</button>
       <button class="ghost" data-action="foAll" id="btnFoAll"
@@ -489,6 +505,14 @@
   <form method="dialog" class="dlg-actions">
     <button class="ghost" value="cancel">Отмена</button>
     <button id="confirmOk" value="ok">OK</button>
+  </form>
+</dialog>
+<dialog id="presetMenuDlg" aria-labelledby="pmTitle">
+  <p id="pmTitle" class="dlgtitle"></p>
+  <p id="pmMeta" class="dlgsub"></p>
+  <div class="pmenu" id="pmActions"></div>
+  <form method="dialog" class="dlg-actions">
+    <button class="ghost" value="close">Отмена</button>
   </form>
 </dialog>
 <dialog id="notesDlg" aria-labelledby="notesTitle">
@@ -642,6 +666,9 @@ const IC = {
   link: '<svg class="ic" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6.5 9.5l3-3"/><path d="M5.5 7L4 5.5a2.6 2.6 0 0 1 3.7-3.7L9.2 3.3"/><path d="M10.5 9l1.5 1.5a2.6 2.6 0 0 1-3.7 3.7L6.8 12.7"/></svg>',
   sun: '<svg class="ic" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="8" cy="8" r="3"/><path d="M8 1.2v1.6M8 13.2v1.6M1.2 8h1.6M13.2 8h1.6M3.2 3.2l1.1 1.1M11.7 11.7l1.1 1.1M12.8 3.2l-1.1 1.1M4.3 11.7l-1.1 1.1"/></svg>',
   moon: '<svg class="ic" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" aria-hidden="true"><path d="M13.5 9.8A6.2 6.2 0 0 1 6.2 2.5a6.2 6.2 0 1 0 7.3 7.3z"/></svg>',
+  more: '<svg class="ic" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" aria-hidden="true"><path d="M8 3.2h.01M8 8h.01M8 12.8h.01"/></svg>',
+  empty: '<svg class="ic" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2.2" y="3.2" width="11.6" height="9.6" rx="2"/><path d="M5 8h6M8 5v6"/></svg>',
+  search: '<svg class="ic" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5L14 14"/></svg>',
 };
 
 // Сообщение видно toast'ом (клик — закрыть), а #msg — visually-hidden
@@ -911,12 +938,30 @@ async function pollStatus() {
 
 let lastPresets = []; // кэш для перерисовки при смене selected/поиска без запроса
 
+// host:port без схемы и кредов: в строке пресета он должен читаться, а не
+// прятаться за https:// и маской пароля (сам URI остаётся в title).
+function proxyHost(proxy) {
+  const s = String(proxy || '');
+  const at = s.lastIndexOf('@');
+  const tail = at >= 0 ? s.slice(at + 1) : s.replace(/^[a-z]+:\/\//i, '');
+  return tail.replace(/\/+$/, '') || s;
+}
+
+function presetMeta(p) {
+  const m = String(p.proxy || '').match(/^([a-z]+):\/\//i);
+  const scheme = m ? m[1].toLowerCase() : '';
+  const host = proxyHost(p.proxy);
+  const proto = scheme && scheme !== 'https' ? scheme + ' · ' : '';
+  return proto + (p.username ? p.username + ' · ' : '') + host;
+}
+
+function isActivePreset(p) {
+  return activeName ? p.name === activeName : !!p.active;
+}
+
 function orderedPresets(presets) {
-  if (!foOrderMode) return presets;
-  const chain = foChainArr
-    .map(n => presets.find(p => p.name === n)).filter(Boolean);
-  const rest = presets.filter(p => !foChainArr.includes(p.name));
-  return chain.concat(rest);
+  // Активный — первым: он не должен тонуть в алфавитном списке conf.d.
+  return presets.filter(isActivePreset).concat(presets.filter(p => !isActivePreset(p)));
 }
 
 function captureFocus() {
@@ -959,63 +1004,72 @@ function renderPresets(presets) {
   const shown = q ? ordered.filter(p =>
     (p.name + ' ' + (p.proxy || '')).toLowerCase().includes(q)) : ordered;
   const ul = $('presets'); ul.setAttribute('aria-busy','false'); ul.innerHTML = '';
-  if (!shown.length) {
-    const search = presets.length;
-    ul.innerHTML = '<li class="empty" aria-live="polite">'
-      + (search
-        ? '<span class="ico" aria-hidden="true">⌕</span>ничего не найдено'
-          + '<span class="hint">попробуйте другое слово или очистите поиск</span>'
-        : '<span class="ico" aria-hidden="true">✳</span>пресетов пока нет'
-          + '<span class="hint">нажмите «+ Новый», чтобы создать первый</span>')
-      + '</li>';
+
+  if (!presets.length) {
+    ul.innerHTML = '<li class="empty" aria-live="polite">' + IC.empty + '<b>Пресетов пока нет</b>'
+      + '<span class="hint">Вставьте строку подключения выше или нажмите «+ Новый»</span>'
+      + '<button type="button" class="ghost" data-action="focusQuick">Вставить ссылку</button></li>';
     return;
   }
+  if (!shown.length) {
+    ul.innerHTML = '<li class="empty" aria-live="polite">' + IC.search + '<b>Ничего не найдено</b>'
+      + '<span class="hint">Попробуйте другое слово или очистите поиск</span></li>';
+    return;
+  }
+
   for (const p of shown) {
     const li = document.createElement('li');
-    // активность берём из свежего /api/status (activeName), а p.active —
-    // запасной вариант до первого статуса: автопереключение и авто-возврат
-    // должны подсвечиваться сразу, без перезапроса списка
-    const isActive = activeName ? p.name === activeName : p.active;
+    const isActive = isActivePreset(p);
     li.className = (isActive ? 'active' : '') + (p.name === current ? ' selected' : '');
-    // односторочная строка: имя + бейджи + замаскированный proxy с ellipsis;
-    // полный URI — в title (proxy уже без пароля, маска только для UI)
+    // маска пароля — только для title: вторая строка показывает host:port
     const masked = p.proxy.replace(/:\/\/[^@]+@/, '://***@');
     const idx = foChainArr.indexOf(p.name);
     const role = idx === 0
       ? '<span class="badge" title="Основной в цепочке">осн.</span>'
-      : (idx > 0
-          ? '<span class="badge" title="Резерв ' + (idx + 1) + '">№' + (idx + 1) + '</span>'
-          : (foOrderMode ? '<span class="badge" title="Вне цепочки">—</span>' : ''));
-    const full = idx < 0 && foChainArr.length >= FO_CHAIN_MAX;
-    const updown = foOrderMode && idx >= 0
-      ? '<button class="act" data-action="foUp" data-arg="' + escapeHtml(p.name) + '" aria-label="Выше ' + escapeHtml(p.name) + '" title="Выше"' + (idx === 0 || foBusy ? ' disabled' : '') + '>' + IC.up + '</button>'
-        + '<button class="act" data-action="foDown" data-arg="' + escapeHtml(p.name) + '" aria-label="Ниже ' + escapeHtml(p.name) + '" title="Ниже"' + (idx === foChainArr.length - 1 || foBusy ? ' disabled' : '') + '>' + IC.down + '</button>'
+      : (idx > 0 ? '<span class="badge" title="Резерв ' + (idx + 1) + '">№' + (idx + 1) + '</span>' : '');
+    const listen = p.listen_count > 1
+      ? '<span class="badge listen" title="Слушает ' + p.listen_count + ' адреса">×' + p.listen_count + '</span>'
       : '';
-    const chainTitle = full ? 'Цепочка заполнена (' + FO_CHAIN_MAX + ')'
-      : (idx >= 0 ? 'Убрать из цепочки' : 'Добавить в цепочку');
-    const chainBtn = '<button class="act" data-action="foToggle" data-arg="' + escapeHtml(p.name) + '"'
-      + (idx >= 0
-          ? ' aria-label="Убрать ' + escapeHtml(p.name) + ' из цепочки"'
-          : ' aria-label="Добавить ' + escapeHtml(p.name) + ' в цепочку"')
-      + ' aria-pressed="' + (idx >= 0) + '" title="' + chainTitle + '"'
-      + (foBusy || full ? ' disabled' : '') + '>' + IC.link + '</button>';
-    li.innerHTML = '<button class="sel" '+(p.name === current ? 'aria-current="true" ' : '')
-      + 'data-action="select" data-arg="'+escapeHtml(p.name)+'">'
-      + '<span class="name" title="'+escapeHtml(p.name)+'">'+escapeHtml(p.name)+'</span>'
-      + (isActive ? '<span class="badge">активен</span>' : '')
-      + role
-      + (p.listen_count > 1 ? '<span class="badge listen" title="слушает '+p.listen_count+' адреса(ов)">×'+p.listen_count+'</span>' : '')
-      + '<span class="proxy" title="'+escapeHtml(masked)+'">'+escapeHtml(masked)+'</span>'
+    const name = escapeHtml(p.name);
+    li.innerHTML = '<button class="sel" data-action="select" data-arg="' + name + '"'
+      + (p.name === current ? ' aria-current="true"' : '') + '>'
+      + '<span class="ptop"><span class="name" title="' + name + '">' + name + '</span>'
+      + (isActive ? '<span class="badge">активен</span>' : '') + '</span>'
+      + '<span class="pmeta"><span class="proxy" title="' + escapeHtml(masked) + '">'
+      + escapeHtml(presetMeta(p)) + '</span>'
+      + '<span class="pbadges">' + role + listen + '</span></span>'
       + '</button>'
-      + '<span class="acts">'
-      + updown
-      + chainBtn
-      + (!isActive ? '<button class="act" aria-label="Активировать '+escapeHtml(p.name)+'" title="Активировать" data-action="activate" data-arg="'+escapeHtml(p.name)+'">' + IC.arrow + '</button>' : '')
-      + '<button class="act" aria-label="Дублировать '+escapeHtml(p.name)+'" title="Дублировать (пароль переносится)" data-action="duplicate" data-arg="'+escapeHtml(p.name)+'">' + IC.copy + '</button>'
-      + '<button class="del" aria-label="Удалить '+escapeHtml(p.name)+'" title="Удалить" data-action="del" data-arg="'+escapeHtml(p.name)+'">' + IC.x + '</button>'
-      + '</span>';
+      + '<button class="kebab" type="button" data-action="presetMenu" data-arg="' + name + '"'
+      + ' aria-label="Действия с ' + name + '" aria-haspopup="dialog">' + IC.more + '</button>';
     ul.appendChild(li);
   }
+}
+
+// Меню действий строки: единственное место, где живут активация, цепочка,
+// дублирование и удаление. Активному пресету не предлагаем активировать его
+// ещё раз или удалить — сервер такие операции всё равно отклонит.
+function openPresetMenu(name) {
+  const p = lastPresets.find(x => x.name === name);
+  if (!p) return;
+  const isActive = isActivePreset(p);
+  const inChain = foChainArr.includes(name);
+  const full = !inChain && foChainArr.length >= FO_CHAIN_MAX;
+  const n = escapeHtml(name);
+  const acts = [];
+  $('pmTitle').textContent = name;
+  $('pmMeta').textContent = presetMeta(p) + (isActive ? ' · активен' : '');
+  if (!isActive)
+    acts.push('<button type="button" class="ghost" data-action="activate" data-arg="' + n + '">Сделать активным</button>');
+  if (inChain)
+    acts.push('<button type="button" class="ghost" data-action="foToggle" data-arg="' + n + '">Убрать из цепочки</button>');
+  else
+    acts.push('<button type="button" class="ghost" data-action="foToggle" data-arg="' + n + '"'
+      + (full ? ' disabled title="Цепочка заполнена"' : '') + '>Добавить в цепочку</button>');
+  acts.push('<button type="button" class="ghost" data-action="duplicate" data-arg="' + n + '">Дублировать</button>');
+  if (!isActive)
+    acts.push('<button type="button" class="danger" data-action="del" data-arg="' + n + '">Удалить</button>');
+  $('pmActions').innerHTML = acts.join('');
+  $('presetMenuDlg').showModal();
 }
 
 function escapeHtml(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
@@ -2068,6 +2122,8 @@ const ACTIONS = {
   tgTest: () => testTelegram(),
   tgOff: () => offTelegram(),
   select: (arg) => selectPreset(arg),
+  presetMenu: (arg) => openPresetMenu(arg),
+  focusQuick: () => { $('quickUri').scrollIntoView({block:'center'}); $('quickUri').focus(); },
   activate: (arg) => activate(arg),
   duplicate: (arg) => dupPreset(arg),
   del: (arg) => del(arg),
@@ -2085,7 +2141,13 @@ document.addEventListener('click', (e) => {
   const el = e.target.closest('[data-action]');
   if (!el) return;
   const fn = ACTIONS[el.dataset.action];
-  if (fn) { e.preventDefault(); fn(el.dataset.arg); }
+  if (!fn) return;
+  e.preventDefault();
+  // Меню — модальный dialog: закрываем его до действия, иначе следующий
+  // диалог (confirm при удалении/цепочке) откроется поверх него.
+  const menu = $('presetMenuDlg');
+  if (menu.open && el.closest('#presetMenuDlg')) menu.close();
+  fn(el.dataset.arg);
 });
 
 $('editor').addEventListener('submit', save);
