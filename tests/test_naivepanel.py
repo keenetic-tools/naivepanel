@@ -5848,3 +5848,39 @@ def test_p0_first_run_hides_failover_and_export(app):
     assert "foSection" in sync and "btnExport" in sync
     assert "lastPresets.length < 2" in sync
     assert "noPresets" in sync
+
+
+def test_p0_offline_banner_and_error_state(app):
+    html = _ui_html()
+    assert 'id="connBanner"' in html
+    assert 'id="connText"' in html
+    assert "function setOffline(" in html
+    poll = _ui_fn(html, "pollStatus")
+    assert "noteOk" in poll and "noteFail" in poll
+    assert "isConnError" in poll
+    refresh = _ui_fn(html, "refreshAll")
+    assert "renderPresetsError" in refresh
+    assert "isConnError" in refresh
+    assert "retryAll" in html
+    assert "Повторить" in html
+    assert "502" in html
+    assert "CONN_ERROR_STATUSES = [502, 503, 504]" in html
+    assert "retrying" in html
+    assert "if (retrying) return" in html
+    assert "retry: () => retryAll()" in html
+    assert "refreshPresets" in poll
+    assert "refreshAll" not in poll
+    assert "function refreshPresets(" in html
+    assert "Promise.all" not in refresh
+    assert "await jget('/api/status')" in refresh
+    assert "renderPresets(await jget('/api/configs'))" in refresh
+    cfg = refresh[refresh.index("renderPresets(await jget('/api/configs'))"):]
+    assert "renderPresetsError" in cfg
+    call = cfg.index("loadFailover();")
+    assert cfg.index("renderPresetsError") < call
+    assert "return" in cfg[:call]
+    assert "applyFailover" not in refresh
+    assert "|| offline" in _ui_fn(html, "renderServiceButtons")
+    assert "pollFails >= 2" in _ui_fn(html, "noteFail")
+    assert 'data-action="retry"' in _ui_fn(html, "renderPresetsError")
+    assert "--conn-banner-h" in html

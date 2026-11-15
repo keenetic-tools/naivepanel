@@ -43,7 +43,8 @@
     --fs-11:11px; --fs-12:12px; --fs-13:13px; --fs-14:14px; --fs-16:16px;
     --font-mono:ui-monospace,Menlo,monospace;
     --r-s:8px; --r-m:10px; --r-l:12px;
-    --z-header:5; --z-nav:6; --z-toast:10;
+    --z-header:5; --z-nav:6; --z-banner:9; --z-toast:10;
+    --conn-banner-h:66px;
     --focus-ring:2px solid var(--acc);
     --status-ok:var(--acc); --status-err:var(--err); --status-warn:var(--warn);
   }
@@ -227,6 +228,19 @@
              padding:0 2px; margin-left:8px; font-size:12px; font-weight:400;
              box-shadow:none; }
   .toast-x:hover { opacity:1; filter:none; box-shadow:none; background:none; }
+  /* Offline-баннер: фиксированная полоса над тостами. body.has-conn-banner
+     поднимает тосты и добавляет отступ, чтобы баннер не накрывал контент. */
+  #connBanner { position:fixed; left:var(--sp-4); right:var(--sp-4); bottom:var(--sp-4);
+                z-index:var(--z-banner); display:flex; align-items:center; gap:var(--sp-2);
+                padding:10px var(--sp-3); border:1px solid var(--err); border-radius:var(--r-m);
+                background:var(--card); box-shadow:var(--shadow-2); font-size:var(--fs-13); }
+  #connBanner .dot { margin-right:0; flex:none; }
+  #connBanner button { margin-left:auto; }
+  body.has-conn-banner { padding-bottom:calc(var(--conn-banner-h, 66px) + 32px); }
+  body.has-conn-banner #toasts { bottom:calc(var(--conn-banner-h, 66px) + 40px); }
+  @media (max-width:800px) {
+    #connBanner { left:12px; right:12px; bottom:calc(12px + env(safe-area-inset-bottom)); }
+  }
   dialog { border:1px solid var(--border); border-radius:var(--r-l); background:var(--card);
            color:var(--fg); padding:18px; max-width:min(420px, calc(100vw - 32px));
            box-shadow:var(--shadow-2); }
@@ -609,6 +623,12 @@
     </div>
   </form>
 </dialog>
+<div id="connBanner" hidden>
+  <span class="dot off" aria-hidden="true"></span>
+  <span id="connText" role="status">Нет связи с панелью</span>
+  <button type="button" class="ghost" id="btnRetry" data-action="retry"
+          aria-label="Повторить подключение к панели">Повторить</button>
+</div>
 <div id="toasts"></div>
 
 <script nonce="{{ csp_nonce }}">
@@ -824,13 +844,33 @@ async function maybeDiscard() {
 }
 
 async function refreshAll() {
+  let st;
+  try { st = await jget('/api/status'); }
+  catch (e) {
+    if (isConnError(e)) noteFail(true);
+    if (!lastPresets.length) renderPresetsError(humanError(e));
+    flash(e.message, false);
+    return;
+  }
+  lastStatus = st;
+  noteOk();
+  // Шаблонный/render-сбой не должен ни поднимать offline, ни всплывать
+  // unhandled rejection'ом: connectivity решает только запрос статуса.
   try {
-    const [st, ps] = await Promise.all([jget('/api/status'), jget('/api/configs')]);
     renderStatus(st);
-    renderPresets(ps);
+    try { renderPresets(await jget('/api/configs')); }
+    catch (e) {
+      flash(e.message, false);
+      if (!lastPresets.length) {
+        renderPresetsError(humanError(e));
+        // До загрузки фейловера не доходим: она перерисует пресеты и затрёт
+        // error-state обычным «Пресетов пока нет» без retry.
+        return;
+      }
+    }
     loadFailover();
     loadSpark();
-    loadLog();
+    loadLog();   // каждый сам гасит свои сетевые ошибки
   } catch (e) { flash(e.message, false); }
 }
 
@@ -844,9 +884,104 @@ function fmtUptime(s) {
 }
 
 let lastStatus = null;
+let lastOkAt = 0;
+let pollFails = 0;
+let offline = false;
+let retrying = false;
+let lastStatusHtml = '';
 let svcKey = '';
 let svcBusy = false; // идёт POST /api/service — не перерисовывать кнопки включёнными
 let e2eBusy = false; // идёт POST /api/e2e
+
+// 502/503/504 — прокси/шлюз не достучался до панели: для пользователя это
+// такой же обрыв, как Failed to fetch. 401/500 — «панель ответила», баннер не
+// поднимаем: это ошибка доступа/сервера, а не отсутствие связи.
+const CONN_ERROR_STATUSES = [502, 503, 504];
+function isConnError(e) {
+  return !e || !e.httpStatus || CONN_ERROR_STATUSES.includes(e.httpStatus);
+}
+
+// Высоту баннера меряем, а не хардкодим: на 320/360/375px текст переносится
+// и фиксированные 64px накрывали контент/тосты.
+function syncBannerHeight() {
+  if (!offline) return;
+  document.documentElement.style.setProperty(
+    '--conn-banner-h', $('connBanner').offsetHeight + 'px');
+}
+
+// Offline-состояние: баннер появляется после двух сетевых сбоев подряд (или
+// сразу, если упал refreshAll), прячется первым успешным ответом. Last data
+// (lastStatus) не сбрасываем — кнопки и цифры должны пережить обрыв.
+function setOffline(on) {
+  if (on === offline) return;
+  offline = on;
+  $('connBanner').hidden = !on;
+  document.body.classList.toggle('has-conn-banner', on);
+  if (on) {
+    const at = lastOkAt
+      ? new Date(lastOkAt).toLocaleTimeString('ru-RU', {hour:'2-digit', minute:'2-digit'})
+      : '';
+    $('connText').textContent = 'Нет связи с панелью' + (at ? ' · последнее обновление ' + at : '');
+    $('status').innerHTML = '<span class="off"><span class="dot off" aria-hidden="true"></span>нет связи</span>';
+    lastStatusHtml = '';
+    // offline уже true: предикат в renderServiceButtons выключит кнопки и
+    // заодно уведёт фокус с кнопки, которую сейчас скроет.
+    renderServiceButtons(lastStatus || {}, true);
+    syncBannerHeight();
+  }
+}
+
+function noteOk() {
+  const wasOffline = offline;
+  lastOkAt = Date.now();
+  pollFails = 0;
+  setOffline(false);
+  // force только при восстановлении: ключ состояния мог не измениться, а
+  // кнопки были выключены offline'ом.
+  if (wasOffline) renderServiceButtons(lastStatus || {}, true);
+  if (wasOffline) flash('Связь с панелью восстановлена', true);
+  return wasOffline;
+}
+
+function noteFail(immediate) {
+  pollFails++;
+  if (immediate || pollFails >= 2) setOffline(true);
+}
+
+function renderPresetsError(msg) {
+  const ul = $('presets');
+  ul.setAttribute('aria-busy', 'false');
+  ul.innerHTML = '<li class="empty" aria-live="polite">' + IC.empty
+    + '<b>Не удалось загрузить пресеты</b>'
+    + '<span class="hint">' + escapeHtml(msg || 'нет связи с панелью') + '</span>'
+    + '<button type="button" class="ghost" data-action="retry">Повторить</button></li>';
+}
+
+async function retryAll() {
+  if (retrying) return;
+  retrying = true;
+  const btns = [...document.querySelectorAll('[data-action="retry"]')];
+  btns.forEach(b => { b.disabled = true; });
+  try { await refreshAll(); }
+  finally {
+    retrying = false;
+    btns.forEach(b => { if (b.isConnected) b.disabled = false; });
+  }
+}
+
+// Догрузка только пресетов: статус уже получен, поэтому сетевой сбой здесь —
+// не повод поднимать offline-баннер (иначе configs-only обрыв зацикливал бы
+// recovery: poll → refreshAll → noteFail → баннер → poll ...).
+async function refreshPresets() {
+  try { renderPresets(await jget('/api/configs')); }
+  catch (e) {
+    flash(e.message, false);
+    if (!lastPresets.length) {
+      renderPresetsError(humanError(e));
+      return;
+    }
+  }
+}
 
 // Состояние приходит из /api/status; 3-секундный поллинг не должен трогать
 // кнопки без изменений (это сбрасывало бы фокус). init-скрипта может не быть —
@@ -866,13 +1001,15 @@ function renderServiceButtons(st, force) {
   const keepFocus = !!(focused && focused.matches('[data-action="svc"]'));
 
   // Кнопки не «мертвые»: в каждом состоянии видно только применимое действие.
+  // offline входит в disabled: пока баннер висит, in-flight svc/e2e finally
+  // не должен вернуть кнопки в строй до реального восстановления связи.
   $('btnStart').hidden = running || !has;
   $('btnStop').hidden = !running;
   $('btnRestart').hidden = !running;
-  $('btnStart').disabled = !init || svcBusy;
-  $('btnStop').disabled = !init || svcBusy;
-  $('btnRestart').disabled = !init || svcBusy;
-  $('btnE2e').disabled = !has || e2eBusy;
+  $('btnStart').disabled = !init || svcBusy || offline;
+  $('btnStop').disabled = !init || svcBusy || offline;
+  $('btnRestart').disabled = !init || svcBusy || offline;
+  $('btnE2e').disabled = !has || e2eBusy || offline;
 
   if (keepFocus && focused.hidden) {
     const next = [$('btnStop'), $('btnRestart'), $('btnStart'), $('btnE2e')]
@@ -1018,7 +1155,17 @@ $('tgForm').addEventListener('submit', saveTelegram);
 // Лёгкий поллинг: лог и статус сами показывают, что naive упал, без кликов.
 // Пресеты не трогаем — перерисовка списка каждые 3с мешает наведению/клику.
 async function pollStatus() {
-  try { renderStatus(await jget('/api/status')); } catch (e) { /* transient */ }
+  try {
+    const st = await jget('/api/status');
+    lastStatus = st;
+    const recovered = noteOk();
+    renderStatus(st);
+    // Только восстановление после initial-сбоя: кэш строк не трогаем, чтобы
+    // не сбрасывать фокус/наведение на каждом обычном recovery.
+    if (recovered && !lastPresets.length) await refreshPresets();
+  } catch (e) {
+    if (isConnError(e)) noteFail(false); // 401/500 — не «нет сети»
+  }
 }
 
 let lastPresets = []; // кэш для перерисовки при смене selected/поиска без запроса
@@ -2277,12 +2424,16 @@ async function copyPac() {
 }
 
 async function loadLog() {
+  if (offline) return; // связь уже помечена offline — прошлый лог не трогаем
   let content;
   try {
     const r = await jget('/api/logs?lines=100&src='+logSrc);
     content = r.content || '(пусто)';
   } catch (e) {
-    content = 'log error: '+e.message;
+    // transient-сбой не затирает прочитанный лог; без кэша показываем
+    // по-русски, без внутреннего «log error» и браузерного Failed to fetch
+    if (lastLog) return;
+    content = isConnError(e) ? 'Нет связи с панелью' : 'log error: '+e.message;
   }
   if (content !== lastLog) {
     lastLog = content;
@@ -2359,6 +2510,8 @@ $('log').addEventListener('scroll', () => {
 
 // Автообновление лога и статуса: раз в 3с, только на видимой вкладке.
 setInterval(() => { if (!authChanged && !document.hidden) { loadLog(); pollStatus(); } }, 3000);
+// Высота offline-баннера зависит от переноса текста — пересчитываем при ресайзе.
+addEventListener('resize', () => { if (offline) syncBannerHeight(); });
 document.addEventListener('visibilitychange', () => {
   if (authChanged) return; // пароль уже сменён — старыми кредами не поллим
   if (!document.hidden) { loadLog(); pollStatus(); loadSpark(); }
@@ -2410,6 +2563,7 @@ const ACTIONS = {
   logSrc: (arg) => setLogSrc(arg),
   logDownload: () => downloadLog(),
   logCopy: () => copyLog(),
+  retry: () => retryAll(),
 };
 
 document.addEventListener('click', (e) => {
