@@ -359,7 +359,7 @@
         class="close" id="btnCloseEditor" data-action="closeEditor" hidden
         aria-label="Закрыть редактор" title="Закрыть (Esc)"><svg class="ic" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8"/></svg></button></h2>
     <form id="editor" style="display:none">
-      <label for="f_name">Имя пресета (a-z 0-9 _ - .)</label>
+      <label for="f_name">Имя пресета (латиница, цифры, _ - .; до 64 символов)</label>
       <input id="f_name" pattern="[a-zA-Z0-9_\-.]{1,64}" autocomplete="off" spellcheck="false">
 
       <label for="f_listen">Listen — один или несколько адресов</label>
@@ -583,10 +583,50 @@ async function jput(url, body) {
 }
 async function jdel(url) { const r = await fetch(url, {method:'DELETE', headers:CSRF}); return handle(r); }
 
+// Сервер отдаёт технические английские abort(description). Наружу — понятная
+// причина; незнакомое оставляем как есть, кроме общих подсказок по 401/403/429.
+const ERROR_RU = {
+  'cannot delete active preset': 'Активный пресет нельзя удалить — сначала переключитесь на другой.',
+  'invalid name': 'Недопустимое имя пресета: латиница, цифры, _ - . (до 64 символов).',
+  'name in body must match URL': 'Имя в форме не совпадает с именем пресета.',
+  'too many concurrent checks, try later': 'Слишком много одновременных проверок. Подождите минуту.',
+  'too many failed auth attempts, try later': 'Слишком много неудачных попыток входа. Подождите минуту.',
+  'panel is exposed without a password — set one (install.sh --with-auth) first':
+    'Панель открыта в сеть без пароля. Сначала задайте пароль (install.sh --with-auth).',
+  'host not allowed (see NAIVEPANEL_HOSTS)': 'Адрес панели не разрешён. Проверьте NAIVEPANEL_HOSTS.',
+};
+
+function ruError(msg, status) {
+  if (msg && ERROR_RU[msg]) return ERROR_RU[msg];
+  if (typeof msg === 'string' && /^preset .+ not found$/.test(msg))
+    return 'Пресет не найден — обновите список.';
+  if (status === 401) return 'Неверный пароль. Войдите заново.';
+  if (status === 403) return 'Доступ запрещён.';
+  if (status === 429) return 'Слишком много запросов. Попробуйте позже.';
+  return msg || ('HTTP ' + status);
+}
+
+// fetch() бросает «Failed to fetch»/«Load failed» без HTTP-статуса — это
+// сетевой обрыв, а не текст сервера.
+function humanError(err) {
+  // Нормализуем только сетевой фрагмент: префикс действия («Не удалось
+  // отправить команду: …») сохраняется и остаётся понятным пользователю.
+  const NET_ERROR_RE = /(Failed to fetch|NetworkError(?: when attempting to fetch resource\.?)?|Load failed|Network request failed)/i;
+  const msg = String((err && err.message) || err || '').trim();
+  if (!NET_ERROR_RE.test(msg)) return msg;
+  const cleaned = msg.replace(NET_ERROR_RE, 'нет связи с панелью');
+  return /^нет связи с панелью$/i.test(cleaned) ? 'Нет связи с панелью' : cleaned;
+}
+
 async function handle(r) {
   const txt = await r.text();
   let data; try { data = JSON.parse(txt); } catch { data = {raw:txt}; }
-  if (!r.ok) throw new Error(data.error || data.description || data.message || (data.raw || ('HTTP '+r.status)));
+  if (!r.ok) {
+    const raw = data.error || data.description || data.message || data.raw || ('HTTP ' + r.status);
+    const err = new Error(ruError(raw, r.status));
+    err.httpStatus = r.status;
+    throw err;
+  }
   return data;
 }
 
@@ -607,6 +647,7 @@ const IC = {
 // Сообщение видно toast'ом (клик — закрыть), а #msg — visually-hidden
 // aria-live для скринридера. Ошибки держим дольше: их успевают прочитать.
 function flash(msg, ok, ms) {
+  msg = humanError(msg);
   $('msg').textContent = msg;
   if (!msg) return;
   const box = $('toasts');

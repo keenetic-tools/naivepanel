@@ -5640,3 +5640,48 @@ def test_untar_xz_pipeline_failure_raises(app, monkeypatch, tmp_path):
     monkeypatch.setattr(app.upd.subprocess, "run", run2)
     with pytest.raises(RuntimeError, match="xz -dc"):
         app.upd._untar_xz(tmp_path / "a.tar.xz", tmp_path)
+
+
+# --- UI P0 (2026-11-15): строки профилей, действия, первый запуск, offline ----
+
+def _ui_html() -> str:
+    return (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+
+
+def _ui_fn(html: str, name: str) -> str:
+    m = re.search(rf"(?:async )?function {re.escape(name)}\(.*?\n\}}", html, re.S)
+    assert m, f"{name}() не найден в index.html"
+    return m.group(0)
+
+
+def test_p0_api_errors_are_localized(app):
+    html = _ui_html()
+    assert "function ruError(" in html
+    for phrase in ("cannot delete active preset",
+                   "invalid name",
+                   "too many concurrent checks, try later"):
+        assert phrase in html, phrase
+    # Русские тексты — не только ключи карты: проверяем, что локализация
+    # действительно есть в шаблоне, а не отключена мутантом.
+    assert "Активный пресет нельзя удалить" in html
+    assert "Недопустимое имя пресета: латиница" in html
+    assert "Пресет не найден" in html
+    assert "Слишком много запросов. Попробуйте позже." in html
+    assert "Нет связи с панелью" in html
+
+    ru = _ui_fn(html, "ruError")
+    for marker in ("status === 401", "status === 403", "status === 429",
+                   "not found"):
+        assert marker in ru
+    human = _ui_fn(html, "humanError")
+    for browser_msg in ("Failed to fetch", "NetworkError",
+                        "Load failed", "Network request failed"):
+        assert browser_msg in human
+    assert "нет связи с панелью" in human
+
+    handle = _ui_fn(html, "handle")
+    assert "ruError(" in handle
+    assert "err.httpStatus = r.status" in handle
+    flash = _ui_fn(html, "flash")
+    assert "humanError(" in flash
+    assert flash.index("humanError(") < flash.index("textContent")
