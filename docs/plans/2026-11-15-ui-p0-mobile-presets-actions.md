@@ -1892,4 +1892,3 @@ git commit -m "docs: describe mobile rows, safe actions and offline state"
    По умолчанию — нет (предупреждение + disabled pristine).
 3. Глобальный переименование «пресет → профиль» — отдельный copy/i18n-проход;
    в этом плане везде остаётся «пресет», новые тексты не смешивают термины.
-
