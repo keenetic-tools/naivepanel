@@ -235,6 +235,16 @@
   .pmenu { display:flex; flex-direction:column; gap:8px; margin-top:14px; }
   .pmenu button { width:100%; text-align:left; }
   .dlg-actions { display:flex; gap:8px; justify-content:flex-end; margin-top:16px; }
+  .order-list { list-style:none; margin:12px 0 0; padding:0; display:flex;
+                flex-direction:column; gap:6px; max-height:320px; overflow:auto; }
+  .order-item { display:grid; grid-template-columns:20px minmax(0,1fr) 44px 44px;
+                align-items:center; gap:6px; padding:4px 0;
+                border-bottom:1px solid var(--border); }
+  .order-item .onum { color:var(--mut); font-size:12px; text-align:right; }
+  .order-item .oname { min-width:0; overflow:hidden; text-overflow:ellipsis;
+                       white-space:nowrap; }
+  .order-list .empty { list-style:none; text-align:center; color:var(--mut);
+                       font-size:12px; padding:12px; }
   /* Строка версии в диалоге отката */
   .rbrow { display:flex; align-items:center; gap:8px; padding:5px 6px;
            border-radius:8px; cursor:pointer; }
@@ -352,11 +362,9 @@
     <h2 class="sect">Фейловер <span id="foCount" class="hint"></span></h2>
     <div id="foInfo" style="font-size:12px;color:var(--mut);margin-top:8px">фейловер: …</div>
     <div class="actions" style="margin-top:8px">
-      <!-- Временно скрыта: строки больше не рисуют стрелки, порядок
-           переедет в диалог (Task 3); неработающий режим не показываем -->
-      <button class="ghost" data-action="foOrder" id="btnFoOrder" hidden
-              aria-pressed="false"
-              title="Показать цепочку в порядке приоритета и включить ↑↓">Порядок</button>
+      <button class="ghost" data-action="foOrder" id="btnFoOrder"
+              aria-haspopup="dialog"
+              title="Изменить порядок пресетов в цепочке">Порядок</button>
       <button class="ghost" data-action="foAll" id="btnFoAll"
               title="Добавить все пресеты в цепочку (не больше 8)">Все в цепочку</button>
     </div>
@@ -513,6 +521,14 @@
   <div class="pmenu" id="pmActions"></div>
   <form method="dialog" class="dlg-actions">
     <button class="ghost" value="close">Отмена</button>
+  </form>
+</dialog>
+<dialog id="foOrderDlg" aria-labelledby="foOrderTitle">
+  <p id="foOrderTitle" class="dlgtitle">Порядок цепочки</p>
+  <p class="dlgsub">При сбое панель переключается на следующий пресет сверху вниз.</p>
+  <ol id="foOrderList" class="order-list"></ol>
+  <form method="dialog" class="dlg-actions">
+    <button class="ghost" value="close">Готово</button>
   </form>
 </dialog>
 <dialog id="notesDlg" aria-labelledby="notesTitle">
@@ -982,10 +998,10 @@ function restoreFocus(f) {
   if (!el) return;
   // id-captured кнопка могла сама выключиться после PUT (например «Вся
   // цепочка» при заполнении): без этого фокус падал бы на <body>. Уводим
-  // на «Порядок», он доступен при непустой цепочке или включённом режиме.
+  // на «Порядок», он доступен при непустой цепочке.
   if (el.disabled && f.id) {
     const order = document.getElementById('btnFoOrder');
-    if (order && !order.disabled) el = order;
+    if (order && !order.disabled && !order.hidden) el = order;
   }
   // на краях цепочки стрелка disabled — фокус уводим на соседнюю стрелку,
   // иначе на кнопку цепочки: иначе после PUT фокус падал бы на <body>
@@ -993,7 +1009,7 @@ function restoreFocus(f) {
     const other = byAction(f.action === 'foUp' ? 'foDown' : 'foUp');
     el = (other && !other.disabled) ? other : (byAction('foToggle') || el);
   }
-  if (!el.disabled) el.focus();
+  if (el && !el.disabled && !el.hidden) el.focus();
 }
 
 function renderPresets(presets) {
@@ -1267,16 +1283,14 @@ function fmtSpan(s) {
   return m ? m+'м' : '<1м';
 }
 
-// Фейловер: цепочка «основной → запасные» правится прямо из строк пресетов
-// (кнопка цепочки), порядок — режимом «Порядок» (стрелки). Каждое
-// изменение сразу уходит PUT
+// Фейловер: цепочка «основной → запасные» — состав из меню «⋯» строки
+// пресета, порядок — диалогом «Порядок». Каждое изменение сразу уходит PUT
 // /api/failover: без черновиков и кнопки «Сохранить». Монитор панели делает
 // E2E-проверку активного пресета и после порога неудач подряд переключает
 // на следующий; назад, на основной — только вручную или авто-возвратом.
 let foChainArr = [];       // эффективная цепочка с сервера
 let foEnabled = false;     // фейловер включён
 let foAutoReturn = false;  // авто-возврат
-let foOrderMode = false;   // режим отображения «Порядок» (не сохраняется)
 let foBusy = false;        // идёт PUT — контролы заблокированы
 let foLast = null;         // последний ответ /api/failover (для перерисовки)
 let activeName = null;     // активный пресет (из /api/status)
@@ -1342,9 +1356,7 @@ function renderFailover(d) {
   $('foAuto').disabled = !d.enabled || !chain.length || foBusy;
   if (!foBusy) $('foAuto').checked = !!d.auto_return;
   const order = $('btnFoOrder');
-  order.textContent = foOrderMode ? 'Готово' : 'Порядок';
-  order.setAttribute('aria-pressed', foOrderMode ? 'true' : 'false');
-  order.disabled = foBusy || (!chain.length && !foOrderMode);
+  order.disabled = foBusy || !chain.length;
   $('btnFoAll').disabled = foBusy
     || chain.length >= FO_CHAIN_MAX
     || !lastPresets.some(p => !chain.includes(p.name));
@@ -1367,6 +1379,7 @@ async function foSaveState(enabled, chain, auto) {
     foBusy = false;
     renderFailover(foLast);
     renderPresets(lastPresets);
+    if ($('foOrderDlg').open) renderFoOrder();
     restoreFocus(focus);
   }
 }
@@ -1411,10 +1424,28 @@ async function foAll() {
   await foSaveState(foEnabled, chain, foEnabled ? foAutoReturn : false);
 }
 
-function foToggleOrder() {
-  foOrderMode = !foOrderMode;
-  renderFailover(foLast);
-  renderPresets(lastPresets);
+function renderFoOrder() {
+  const list = $('foOrderList');
+  if (!foChainArr.length) {
+    list.innerHTML = '<li class="empty">Цепочка пуста</li>';
+    return;
+  }
+  list.innerHTML = foChainArr.map((name, i) => '<li class="order-item">'
+    + '<span class="onum">' + (i + 1) + '</span>'
+    + '<span class="oname" title="' + escapeHtml(name) + '">' + escapeHtml(name) + '</span>'
+    + '<button type="button" class="ghost iconbtn" data-action="foUp" data-arg="' + escapeHtml(name) + '"'
+    + ' aria-label="Выше ' + escapeHtml(name) + '" title="Выше"'
+    + (i === 0 || foBusy ? ' disabled' : '') + '>' + IC.up + '</button>'
+    + '<button type="button" class="ghost iconbtn" data-action="foDown" data-arg="' + escapeHtml(name) + '"'
+    + ' aria-label="Ниже ' + escapeHtml(name) + '" title="Ниже"'
+    + (i === foChainArr.length - 1 || foBusy ? ' disabled' : '') + '>' + IC.down + '</button>'
+    + '</li>').join('');
+}
+
+function openFoOrder() {
+  if (!foChainArr.length) return;
+  renderFoOrder();
+  $('foOrderDlg').showModal();
 }
 
 function foRerender() {
@@ -2100,7 +2131,7 @@ const ACTIONS = {
   quickImport: () => quickImport(),
   copyPac: () => copyPac(),
   import: () => $('importFile').click(),
-  foOrder: () => foToggleOrder(),
+  foOrder: () => openFoOrder(),
   foToggle: (arg) => foToggle(arg),
   foAll: () => foAll(),
   foUp: (arg) => foMove(arg, -1),

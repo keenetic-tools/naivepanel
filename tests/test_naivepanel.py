@@ -3156,6 +3156,9 @@ def test_ui_failover_lives_with_presets(app):
     for marker in ('id="foInfo"', 'id="foEnabled"', 'id="foAuto"',
                    'id="foCount"', 'data-action="foOrder"',
                    'data-action="foAll"', 'data-action="foToggle"',
+                   'data-action="foUp"', 'data-action="foDown"',
+                   "renderFoOrder", 'id="foOrderDlg"',
+                   "Добавить в цепочку",
                    "FO_CHAIN_MAX", "orderedPresets",
                    "captureFocus", "restoreFocus",
                    'id="foEnabled" aria-label="Автофейловер включён" disabled',
@@ -5715,6 +5718,18 @@ def test_p0_preset_menu_has_labelled_actions(app):
         assert label in menu, label
     assert "isActivePreset" in menu
     assert "presetMenuDlg" in menu or "showModal" in menu
+
+
+def test_p0_failover_order_is_a_dialog(app):
+    html = _ui_html()
+    assert 'id="foOrderDlg"' in html
+    assert 'id="foOrderList"' in html
+    assert "foOrderMode" not in html, "режим порядка в строках должен быть удалён"
+    assert "renderFoOrder" in _ui_fn(html, "foSaveState")
+    order = _ui_fn(html, "renderFoOrder")
+    assert "foUp" in order and "foDown" in order
+    assert "order-item" in order
+    assert "foOrder: () => openFoOrder()" in html
 
 
 def test_p0_empty_state_layout(app):
