@@ -795,6 +795,30 @@ def _notify_pending_append(event: str, text: str) -> None:
         log.warning("notify pending append failed: %s", exc)
 
 
+def _notify_pending_drop(*events: str) -> int:
+    """Убрать из отложенных события, которые отменило более новое.
+
+    Сейчас один случай: `failover_exhausted` перед `failover_recovered`.
+    Пока связи не было, «исчерпание» осело в pending; доставить его после
+    «связь восстановлена» — противоречие в чате. Возвращает число убранных.
+    """
+    drop = set(events)
+    items = _notify_pending_all()
+    kept = [i for i in items if i.get("event") not in drop]
+    if len(kept) == len(items):
+        return 0
+    try:
+        tmp = NOTIFY_PENDING.with_suffix(".jsonl.tmp")
+        with tmp.open("w", encoding="utf-8") as fh:
+            fh.write("\n".join(json.dumps(i) for i in kept)
+                     + ("\n" if kept else ""))
+        tmp.replace(NOTIFY_PENDING)
+    except OSError as exc:
+        log.warning("notify pending drop failed: %s", exc)
+        return 0
+    return len(items) - len(kept)
+
+
 def _notify_pending_all(raw: bool = False) -> list[Any]:
     """Отложенные события (старые → новые); битые строки пропускаем."""
     try:
@@ -851,6 +875,10 @@ def _notify_tick(timeout: float = 30.0) -> None:
         event, text = _notify_queue.get(timeout=timeout)
     except queue.Empty:
         return
+    if event == "failover_recovered" and _notify_channel() is not None:
+        # «исчерпание», застрявшее в pending, пока связи не было, устарело:
+        # после «связь восстановлена» оно читалось бы как противоречие.
+        _notify_pending_drop("failover_exhausted")
     if _notify_send(event, text):
         return
     if _notify_channel() is None:
@@ -1152,7 +1180,13 @@ class _Failover:
         self.hot = armed and not result.get("ok")  # неудача → частые проверки
         if result.get("ok"):
             self._fails = 0
+            was_exhausted = self._exhausted_announced
             self._exhausted_announced = False
+            if was_exhausted:
+                # связь вернулась после «цепочка исчерпана»: сообщаем об этом
+                # раньше авто-возврата, иначе его событие съест единственный
+                # шанс рассказать о восстановлении. Возврат — следующим ok-циклом.
+                return {"event": "recovered", "active": active}
             idx = conf["chain"].index(active) if armed else None
             if armed and conf["auto_return"] and idx and idx > 0:
                 return self._try_return(conf, active, idx)
@@ -1260,6 +1294,65 @@ class _Failover:
 _failover = _Failover()
 
 
+def _report_failover_event(ev: dict[str, Any]) -> None:
+    """Событие цикла фейловера → лог панели и уведомление.
+
+    Вынесено из вечного sleep-цикла, чтобы обработку можно было проверить
+    тестом без потоков: побочные эффекты (лог, очередь уведомлений) те же.
+    """
+    if ev["event"] == "switched":
+        rst = ev.get("restart") or {}
+        rc = rst.get("rc") if isinstance(rst, dict) else None
+        if isinstance(rc, int) and rc != 0:
+            log.error(
+                "фейловер: %s не прошёл E2E-проверки — переключение"
+                " на %s, но рестарт НЕ удался: rc=%s %s",
+                ev["from"], ev["to"], rc, rst.get("stderr") or "")
+        else:
+            log.warning(
+                "фейловер: %s не прошёл %d E2E-проверок подряд — "
+                "переключение на %s",
+                ev["from"], cfg.FAILOVER_THRESHOLD, ev["to"])
+        _notify("failover_switch",
+                f"NaivePanel: {ev['from']} не работает — "
+                f"переключение на {ev['to']}")
+    elif ev["event"] == "returned":
+        log.warning(
+            "авто-возврат: %s жив (TCP %d подряд + проба E2E) — "
+            "возврат с %s", ev["to"], cfg.FAILOVER_RETURN_ALIVE, ev["from"])
+        _notify("failover_return",
+                f"NaivePanel: {ev['to']} снова жив — авто-возврат "
+                f"с {ev['from']}")
+    elif ev["event"] == "return_probe_failed":
+        log.warning(
+            "авто-возврат: %s TCP-жив, но проба E2E не прошла (%s) — "
+            "cooldown %dс", ev["candidate"], ev.get("error"),
+            cfg.FAILOVER_RETURN_COOLDOWN)
+        _notify("failover_return_probe_failed",
+                f"NaivePanel: авто-возврат на {ev['candidate']} "
+                f"отложен — проба не прошла")
+    elif ev["event"] == "activate-failed":
+        log.error(
+            "фейловер: активация %s не удалась (валидация)",
+            ev["to"])
+    elif ev["event"] == "exhausted":
+        log.error(
+            "фейловер: цепочка исчерпана — %s не работает и "
+            "запасных больше нет; проверка продолжается, возврат "
+            "на основной — вручную", ev["active"])
+        _notify("failover_exhausted",
+                f"NaivePanel: цепочка исчерпана — {ev['active']} "
+                f"не работает, запасных нет")
+    elif ev["event"] == "recovered":
+        log.warning(
+            "фейловер: связь восстановлена — %s снова проходит "
+            "E2E-проверку", ev["active"])
+        _notify("failover_recovered",
+                f"NaivePanel: связь восстановлена — {ev['active']} "
+                f"снова работает")
+    # failing не логируем: до порога это нормальный шум сети
+
+
 def _failover_loop() -> None:
     # как watchdog: daemon-поток, сбойный тик не убивает цикл. Пустая цепочка
     # — честный idle, поэтому поток стартует всегда: цепочку можно задать из
@@ -1268,50 +1361,7 @@ def _failover_loop() -> None:
         try:
             ev = _failover.cycle()
             if ev is not None:
-                if ev["event"] == "switched":
-                    rst = ev.get("restart") or {}
-                    rc = rst.get("rc") if isinstance(rst, dict) else None
-                    if isinstance(rc, int) and rc != 0:
-                        log.error(
-                            "фейловер: %s не прошёл E2E-проверки — переключение"
-                            " на %s, но рестарт НЕ удался: rc=%s %s",
-                            ev["from"], ev["to"], rc, rst.get("stderr") or "")
-                    else:
-                        log.warning(
-                            "фейловер: %s не прошёл %d E2E-проверок подряд — "
-                            "переключение на %s",
-                            ev["from"], cfg.FAILOVER_THRESHOLD, ev["to"])
-                    _notify("failover_switch",
-                            f"NaivePanel: {ev['from']} не работает — "
-                            f"переключение на {ev['to']}")
-                elif ev["event"] == "returned":
-                    log.warning(
-                        "авто-возврат: %s жив (TCP %d подряд + проба E2E) — "
-                        "возврат с %s", ev["to"], cfg.FAILOVER_RETURN_ALIVE, ev["from"])
-                    _notify("failover_return",
-                            f"NaivePanel: {ev['to']} снова жив — авто-возврат "
-                            f"с {ev['from']}")
-                elif ev["event"] == "return_probe_failed":
-                    log.warning(
-                        "авто-возврат: %s TCP-жив, но проба E2E не прошла (%s) — "
-                        "cooldown %dс", ev["candidate"], ev.get("error"),
-                        cfg.FAILOVER_RETURN_COOLDOWN)
-                    _notify("failover_return_probe_failed",
-                            f"NaivePanel: авто-возврат на {ev['candidate']} "
-                            f"отложен — проба не прошла")
-                elif ev["event"] == "activate-failed":
-                    log.error(
-                        "фейловер: активация %s не удалась (валидация)",
-                        ev["to"])
-                elif ev["event"] == "exhausted":
-                    log.error(
-                        "фейловер: цепочка исчерпана — %s не работает и "
-                        "запасных больше нет; проверка продолжается, возврат "
-                        "на основной — вручную", ev["active"])
-                    _notify("failover_exhausted",
-                            f"NaivePanel: цепочка исчерпана — {ev['active']} "
-                            f"не работает, запасных нет")
-                # failing не логируем: до порога это нормальный шум сети
+                _report_failover_event(ev)
         except Exception:  # один сбойный тик не должен останавливать поток
             log.warning("failover cycle failed", exc_info=True)
         # двухскоростной ритм: сбой → частые проверки до порога/восстановления
@@ -1492,6 +1542,7 @@ __all__ = [
     "_notify_loop",
     "_notify_pending_all",
     "_notify_pending_append",
+    "_notify_pending_drop",
     "_notify_queue",
     "_notify_send",
     "_notify_snapshot",
@@ -1501,6 +1552,7 @@ __all__ = [
     "_proxy_e2e_check",
     "_recv_exact",
     "_recv_until",
+    "_report_failover_event",
     "_socks5_connect_via_proxy",
     "_status",
     "_tail_path",

@@ -3119,9 +3119,10 @@ def test_failover_exhausted_announced_once(client, app, monkeypatch):
     # следующая волна: счётчик копится, но exhausted уже не анонсируется
     assert fo.cycle() == {"event": "failing", "fails": 1}
     assert fo.cycle() is None
-    # восстановление снимает «уже кричали» — следующий провал снова анонсирует
+    # восстановление снимает «уже кричали», даёт событие recovered — и
+    # следующий провал снова анонсирует exhausted
     _fo_e2e(monkeypatch, app, ok=True)
-    fo.cycle()
+    assert fo.cycle() == {"event": "recovered", "active": "home"}
     _fo_e2e(monkeypatch, app, ok=False, error="x")
     fo.cycle()
     assert fo.cycle() == {"event": "exhausted", "active": "home"}
@@ -3812,6 +3813,16 @@ def test_notify_dedupe_and_disabled(app):
     assert app._notify_queue.qsize() == 2
 
 
+def test_notify_failover_recovered(app):
+    # исчерпание цепочки раньше не имело парного «связь восстановлена»
+    _notify_webhook(app)
+    app._notify_last.clear()
+    app._report_failover_event({"event": "recovered", "active": "home"})
+    assert list(app._notify_queue.queue) == [
+        ("failover_recovered",
+         "NaivePanel: связь восстановлена — home снова работает")]
+
+
 def test_notify_send_webhook(app, monkeypatch):
     captured = {}
 
@@ -3986,6 +3997,27 @@ def test_notify_pending_append_flush_and_status(app, monkeypatch):
         app._notify_pending_append("e", f"t{i}")
     assert len(app._notify_pending_all()) == 50
     assert app._notify_pending_all()[-1]["text"] == "t59"
+
+
+def test_notify_recovered_supersedes_pending_exhausted(app, monkeypatch):
+    # «исчерпание», застрявшее в pending за время обрыва, не должно прийти
+    # после «связь восстановлена» — иначе в чате противоречие
+    _notify_webhook(app)
+    app._notify_pending_append("failover_exhausted", "сети нет")
+    app._notify_pending_append("failover_switch", "переключились")
+    sent = []
+
+    def fake_send(event, text):
+        sent.append((event, text))
+        return event == "failover_recovered"   # связь есть только для recovery
+
+    monkeypatch.setattr(app.mon, "_notify_send", fake_send)
+    app._notify_queue.put(("failover_recovered", "связь восстановлена"))
+    app._notify_tick(timeout=0.01)
+    assert sent == [("failover_exhausted", "сети нет"),
+                    ("failover_recovered", "связь восстановлена")]
+    left = app._notify_pending_all()
+    assert [i["event"] for i in left] == ["failover_switch"]
 
 
 # --- Настройка Telegram из панели --------------------------------------------
