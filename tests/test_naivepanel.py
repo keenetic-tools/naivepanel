@@ -5619,6 +5619,29 @@ def test_ui_uptime_stats_row(app):
     assert "'аптайм 24ч/7д'" not in body, "осталась отдельная строка процентов"
 
 
+def test_ui_overview_system_split(app):
+    """«Обзор» — только рантайм прокси; версия панели и watchdog — в «Системе».
+
+    Длинные значения (пресет, аптайм) идут wide-строкой: в полуколонке 288px
+    они обрезались («gw1.aig…», «19ч 28…») — v0.24.2.
+    """
+    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    m = re.search(r"function renderStatus\(st\) \{.*?\n\}", html, re.S)
+    assert m, "renderStatus() не найден"
+    body = m.group(0)
+    # wide-строки задаются явно по множеству ключей, а не «первая строка»
+    assert "wideRow" in body and "'состояние'" in body and "'аптайм'" in body
+    # панель-уровень ушёл из svcinfo в sysinfo
+    assert "['панель'" not in body, "строка «панель» должна жить в #sysinfo"
+    assert "sysRows" in body and "$('sysinfo')" in body, "нет рендера #sysinfo"
+    assert "['версия'" in body and "['watchdog'" in body
+    # #sysinfo — внутри карточки «Система», в секции «Панель»
+    sys_card = html.split('id="sec-system"', 1)[1]
+    assert 'id="sysinfo"' in sys_card, "#sysinfo не в карточке «Система»"
+    assert 'id="sysinfo"' in sys_card.split('id="updInfo"', 1)[0], \
+        "#sysinfo должен стоять до строки обновлений секции «Панель»"
+
+
 # --- busybox-тар без -J (фид 1.38): распаковка naive-тарболла -------------------
 
 class _ProcResult:

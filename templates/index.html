@@ -120,8 +120,10 @@
   .svcinfo { display:grid; grid-template-columns:1fr 1fr; gap:2px 14px; margin-bottom:14px; font-size:13px; }
   .svcinfo .kv { display:flex; justify-content:space-between; gap:10px; min-width:0;
                  padding:2px 6px; margin:0 -6px; border-radius:6px; }
-  /* «состояние» (точка + слово) не влезает в полуколонку без обрезки */
+  /* длинные значения (имя пресета, аптайм с доступностью) — во всю ширину;
+     значение переносится, а не обрезается многоточием */
   .svcinfo .kv.wide { grid-column:1 / -1; }
+  .svcinfo .kv.wide b { white-space:normal; text-align:right; }
   .spark { display:flex; flex-direction:column; gap:3px; margin-bottom:14px; }
   .spark svg { display:block; width:100%; height:16px; border-radius:3px; overflow:hidden; }
   .spark .cap { font-size:11px; color:var(--mut); white-space:nowrap;
@@ -524,6 +526,7 @@
       <button data-action="naiveUpdate" id="btnNvUpd" hidden>Обновить</button>
     </div>
     <h2 class="sect">Панель</h2>
+    <div class="svcinfo" id="sysinfo" style="margin-bottom:4px"></div>
     <div class="actions" style="margin-top:10px">
       <button class="ghost wide" data-action="panelRestart" title="Перезапуск веб-панели (после обновления файлов)">Перезапуск</button>
     </div>
@@ -921,6 +924,7 @@ let offline = false;
 let retrying = false;
 let lastStatusHtml = '';
 let lastSvcHtml = '';
+let lastSysHtml = '';
 let svcKey = '';
 let svcBusy = false; // идёт POST /api/service — не перерисовывать кнопки включёнными
 let e2eBusy = false; // идёт POST /api/e2e
@@ -1107,25 +1111,39 @@ function renderStatus(st) {
   const upStreak = st.active ? fmtUptime(st.uptime) : '—';
   const upVal = '<span title="'+upTip+'">'+upStreak
     + (us == null ? '' : ' · '+fmtUpPct(us.day)+' / '+fmtUpPct(us.week))+'</span>';
+  // «Обзор» — только рантайм прокси; панель-уровень (версия, watchdog)
+  // живёт в карточке «Система»
   const rows = [
     ['состояние', st.active ? '<span class="on">'+dotOn+' работает</span>' : '<span class="off">'+dotOff+' остановлен</span>'],
     ['пресет', st.current ? escapeHtml(st.current) : '—'],
     ['аптайм', upVal],
     ['pid', st.active && st.pid != null ? String(st.pid) : '—'],
     ['соединений', conn ? '<span title="'+connTip+'">'+conn.established+'</span>' : '—'],
-    ['watchdog', st.watchdog
-      ? (st.watchdog.tripped ? 'выкл (флаппинг)'
-         : st.watchdog.enabled ? 'вкл' + (st.watchdog.restarts ? ' · ↻'+st.watchdog.restarts : '')
-         : 'выкл')
-      : '—'],
-    ['панель', 'v'+escapeHtml(st.version || '?')],
   ];
-  const svcHtml = rows.map(([k, v], i) =>
-    '<div class="kv'+(i === 0 ? ' wide' : '')+'"><span>'+k+'</span><b>'+v+'</b></div>').join('');
+  // длинные значения — во всю ширину колонки, коротышы (pid, соединений) — пара
+  const wideRow = new Set(['состояние', 'пресет', 'аптайм']);
+  const svcHtml = rows.map(([k, v]) =>
+    '<div class="kv'+(wideRow.has(k) ? ' wide' : '')+'"><span>'+k+'</span><b>'+v+'</b></div>').join('');
   if (svcHtml !== lastSvcHtml) {
     $('svcinfo').innerHTML = svcHtml;
     $('svcinfo').title = 'обновлено ' + new Date().toLocaleTimeString();
     lastSvcHtml = svcHtml;
+  }
+  const wdTip = 'панель сама поднимает прокси при падении; ↻N — рестартов с запуска панели';
+  const wdVal = st.watchdog
+    ? (st.watchdog.tripped ? 'выкл (флаппинг)'
+       : st.watchdog.enabled ? 'вкл' + (st.watchdog.restarts ? ' · ↻'+st.watchdog.restarts : '')
+       : 'выкл')
+    : '—';
+  const sysRows = [
+    ['версия', 'v'+escapeHtml(st.version || '?')],
+    ['watchdog', '<span title="'+wdTip+'">'+wdVal+'</span>'],
+  ];
+  const sysHtml = sysRows.map(([k, v]) =>
+    '<div class="kv"><span>'+k+'</span><b>'+v+'</b></div>').join('');
+  if (sysHtml !== lastSysHtml) {
+    $('sysinfo').innerHTML = sysHtml;
+    lastSysHtml = sysHtml;
   }
   renderEditorChrome();
 }
