@@ -5642,6 +5642,23 @@ def test_ui_overview_system_split(app):
         "#sysinfo должен стоять до строки обновлений секции «Панель»"
 
 
+def test_ui_overview_button_grid(app):
+    """Сервисные кнопки «Обзора» — ровной сеткой, не рваным flex-wrap (v0.24.3).
+
+    Пара Стоп/Рестарт делит строку поровну; Запуск и утилиты (Проверить
+    прокси, Скопировать PAC) — во всю ширину карточки.
+    """
+    html = _ui_html()
+    assert 'class="svcbtns"' in html, "кнопки Обзора не переведены на сетку .svcbtns"
+    grid = html.split('class="svcbtns"', 1)[1].split("</div>", 1)[0]
+    for bid in ("btnStart", "btnStop", "btnRestart", "btnE2e", "btnPac"):
+        assert f'id="{bid}"' in grid, f"{bid} не в .svcbtns"
+    # spanning-правило обязано накрывать Запуск и обе утилиты
+    css = html.split("</style>", 1)[0]
+    assert ".svcbtns > #btnStart, .svcbtns > #btnE2e, .svcbtns > #btnPac" in css, \
+        "нет spanning-правила для Запуск/Проверить/PAC"
+
+
 # --- busybox-тар без -J (фид 1.38): распаковка naive-тарболла -------------------
 
 class _ProcResult:

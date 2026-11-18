@@ -215,6 +215,12 @@
   .apply-hint { margin-top:12px; color:var(--warn); font-size:12px; }
   .row #btnDelete { margin-left:auto; }
   .actions { display:flex; gap:8px; flex-wrap:wrap; margin-top:14px; }
+  /* Сервисные кнопки «Обзора» — ровная сетка вместо рваного flex-wrap:
+     пара Стоп/Рестарт делит строку поровну, Запуск и утилиты — во всю
+     ширину карточки. Запуск при остановленном сервисе — единственная
+     кнопка строки (hidden-кнопки grid не занимает) */
+  .svcbtns { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:14px; }
+  .svcbtns > #btnStart, .svcbtns > #btnE2e, .svcbtns > #btnPac { grid-column:1 / -1; }
   pre.log { background:var(--log-bg); color:var(--log-fg); padding:var(--sp-3); border:1px solid var(--border);
             border-radius:var(--r-m); box-shadow:inset 0 1px 4px rgba(0,0,0,.12);
             max-height:260px; overflow:auto; font:12px/1.55 ui-monospace,Menlo,monospace;
@@ -373,7 +379,7 @@
     <h2>Обзор</h2>
     <div class="svcinfo" id="svcinfo"></div>
     <div id="e2eSpark" class="spark" hidden></div>
-    <div class="actions">
+    <div class="svcbtns">
       <button data-action="svc" data-arg="start" id="btnStart" disabled>Запуск</button>
       <button class="ghost" data-action="svc" data-arg="stop" id="btnStop" disabled>Стоп</button>
       <button class="ghost" data-action="svc" data-arg="restart" id="btnRestart" disabled>Рестарт</button>
