@@ -266,6 +266,28 @@ def test_wrong_password_is_rejected(client, env):
     assert r.status_code == 401
 
 
+def test_nothing_but_auth_notice_without_password(client, env):
+    # «что доступно без пароля»: разметка панели не отдаётся вовсе —
+    # только текст 401; API отвечает 401-JSON (v0.25.0, вопрос с роутера)
+    (env / "admin.pass").write_text("admin:$2b$12$shortbrokenhash\n")
+    r = client.get("/")
+    assert r.status_code == 401
+    assert b"svcinfo" not in r.data
+    assert "Обзор".encode() not in r.data
+    r = client.get("/api/status")
+    # _require_auth отвечает напрямую текстом, минуя JSON-errorhandler
+    assert r.status_code == 401
+    assert b"auth required" in r.data
+
+
+def test_logout_is_pure_client_side_no_public_endpoint(client, env):
+    # «Выход» (v0.25.0) — навигация на logout@host: /api/logout-эндпоинта
+    # нет, публичных путей кроме /proxy.pac не появилось
+    (env / "admin.pass").write_text("admin:$2b$12$shortbrokenhash\n")
+    r = client.post("/api/logout", headers=CSRF)
+    assert r.status_code == 401  # auth-гейт до 404: мутация не публична
+
+
 def test_auth_throttles_after_repeated_failures(client, env, app):
     bcrypt = pytest.importorskip("bcrypt")
     h = bcrypt.hashpw(b"s3cret", bcrypt.gensalt()).decode()
@@ -5657,6 +5679,26 @@ def test_ui_overview_button_grid(app):
     css = html.split("</style>", 1)[0]
     assert ".svcbtns > #btnStart, .svcbtns > #btnE2e, .svcbtns > #btnPac" in css, \
         "нет spanning-правила для Запуск/Проверить/PAC"
+
+
+def test_ui_logout_button(app):
+    """«Выход» в шапке (v0.25.0): виден только при включённом auth; клик —
+    навигация на logout@host, которая затирает кэш Basic-кредов браузера
+    (fetch с фейковым Authorization кэш в актуальном Chromium не меняет)."""
+    html = _ui_html()
+    hdr = html.split("</header>", 1)[0]
+    assert 'id="btnLogout"' in hdr and 'data-action="logout"' in hdr, \
+        "нет кнопки «Выход» в шапке"
+    # кнопка живёт только в шапке; вне её — лишь $()-обращение в renderStatus
+    assert 'id="btnLogout"' not in html.split("</header>", 1)[1]
+    assert "$('btnLogout').hidden = !st.auth.enabled" in html, \
+        "кнопка не привязана к st.auth.enabled"
+    fn = _ui_fn(html, "doLogout")
+    assert "askConfirm" in fn
+    assert "location.protocol + '//logout@' + location.host" in fn, \
+        "выход не затирает кэш браузера навигацией с фейковой парой"
+    # серверной части у выхода нет: /api/logout в шаблоне не упоминается
+    assert "/api/logout" not in html
 
 
 # --- busybox-тар без -J (фид 1.38): распаковка naive-тарболла -------------------

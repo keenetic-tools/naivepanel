@@ -366,6 +366,8 @@
 <header>
   <h1><span class="logo" aria-hidden="true">N</span>NaivePanel</h1>
   <button class="ghost iconbtn" id="themeToggle" data-action="theme" title="Переключить тему (светлая/тёмная)"><svg class="ic" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="8" cy="8" r="3"/><path d="M8 1.2v1.6M8 13.2v1.6M1.2 8h1.6M13.2 8h1.6M3.2 3.2l1.1 1.1M11.7 11.7l1.1 1.1M12.8 3.2l-1.1 1.1M4.3 11.7l-1.1 1.1"/></svg></button>
+  <button class="ghost iconbtn" id="btnLogout" data-action="logout" hidden
+          title="Выйти — браузер забудет пароль и попросит его заново" aria-label="Выйти"><svg class="ic" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 2.5H4A1.5 1.5 0 0 0 2.5 4v8A1.5 1.5 0 0 0 4 13.5h2"/><path d="M9.5 5l3 3-3 3"/><path d="M5 8h7.5"/></svg></button>
   <span id="status" aria-live="polite">…</span>
 </header>
 <nav id="secNav" aria-label="Разделы панели">
@@ -845,6 +847,20 @@ function askConfirm(message, opts = {}) {
   });
 }
 
+async function doLogout() {
+  const ok = await askConfirm(
+    'Выйти из панели?\nБраузер забудет пароль и попросит его при следующем входе.',
+    {ok: 'Выйти'});
+  if (!ok) return;
+  // Basic-креды кэширует сам браузер и шлёт их молча с каждым запросом —
+  // «отмена» нативного промпта их не снимает. Единственный рабочий выход:
+  // навигация с заведомо неверной парой в URL (logout@) — браузер затирает
+  // кэш кредов, сервер отвечает 401 и появляется нативный промпт.
+  // (fetch с фейковым Authorization кэш в актуальном Chromium НЕ меняет —
+  // проверено живым прогоном; навигация меняет.)
+  location.href = location.protocol + '//logout@' + location.host + '/';
+}
+
 function openPassword() {
   $('pwForm').reset();
   $('pwMsg').textContent = '';
@@ -1091,7 +1107,11 @@ function renderStatus(st) {
        : 'выкл')
       + (st.notify.pending ? ' · отложено: '+st.notify.pending : '');
   }
-  if (st.auth) $('btnPwChange').hidden = !st.auth.enabled;
+  if (st.auth) {
+    $('btnPwChange').hidden = !st.auth.enabled;
+    // «Выйти» осмысленен только при включённом auth
+    $('btnLogout').hidden = !st.auth.enabled;
+  }
   const dotOn = '<span class="dot on" aria-hidden="true"></span>', dotOff = '<span class="dot off" aria-hidden="true"></span>';
   // Шапка без версии и без «пресет:» — на телефоне она уходила в ellipsis.
   // innerHTML трогаем только при изменении: 3-секундный поллинг с одинаковой
@@ -2634,6 +2654,7 @@ const ACTIONS = {
   rbClose: () => $('rbDlg').close(),
   pwOpen: () => openPassword(),
   pwClose: () => $('pwDlg').close(),
+  logout: () => doLogout(),
   tgTest: () => testTelegram(),
   tgOff: () => offTelegram(),
   select: (arg) => selectPreset(arg),
