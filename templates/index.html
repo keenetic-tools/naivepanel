@@ -219,11 +219,13 @@
      рваного flex-wrap. Диалоги и строки «поле + кнопка» — не сетка. */
   .actions { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:14px; }
   .actions > :last-child:nth-child(odd) { grid-column:1 / -1; }
-  /* Поток обновлений (бинарник и панель): «Проверить обновления» и «Обновить»
-     — во всю ширину, как «Перезапуск»; видимое обновление выстраивает шаги
-     вертикально (проверить → обновить → что нового) */
-  .actions > #btnNvCheck, .actions > #btnNvUpd,
-  .actions > #btnUpdCheck, .actions > #btnUpdApply { grid-column:1 / -1; }
+  /* Поток обновлений — одна морфящая кнопка: без обновления «Проверить
+     обновления» — единственная видимая, во всю ширину («solo»); когда
+     обновление есть, она становится акцентной «Обновить до vX.Y.Z» и у
+     панели делит строку с «Что нового». Класс ставит JS: у панели
+     «Что нового» — скрытый sibling, nth-child его считает, odd-tail
+     правило resting-состояние не накроет */
+  .actions > .solo { grid-column:1 / -1; }
   /* Сервисные кнопки «Обзора» — ровная сетка вместо рваного flex-wrap:
      пара Стоп/Рестарт делит строку поровну, Запуск и утилиты — во всю
      ширину карточки. Проверить прокси — последняя строка, сразу над
@@ -543,7 +545,6 @@
     <div class="actions" style="margin-top:8px">
       <button class="ghost" data-action="naiveCheck" id="btnNvCheck"
               title="Сверить версию бинарника с последним релизом klzgrad/naiveproxy">Проверить обновления</button>
-      <button data-action="naiveUpdate" id="btnNvUpd" hidden>Обновить</button>
     </div>
     <h2 class="sect">Панель</h2>
     <div class="svcinfo" id="sysinfo" style="margin-bottom:4px"></div>
@@ -553,7 +554,6 @@
     <div id="updInfo" style="font-size:12px;color:var(--mut);margin-top:12px">обновления: проверка…</div>
     <div class="actions" style="margin-top:8px">
       <button class="ghost" data-action="updateCheck" id="btnUpdCheck" title="Сверить версию панели с последним релизом GitHub">Проверить обновления</button>
-      <button data-action="updateApply" id="btnUpdApply" hidden>Обновить</button>
       <button class="ghost" data-action="updateNotes" id="btnUpdNotes" hidden title="Описание грядущего релиза">Что нового</button>
     </div>
     <div id="rbInfo" style="font-size:12px;color:var(--mut);margin-top:12px">откат: …</div>
@@ -2081,8 +2081,12 @@ async function checkUpdate(manual) {
 }
 
 function renderUpdate(err) {
-  const info = $('updInfo'), apply = $('btnUpdApply'), notes = $('btnUpdNotes');
-  apply.hidden = notes.hidden = true;
+  const info = $('updInfo'), btn = $('btnUpdCheck'), notes = $('btnUpdNotes');
+  notes.hidden = true;
+  btn.classList.add('solo');
+  btn.classList.add('ghost');
+  btn.textContent = 'Проверить обновления';
+  btn.title = 'Сверить версию панели с последним релизом GitHub';
   if (!upd) {
     info.textContent = 'обновления: не проверены' + (err ? ' — '+err : '');
     return;
@@ -2094,8 +2098,11 @@ function renderUpdate(err) {
   if (upd.available) {
     info.innerHTML = 'доступна <b style="color:var(--acc)">v'+escapeHtml(upd.latest)+'</b>'
       + ' · установлена v'+escapeHtml(upd.current);
-    apply.hidden = notes.hidden = false;
-    apply.textContent = 'Обновить до v'+upd.latest;
+    notes.hidden = false;
+    btn.classList.remove('solo');
+    btn.classList.remove('ghost');
+    btn.textContent = 'Обновить до v'+upd.latest;
+    btn.title = 'Обновить панель — веб-панель перезапустится на несколько секунд, прокси не прервётся';
   } else {
     info.textContent = 'обновления: установлена последняя версия (v'+upd.current+')';
   }
@@ -2188,8 +2195,11 @@ async function checkNaive(manual) {
 }
 
 function renderNaive(err) {
-  const info = $('nvInfo'), btn = $('btnNvUpd');
-  btn.hidden = true;
+  const info = $('nvInfo'), btn = $('btnNvCheck');
+  btn.classList.add('solo');
+  btn.classList.add('ghost');
+  btn.textContent = 'Проверить обновления';
+  btn.title = 'Сверить версию бинарника с последним релизом klzgrad/naiveproxy';
   if (!nv) {
     info.textContent = 'бинарник: не проверен' + (err ? ' — ' + err : '');
     return;
@@ -2203,15 +2213,17 @@ function renderNaive(err) {
   if (!cur) { // бинарника нет — та же кнопка его устанавливает
     info.innerHTML = 'не установлен · доступен <b style="color:var(--acc)">'
       + escapeHtml(nv.latest || '?') + '</b>' + tgt;
-    btn.hidden = false;
+    btn.classList.remove('ghost');
     btn.textContent = 'Установить';
+    btn.title = 'Скачать и установить бинарник naive — прокси, если запущен, будет перезапущен';
     return;
   }
   if (nv.available) {
     info.innerHTML = escapeHtml(cur) + ' → доступен <b style="color:var(--acc)">'
       + escapeHtml(nv.latest) + '</b>' + tgt;
-    btn.hidden = false;
+    btn.classList.remove('ghost');
     btn.textContent = 'Обновить';
+    btn.title = 'Обновить бинарник naive — прокси перезапустится, соединения оборвутся на секунду';
   } else {
     info.textContent = 'бинарник: ' + cur + ' — актуален' + tgt;
   }
@@ -2225,7 +2237,7 @@ async function updateNaive() {
     : 'Обновить бинарник naive до ' + nv.latest + '?\nПрокси перезапустится — соединения оборвутся на секунду.',
     {ok: missing ? 'Установить' : 'Обновить'});
   if (!ok) return;
-  const btn = $('btnNvUpd');
+  const btn = $('btnNvCheck');
   btn.disabled = true;
   let d;
   try { d = await jpost('/api/naive/update', null); }
@@ -2653,11 +2665,11 @@ const ACTIONS = {
   foUp: (arg) => foMove(arg, -1),
   foDown: (arg) => foMove(arg, 1),
   panelRestart: () => panelRestart(),
-  updateCheck: () => checkUpdate(true),
-  updateApply: () => applyUpdate(),
+  // одна кнопка на поток: есть обновление → применить, нет → перепроверить
+  updateCheck: () => (upd && upd.available) ? applyUpdate() : checkUpdate(true),
   updateNotes: () => showNotes(),
-  naiveCheck: () => checkNaive(true),
-  naiveUpdate: () => updateNaive(),
+  naiveCheck: () => (nv && nv.latest && (nv.available || !(nv.tag || nv.version)))
+    ? updateNaive() : checkNaive(true),
   rollbackOpen: () => openRollback(),
   rbBin: () => rollbackBinary(),
   rbDo: () => rollbackPanel(),

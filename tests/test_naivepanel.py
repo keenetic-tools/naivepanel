@@ -2086,8 +2086,8 @@ def test_update_log_tails_and_is_no_store(client, app, env):
 
 def test_ui_has_update_controls(app):
     html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
-    for marker in ('data-action="updateCheck"', 'data-action="updateApply"',
-                   'data-action="updateNotes"', 'id="updDlg"', 'id="notesDlg"',
+    for marker in ('data-action="updateCheck"', 'data-action="updateNotes"',
+                   'id="updDlg"', 'id="notesDlg"',
                    '/api/update/check', '/api/update/apply', '/api/update/log'):
         assert marker in html, marker
 
@@ -2592,8 +2592,8 @@ def test_install_sh_writes_naive_markers(app):
 
 def test_ui_has_naive_binary_controls(app):
     html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
-    for marker in ('data-action="naiveCheck"', 'data-action="naiveUpdate"',
-                   'id="nvInfo"', 'id="btnNvUpd"', 'id="btnNvCheck"',
+    for marker in ('data-action="naiveCheck"',
+                   'id="nvInfo"', 'id="btnNvCheck"',
                    '/api/naive/check', '/api/naive/update', '/api/naive/status'):
         assert marker in html, marker
 
@@ -5706,11 +5706,24 @@ def test_ui_actions_button_grid(app):
     assert 'id="importFile"' not in grp, \
         "importFile внутри .actions ломает растяжку нечётного хвоста"
     # «Проверить обновления» — единое имя у бинарника и панели (после
-    # v0.25.1), обе кнопки и «Обновить» — во всю ширину, как «Перезапуск»
+    # v0.25.1); проверка и применение — одна морфящаяся кнопка (после
+    # v0.25.2): resting «Проверить обновления» .solo во всю ширину,
+    # при доступном обновнении — акцентная «Обновить до v…», у панели
+    # в паре с «Что нового». Отдельных «Обновить»-кнопок больше нет
     assert html.count(">Проверить обновления</button>") == 2, \
         "у бинарника и панели должна быть кнопка «Проверить обновления»"
-    for rid in ("#btnNvCheck", "#btnNvUpd", "#btnUpdCheck", "#btnUpdApply"):
-        assert f".actions > {rid}" in css, f"нет spanning-правила для {rid}"
+    assert ".actions > .solo" in css, "нет spanning-правила для одиночной кнопки"
+    assert 'id="btnNvUpd"' not in html and 'id="btnUpdApply"' not in html, \
+        "отдельные кнопки «Обновить» не удалены"
+    upd_fn = _ui_fn(html, "renderUpdate")
+    assert "Обновить до v'+upd.latest" in upd_fn and "classList.remove('ghost')" in upd_fn, \
+        "renderUpdate не морфит кнопку в «Обновить до v…»"
+    nv_fn = _ui_fn(html, "renderNaive")
+    assert "'Установить'" in nv_fn and "'Обновить'" in nv_fn, \
+        "renderNaive не морфит кнопку в Установить/Обновить"
+    assert "(upd && upd.available) ? applyUpdate()" in html and \
+           "(nv.available || !(nv.tag || nv.version))" in html, \
+        "клик по слитой кнопке не ветвится проверка/применение"
     # настройки: «Отключить» рядом с «Сохранить», «Отправить тест» — хвост
     # во всю ширину (порядок DOM = порядок таба)
     assert html.index('id="btnTgOff"') < html.index('id="btnTgTest"'), \
