@@ -190,7 +190,6 @@
   button.ghost[aria-pressed="true"] { color:var(--acc); border-color:var(--acc); }
   button.ghost:hover:not(:disabled) { border-color:var(--acc); filter:none; background:var(--hov); box-shadow:none; }
   button.danger { background:var(--err); color:var(--btn-fg); }
-  button.wide { width:100%; }
   button:disabled { opacity:.5; cursor:not-allowed; }
   .iconbtn { padding:4px 9px; border-radius:var(--r-s); }
   /* inline-SVG icon set (UX-06, docs/UI-GUIDELINES.md): stroke наследует
@@ -211,14 +210,20 @@
   input:hover, textarea:hover { border-color:var(--border-sel); }
   input:focus, textarea:focus { border-color:var(--acc); box-shadow:0 0 0 3px var(--dot-halo); outline:none; }
   textarea { min-height:120px; resize:vertical; }
-  .row { display:flex; gap:8px; flex-wrap:wrap; margin-top:14px; }
   .apply-hint { margin-top:12px; color:var(--warn); font-size:12px; }
-  .row #btnDelete { margin-left:auto; }
-  .actions { display:flex; gap:8px; flex-wrap:wrap; margin-top:14px; }
+  /* Кнопочные группы карточек — той же ровной сеткой, что и «Обзор»
+     (v0.24.3): пара делит строку поровну, нечётный хвост — во всю ширину
+     (Импорт, Удалить, Отключить, Что нового, одиночки вроде Перезапуска).
+     nth-child считает и [hidden]-детей: у «Проверить» со спрятанной парой
+     остаётся полуширина + пустая клетка — фиксированная геометрия вместо
+     рваного flex-wrap. Диалоги и строки «поле + кнопка» — не сетка. */
+  .actions { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:14px; }
+  .actions > :last-child:nth-child(odd) { grid-column:1 / -1; }
   /* Сервисные кнопки «Обзора» — ровная сетка вместо рваного flex-wrap:
      пара Стоп/Рестарт делит строку поровну, Запуск и утилиты — во всю
-     ширину карточки. Запуск при остановленном сервисе — единственная
-     кнопка строки (hidden-кнопки grid не занимает) */
+     ширину карточки. Проверить прокси — последняя строка, сразу над
+     #e2eInfo (кнопка рядом с её результатом). Запуск при остановленном
+     сервисе — единственная кнопка строки (hidden-кнопки grid не занимает) */
   .svcbtns { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:14px; }
   .svcbtns > #btnStart, .svcbtns > #btnE2e, .svcbtns > #btnPac { grid-column:1 / -1; }
   pre.log { background:var(--log-bg); color:var(--log-fg); padding:var(--sp-3); border:1px solid var(--border);
@@ -385,10 +390,10 @@
       <button data-action="svc" data-arg="start" id="btnStart" disabled>Запуск</button>
       <button class="ghost" data-action="svc" data-arg="stop" id="btnStop" disabled>Стоп</button>
       <button class="ghost" data-action="svc" data-arg="restart" id="btnRestart" disabled>Рестарт</button>
-      <button class="ghost" data-action="e2e" id="btnE2e" disabled
-              title="Реальный запрос через listen-порт активного пресета: туннель до echo-сервера и exit-IP. TCP-пинг upstream есть в редакторе">Проверить прокси</button>
       <button class="ghost" data-action="copyPac" id="btnPac"
               title="Скопировать адрес PAC-файла — вставьте его в настройки автопрокси устройства (прокси = listen активного пресета; адрес, по которому открыта панель, должен быть достижим с устройства)">Скопировать PAC</button>
+      <button class="ghost" data-action="e2e" id="btnE2e" disabled
+              title="Реальный запрос через listen-порт активного пресета: туннель до echo-сервера и exit-IP. TCP-пинг upstream есть в редакторе">Проверить прокси</button>
     </div>
     <div id="e2eInfo" style="font-size:12px;color:var(--mut);margin-top:8px">проверка: ещё не выполнялась</div>
     <h2 class="sect">Пресеты</h2>
@@ -404,12 +409,14 @@
     <ul class="presets" id="presets" aria-busy="true">
       <li class="skel"></li><li class="skel"></li><li class="skel"></li>
     </ul>
+    <!-- importFile вне .actions: скрытый input — ребёнок группы, он сбивает
+         подсчёт nth-child в spanning-правиле нечётного хвоста -->
+    <input type="file" id="importFile" accept=".json,application/json" style="display:none" aria-hidden="true" tabindex="-1">
     <div class="actions" style="margin-top:10px">
       <button class="ghost" data-action="newPreset">+ Новый</button>
       <a class="btn" id="btnExport" href="/api/configs/export" title="Скачать все пресеты одним JSON. ВНИМАНИЕ: файл содержит пароли upstream!">Экспорт</a>
       <button class="ghost" data-action="import"
               title="Загрузить пресеты из ранее экспортированного JSON">Импорт</button>
-      <input type="file" id="importFile" accept=".json,application/json" style="display:none" aria-hidden="true" tabindex="-1">
     </div>
     <div id="foSection" hidden>
       <h2 class="sect">Фейловер <span id="foCount" class="hint"></span></h2>
@@ -497,7 +504,7 @@
         Изменения активного пресета применятся сразу: прокси перезапустится,
         соединения оборвутся.
       </p>
-      <div class="row">
+      <div class="actions">
         <button type="submit" id="btnSave" title="Ctrl+S">Сохранить</button>
         <button type="button" class="ghost" id="btnActivate"
                 data-action="activate">Сделать активным</button>
@@ -536,7 +543,7 @@
     <h2 class="sect">Панель</h2>
     <div class="svcinfo" id="sysinfo" style="margin-bottom:4px"></div>
     <div class="actions" style="margin-top:10px">
-      <button class="ghost wide" data-action="panelRestart" title="Перезапуск веб-панели (после обновления файлов)">Перезапуск</button>
+      <button class="ghost" data-action="panelRestart" title="Перезапуск веб-панели (после обновления файлов)">Перезапуск</button>
     </div>
     <div id="updInfo" style="font-size:12px;color:var(--mut);margin-top:12px">обновления: проверка…</div>
     <div class="actions" style="margin-top:8px">
@@ -551,7 +558,7 @@
     </div>
     <h2 class="sect" id="sec-settings">Настройки</h2>
     <div class="actions" style="margin-top:10px">
-      <button class="ghost wide" data-action="pwOpen" id="btnPwChange" hidden
+      <button class="ghost" data-action="pwOpen" id="btnPwChange" hidden
               title="Сменить пароль текущего администратора (без SSH)">Сменить пароль…</button>
     </div>
     <div id="ntInfo" style="font-size:12px;color:var(--mut);margin-top:10px"

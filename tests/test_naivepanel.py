@@ -5681,6 +5681,32 @@ def test_ui_overview_button_grid(app):
         "нет spanning-правила для Запуск/Проверить/PAC"
 
 
+def test_ui_actions_button_grid(app):
+    """Кнопочные группы всех карточек — той же сеткой, что и «Обзор»
+    (после v0.25.0): .actions — grid 1fr 1fr, нечётный хвост — во всю
+    ширину; ряд редактора переведён с .row на .actions; «Проверить
+    прокси» — последняя строка svcbtns, рядом со своим результатом
+    #e2eInfo; мёртвый button.wide (сетка тянет одиночки сама) убран."""
+    html = _ui_html()
+    css = html.split("</style>", 1)[0]
+    assert ".actions { display:grid; grid-template-columns:1fr 1fr" in css, \
+        ".actions не переведён на сетку"
+    assert ".actions > :last-child:nth-child(odd)" in css, \
+        "нет spanning-правила нечётного хвоста .actions"
+    assert "button.wide" not in css and 'class="ghost wide"' not in html, \
+        "остался мёртвый .wide"
+    assert ".row {" not in css and 'class="row"' not in html, \
+        "ряд редактора не переведён с .row на .actions"
+    # «Проверить прокси» ниже «Скопировать PAC» — кнопка рядом с результатом
+    assert html.index('id="btnPac"') < html.index('id="btnE2e"'), \
+        "Проверить прокси должен идти после Скопировать PAC (рядом с #e2eInfo)"
+    # скрытый #importFile — не ребёнок группы пресетов: он сбивает
+    # nth-child-подсчёт spanning-правила (поймано live bbox-проверкой)
+    grp = html.split('data-action="newPreset"', 1)[1].split("</div>", 1)[0]
+    assert 'id="importFile"' not in grp, \
+        "importFile внутри .actions ломает растяжку нечётного хвоста"
+
+
 def test_ui_logout_button(app):
     """«Выход» в шапке (v0.25.0): виден только при включённом auth; клик —
     навигация на logout@host, которая затирает кэш Basic-кредов браузера
