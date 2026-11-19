@@ -5705,6 +5705,16 @@ def test_ui_actions_button_grid(app):
     grp = html.split('data-action="newPreset"', 1)[1].split("</div>", 1)[0]
     assert 'id="importFile"' not in grp, \
         "importFile внутри .actions ломает растяжку нечётного хвоста"
+    # «Проверить обновления» — единое имя у бинарника и панели (после
+    # v0.25.1), обе кнопки и «Обновить» — во всю ширину, как «Перезапуск»
+    assert html.count(">Проверить обновления</button>") == 2, \
+        "у бинарника и панели должна быть кнопка «Проверить обновления»"
+    for rid in ("#btnNvCheck", "#btnNvUpd", "#btnUpdCheck", "#btnUpdApply"):
+        assert f".actions > {rid}" in css, f"нет spanning-правила для {rid}"
+    # настройки: «Отключить» рядом с «Сохранить», «Отправить тест» — хвост
+    # во всю ширину (порядок DOM = порядок таба)
+    assert html.index('id="btnTgOff"') < html.index('id="btnTgTest"'), \
+        "Отключить должен стоять перед Отправить тест (пара с Сохранить)"
 
 
 def test_ui_logout_button(app):

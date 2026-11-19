@@ -219,6 +219,11 @@
      рваного flex-wrap. Диалоги и строки «поле + кнопка» — не сетка. */
   .actions { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:14px; }
   .actions > :last-child:nth-child(odd) { grid-column:1 / -1; }
+  /* Поток обновлений (бинарник и панель): «Проверить обновления» и «Обновить»
+     — во всю ширину, как «Перезапуск»; видимое обновление выстраивает шаги
+     вертикально (проверить → обновить → что нового) */
+  .actions > #btnNvCheck, .actions > #btnNvUpd,
+  .actions > #btnUpdCheck, .actions > #btnUpdApply { grid-column:1 / -1; }
   /* Сервисные кнопки «Обзора» — ровная сетка вместо рваного flex-wrap:
      пара Стоп/Рестарт делит строку поровну, Запуск и утилиты — во всю
      ширину карточки. Проверить прокси — последняя строка, сразу над
@@ -537,7 +542,7 @@
     <div id="nvInfo" style="font-size:12px;color:var(--mut);margin-top:10px">бинарник: проверка…</div>
     <div class="actions" style="margin-top:8px">
       <button class="ghost" data-action="naiveCheck" id="btnNvCheck"
-              title="Сверить версию бинарника с последним релизом klzgrad/naiveproxy">Проверить</button>
+              title="Сверить версию бинарника с последним релизом klzgrad/naiveproxy">Проверить обновления</button>
       <button data-action="naiveUpdate" id="btnNvUpd" hidden>Обновить</button>
     </div>
     <h2 class="sect">Панель</h2>
@@ -547,7 +552,7 @@
     </div>
     <div id="updInfo" style="font-size:12px;color:var(--mut);margin-top:12px">обновления: проверка…</div>
     <div class="actions" style="margin-top:8px">
-      <button class="ghost" data-action="updateCheck" title="Сверить версию панели с последним релизом GitHub">Проверить обновления</button>
+      <button class="ghost" data-action="updateCheck" id="btnUpdCheck" title="Сверить версию панели с последним релизом GitHub">Проверить обновления</button>
       <button data-action="updateApply" id="btnUpdApply" hidden>Обновить</button>
       <button class="ghost" data-action="updateNotes" id="btnUpdNotes" hidden title="Описание грядущего релиза">Что нового</button>
     </div>
@@ -574,10 +579,10 @@
       <p id="tgMsg" class="hint" role="status" style="min-height:16px;margin:10px 0 0"></p>
       <div class="actions">
         <button type="submit" id="btnTgSave">Сохранить</button>
-        <button type="button" class="ghost" id="btnTgTest"
-                data-action="tgTest" hidden>Отправить тест</button>
         <button type="button" class="danger" id="btnTgOff"
                 data-action="tgOff" hidden>Отключить</button>
+        <button type="button" class="ghost" id="btnTgTest"
+                data-action="tgTest" hidden>Отправить тест</button>
       </div>
     </form>
   </section>
