@@ -5730,6 +5730,42 @@ def test_ui_actions_button_grid(app):
         "Отключить должен стоять перед Отправить тест (пара с Сохранить)"
 
 
+def test_ui_serious_buttons_outlined_danger(app):
+    """Серьёзные, но обратимые действия — контурный ghost danger: Стоп/
+    Рестарт прокси, Перезапуск панели, «Откат версий…», оба «Откатить»,
+    «Оставить только последнюю» и «Сменить» пароль. Необратимые (Удалить
+    пресет, Отключить TG) остаются сплошным danger — два веса, не один."""
+    html = _ui_html()
+    css = html.split("</style>", 1)[0]
+    assert "button.ghost.danger { background:transparent; color:var(--err); " in css, \
+        "нет контурного правила серьёзных кнопок"
+    assert "button.ghost.danger:hover:not(:disabled)" in css \
+        and "background:var(--err-tint)" in css, \
+        "hover серьёзных кнопок не на токене --err-tint"
+    assert html.count("--err-tint:") == 2, "--err-tint обязан быть в обеих темах"
+
+    def button_tag(key: str) -> str:
+        return html.split(key, 1)[0].rsplit("<button", 1)[-1]
+
+    # серьёзные: прерывают сервис или админ-сессию, но обратимы
+    for key in ('id="btnStop"', 'id="btnRestart"', 'data-action="panelRestart"',
+                'id="btnRbDo"', 'id="btnRbBin"', 'data-action="rbKeep"',
+                'data-action="rollbackOpen"', 'id="btnPwSave"'):
+        tag = button_tag(key)
+        assert 'class="ghost danger"' in tag, f"{key} без подсветки ghost danger"
+    # необратимые — сплошная заливка, не контур
+    for key in ('id="btnDelete"', 'id="btnTgOff"'):
+        tag = button_tag(key)
+        assert 'class="danger"' in tag and "ghost" not in tag, \
+            f"{key} должен оставаться сплошным danger"
+    # контраст контурного danger на карточке/диалоге — WCAG AA (обе темы)
+    for block in (r':root \{ color-scheme:dark;([^}]*)', r'\[data-theme="light"\] \{([^}]*)\}'):
+        theme = re.search(block, html, re.S).group(1)
+        err = re.search(r"--err:#([0-9a-fA-F]{6})", theme).group(1)
+        card = re.search(r"--card:#([0-9a-fA-F]{6})", theme).group(1)
+        assert _wcag_contrast(err, card) >= 4.5, f"err на card: {err}/{card}"
+
+
 def test_ui_logout_button(app):
     """«Выход» в шапке (v0.25.0): виден только при включённом auth; клик —
     навигация на logout@host, которая затирает кэш Basic-кредов браузера
