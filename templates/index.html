@@ -192,10 +192,10 @@
   button.ghost[aria-pressed="true"] { color:var(--acc); border-color:var(--acc); }
   button.ghost:hover:not(:disabled) { border-color:var(--acc); filter:none; background:var(--hov); box-shadow:none; }
   button.danger { background:var(--err); color:var(--btn-fg); }
-  /* Серьёзные, но обратимые действия (стоп/рестарт/откат/смена пароля):
-     контурный danger на уровне ghost — сплошная заливка остаётся для
-     необратимых (Удалить/Отключить). Специфичность (0,4,1) перебивает и
-     button.danger, и hover-правила ghost */
+  /* Серьёзные, но обратимые действия (диалоги отката, смена пароля —
+     открывашка покрашена в тон своему «Сменить»): контурный danger на
+     уровне ghost — сплошная заливка для необратимых и «Стоп».
+     Специфичность (0,4,1) перебивает и button.danger, и hover-правила ghost */
   button.ghost.danger { background:transparent; color:var(--err); border-color:var(--err); }
   button.ghost.danger:hover:not(:disabled) { filter:none; box-shadow:none;
                                              border-color:var(--err); background:var(--err-tint); }
@@ -404,8 +404,8 @@
     <div id="e2eSpark" class="spark" hidden></div>
     <div class="svcbtns">
       <button data-action="svc" data-arg="start" id="btnStart" disabled>Запуск</button>
-      <button class="ghost danger" data-action="svc" data-arg="stop" id="btnStop" disabled>Стоп</button>
-      <button class="ghost danger" data-action="svc" data-arg="restart" id="btnRestart" disabled>Рестарт</button>
+      <button class="danger" data-action="svc" data-arg="stop" id="btnStop" disabled>Стоп</button>
+      <button data-action="svc" data-arg="restart" id="btnRestart" disabled>Рестарт</button>
       <button class="ghost" data-action="copyPac" id="btnPac"
               title="Скопировать адрес PAC-файла — вставьте его в настройки автопрокси устройства (прокси = listen активного пресета; адрес, по которому открыта панель, должен быть достижим с устройства)">Скопировать PAC</button>
       <button class="ghost" data-action="e2e" id="btnE2e" disabled
@@ -558,7 +558,7 @@
     <h2 class="sect">Панель</h2>
     <div class="svcinfo" id="sysinfo" style="margin-bottom:4px"></div>
     <div class="actions" style="margin-top:10px">
-      <button class="ghost danger" data-action="panelRestart" title="Перезапуск веб-панели (после обновления файлов)">Перезапуск</button>
+      <button data-action="panelRestart" title="Перезапуск веб-панели (после обновления файлов)">Перезапуск</button>
     </div>
     <div id="updInfo" style="font-size:12px;color:var(--mut);margin-top:12px">обновления: проверка…</div>
     <div class="actions" style="margin-top:8px">
@@ -567,12 +567,12 @@
     </div>
     <div id="rbInfo" style="font-size:12px;color:var(--mut);margin-top:12px">откат: …</div>
     <div class="actions" style="margin-top:8px">
-      <button class="ghost danger" data-action="rollbackOpen"
+      <button data-action="rollbackOpen"
               title="Откат панели или бинарника naive на сохранённую версию — без SSH">Откат версий…</button>
     </div>
     <h2 class="sect" id="sec-settings">Настройки</h2>
     <div class="actions" style="margin-top:10px">
-      <button class="ghost" data-action="pwOpen" id="btnPwChange" hidden
+      <button class="ghost danger" data-action="pwOpen" id="btnPwChange" hidden
               title="Сменить пароль текущего администратора (без SSH)">Сменить пароль…</button>
     </div>
     <div id="ntInfo" style="font-size:12px;color:var(--mut);margin-top:10px"
