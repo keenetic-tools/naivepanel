@@ -537,16 +537,16 @@ done
 # не расползался относительно канонического.
 
 verify_release_signature() {  # $1=sigfile $2=datafile
-    # Формат: строка 2 .minisig = base64("Ed" + keyid(8) + sig(64)).
+    # Формат: строка 2 .minisig = base64("Ed" + keyid(8) + sig(64)) = 74 байт.
+    # Здесь только отсечение битого файла — строго busybox-совместимо
+    # (sed/base64/wc, без od: busybox od не умеет -A/-t — ловится e2e).
+    # keyid, кривую и саму подпись проверяет эталонный верификатор ниже.
     sig_b64=$(sed -n '2p' "$1")
     sig_bin="$STAGE/.np-sig.bin"
     if ! printf '%s' "$sig_b64" | base64 -d > "$sig_bin" 2>/dev/null \
        || [ "$(wc -c < "$sig_bin")" -ne 74 ]; then
         die "malformed $1"
     fi
-    sig_keyid=$(od -A n -t x1 "$sig_bin" | tr -d ' \n' | cut -c 5-20)
-    [ "$sig_keyid" = "$NP_SIGN_KEYID" ] \
-        || die "signature keyid mismatch (expected $NP_SIGN_KEYID)"
     # Единственный путь верификации — эталонный верификатор на python3
     # (stdlib-only, RFC 8032): его копия встроена ниже, канонический вид —
     # tools/release_sign.py. Отдельный openssl-путь не делаем: на целевой
