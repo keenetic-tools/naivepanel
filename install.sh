@@ -192,6 +192,9 @@ if [ "$UNINSTALL" = 1 ]; then
     fi
     rm -f "$PANEL_DIR/naivepanel.py" /opt/naivepanel/naivepanel.py
     rm -rf "$PANEL_DIR/templates" /opt/naivepanel/templates
+    # backend-пакет целиком (ARCH-01/03): модули + статика — иначе uninstall
+    # оставлял panel/ с кодом и кэшируемыми JS/CSS
+    rm -rf "$PANEL_DIR/panel"
     rmdir "$PANEL_DIR" /opt/naivepanel /opt/etc/naivepanel "$NAIVE_ROOT" 2>/dev/null || true
     info "uninstall complete"
     exit 0
@@ -490,12 +493,24 @@ install_naive() {  # ставит /opt/bin/naive из релиза klzgrad/naive
 
 # --- download + verify -----------------------------------------------------
 
+# SEC-07: подпись релиза. Публичный ключ — trust anchor (зашит сюда, а не
+# качается с origin: иначе компрометация репозитория подменила бы и ключ, и
+# суммы молча). Приватный ключ живёт офлайн у maintainer'а: tools/release_sign.py
+# keygen/sign. Ротация: сгенерировать новую пару, обновить обе константы и
+# README, подписать релиз новым ключом; старый ключ держать до последнего
+# релиза, подписанного им.
+NP_SIGN_KEYID="c1f50218985a4272"
+NP_SIGN_PUBKEY="557782e9b665ed86f6348b5cb47182a1e894c692b3636a1689507ce4e310376d"
+
 BASE="https://raw.githubusercontent.com/${REPO}/${REF}"
 STAGE=$(mktemp -d /tmp/naivepanel.XXXXXX) || die "mktemp failed"
 trap 'rm -rf "$STAGE"' EXIT
 
 info "downloading @ $REF"
 fetch "$BASE/SHA256SUMS"              >"$STAGE/SHA256SUMS"          || die "SHA256SUMS"
+# Подпись SHA256SUMS (minisign-формат) — обязательна: без неё установка
+# отклоняется (fail-closed), иначе подмена SHA256SUMS осталась бы незамеченной
+fetch "$BASE/SHA256SUMS.minisig"      >"$STAGE/SHA256SUMS.minisig"  || die "SHA256SUMS.minisig"
 fetch "$BASE/naivepanel.py"           >"$STAGE/naivepanel.py"       || die "naivepanel.py"
 mkdir -p "$STAGE/templates"
 fetch "$BASE/templates/index.html"    >"$STAGE/templates/index.html" || die "templates/index.html"
@@ -507,11 +522,151 @@ mkdir -p "$STAGE/panel"
 for f in $PANEL_PKG; do
     fetch "$BASE/panel/$f" >"$STAGE/panel/$f" || die "panel/$f"
 done
+# статика UI (ARCH-03): JS/CSS живут отдельно от HTML и кэшируются на год
+mkdir -p "$STAGE/panel/static"
+for f in app.js styles.css; do
+    fetch "$BASE/panel/static/$f" >"$STAGE/panel/static/$f" || die "panel/static/$f"
+done
+
+# --- verify release signature (SEC-07) ---------------------------------------
+# minisign-совместимая Ed25519-подпись SHA256SUMS. Сначала openssl (быстро),
+# при отсутствии — встроенный верификатор на python3 (stdlib-only, RFC 8032).
+# Падение верификации = немедленный отказ; fallback на python допустим только
+# когда openssl нет. Каноническая копия верификатора — tools/release_sign.py;
+# маркеры ниже используются docker-e2e.sh и тестами, чтобы встроенный блок
+# не расползался относительно канонического.
+
+verify_release_signature() {  # $1=sigfile $2=datafile
+    # Формат: строка 2 .minisig = base64("Ed" + keyid(8) + sig(64)).
+    sig_b64=$(sed -n '2p' "$1")
+    sig_bin="$STAGE/.np-sig.bin"
+    if ! printf '%s' "$sig_b64" | base64 -d > "$sig_bin" 2>/dev/null \
+       || [ "$(wc -c < "$sig_bin")" -ne 74 ]; then
+        die "malformed $1"
+    fi
+    sig_keyid=$(od -A n -t x1 "$sig_bin" | tr -d ' \n' | cut -c 5-20)
+    [ "$sig_keyid" = "$NP_SIGN_KEYID" ] \
+        || die "signature keyid mismatch (expected $NP_SIGN_KEYID)"
+    # Единственный путь верификации — эталонный верификатор на python3
+    # (stdlib-only, RFC 8032): его копия встроена ниже, канонический вид —
+    # tools/release_sign.py. Отдельный openssl-путь не делаем: на целевой
+    # платформе python3 обязателен самой панелью, а второй независимый
+    # код верификации — лишняя поверхность для багов и busybox-квирков.
+    if [ ! -x "$PYTHON" ] && ! command -v "$PYTHON" >/dev/null 2>&1; then
+        die "python3 is required to verify the release signature"
+    fi
+    if ! NP_VERIFY_KEYID="$NP_SIGN_KEYID" NP_VERIFY_PUB="$NP_SIGN_PUBKEY" \
+       NP_VERIFY_SIG="$1" NP_VERIFY_DATA="$2" "$PYTHON" - <<'PYEOF'
+#@np-verify-begin
+import base64
+import hashlib
+import os
+import sys
+
+_q = 2**255 - 19
+_d = -121665 * pow(121666, _q - 2, _q) % _q
+_i = pow(2, (_q - 1) // 4, _q)
+
+
+def _xrecover(y):
+    xx = (y * y - 1) * pow(_d * y * y + 1, _q - 2, _q) % _q
+    x = pow(xx, (_q + 3) // 8, _q)
+    if (x * x - xx) % _q != 0:
+        x = (x * _i) % _q
+    if x % 2 != 0:
+        x = _q - x
+    return x
+
+
+_by = 4 * pow(5, _q - 2, _q) % _q
+_b = (_xrecover(_by), _by)
+
+
+def _edwards(p, q_):
+    x1, y1 = p
+    x2, y2 = q_
+    x3 = (x1 * y2 + x2 * y1) * pow(1 + _d * x1 * x2 * y1 * y2, _q - 2, _q) % _q
+    y3 = (y1 * y2 + x1 * x2) * pow(1 - _d * x1 * x2 * y1 * y2, _q - 2, _q) % _q
+    return (x3, y3)
+
+
+def _scalarmult(p, e):
+    q_ = (0, 1)
+    while e > 0:
+        if e & 1:
+            q_ = _edwards(q_, p)
+        p = _edwards(p, p)
+        e >>= 1
+    return q_
+
+
+def _decodeint(s):
+    return int.from_bytes(s, "little")
+
+
+def _decodepoint(s):
+    y = int.from_bytes(s, "little") & ((1 << 255) - 1)
+    x = _xrecover(y)
+    if x & 1 != (s[31] >> 7) & 1:
+        x = _q - x
+    if (-x * x + y * y - 1 - _d * x * x * y * y) % _q != 0:
+        raise ValueError("point not on curve")
+    return (x, y)
+
+
+def _hint(m):
+    return int.from_bytes(hashlib.sha512(m).digest(), "little")
+
+
+def _fail(msg):
+    print("release signature: " + msg, file=sys.stderr)
+    sys.exit(1)
+
+
+sig_path = os.environ["NP_VERIFY_SIG"]
+data_path = os.environ["NP_VERIFY_DATA"]
+key_id = os.environ["NP_VERIFY_KEYID"].lower()
+pub = bytes.fromhex(os.environ["NP_VERIFY_PUB"])
+
+lines = open(sig_path, encoding="utf-8").read().splitlines()
+if len(lines) < 2 or not lines[0].startswith("untrusted comment:"):
+    _fail("malformed signature file")
+try:
+    blob = base64.b64decode(lines[1], validate=True)
+except Exception:
+    _fail("bad base64 in signature")
+if blob[:2] != b"Ed" or len(blob) != 74:
+    _fail("unsupported signature format")
+if blob[2:10].hex() != key_id:
+    _fail("signature keyid mismatch")
+sig, msg = blob[10:], open(data_path, "rb").read()
+if len(sig) != 64 or len(pub) != 32:
+    _fail("bad key/signature length")
+try:
+    r = _decodepoint(sig[:32])
+    a = _decodepoint(pub)
+except ValueError as exc:
+    _fail(str(exc))
+s = _decodeint(sig[32:])
+h = _hint(sig[:32] + pub + msg)
+if _scalarmult(_b, s) != _edwards(r, _scalarmult(a, h)):
+    _fail("release signature verification failed")
+#@np-verify-end
+PYEOF
+    then
+        return 0
+    fi
+    die "release signature verification failed"
+}
+
+verify_release_signature "$STAGE/SHA256SUMS.minisig" "$STAGE/SHA256SUMS"
+info "release signature verified (keyid ${NP_SIGN_KEYID})"
 
 # --- verify checksums: fail-closed (SEC-03) ---------------------------------
-# Пропускать проверку нельзя: SHA256SUMS — единственный integrity-барьер
-# до внедрения подписи релизов (план, Task 8b). Нет sha256sum — верифицируем
-# python3 (панель без него в любом случае не работает); нет и его — умираем.
+# Контрольные суммы сверяются ПОСЛЕ подписи (SEC-07): SHA256SUMS аутентичен,
+# значит подмена любого файла релиза будет поймана здесь. Нет sha256sum —
+# верифицируем python3 (панель без него в любом случае не работает); нет и
+# его — умираем.
 if command -v sha256sum >/dev/null 2>&1; then
     ( cd "$STAGE" && sha256sum -c SHA256SUMS ) || die "checksum verification failed"
 elif [ -x "$PYTHON" ]; then
@@ -555,9 +710,12 @@ putfile "$STAGE/templates/index.html" "$PANEL_DIR/templates/index.html" 0644
 # пакет меняем целиком: файл, удалённый из релиза, не должен оставаться
 # на месте после апгрейда (смешение версий пакета)
 rm -rf "$PANEL_DIR/panel"
-mkdir -p "$PANEL_DIR/panel"
+mkdir -p "$PANEL_DIR/panel/static"
 for f in $PANEL_PKG; do
     putfile "$STAGE/panel/$f" "$PANEL_DIR/panel/$f" 0644
+done
+for f in app.js styles.css; do
+    putfile "$STAGE/panel/static/$f" "$PANEL_DIR/panel/static/$f" 0644
 done
 putfile "$STAGE/S99naivepanel" "$INIT_DIR/S99naivepanel" 0755
 

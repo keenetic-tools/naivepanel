@@ -1,4 +1,5 @@
-"""Security-слой панели: CSP/nonce, Host-allowlist, CSRF, HTTP Basic auth.
+"""Security-слой панели: CSP/nonce, Host-allowlist, CSRF, HTTP Basic auth,
+аудит действий (SEC-08).
 
 Шаг 2/7 модульного разделения (ARCH-01). Функции перенесены из naivepanel.py
 дословно; регистрация хуков (before/after_request, context_processor)
@@ -13,14 +14,16 @@ Flask app.logger (как в panel/config.py).
 """
 
 import hashlib
+import json
 import logging
 import os
 import secrets
 import tempfile
 import time
 from pathlib import Path
+from typing import Any
 
-from flask import Response, abort, g, request
+from flask import Response, abort, g, has_request_context, request
 
 from panel import config as cfg
 
@@ -28,16 +31,16 @@ log = logging.getLogger("naivepanel")
 
 # --- Security headers --------------------------------------------------------
 
-# Скрипты разрешены только по nonce (уникален на запрос): инъекция <script>
-# без nonce не выполнится, 'unsafe-inline' для script не нужен. style-src
-# оставляем 'unsafe-inline' — inline-стили и style="" в шаблоне. Внешние
-# origin'ы запрещены: connect-src 'self' не даёт внедрённому коду
+# Скрипты: same-origin (panel/static) + inline только по nonce (уникален на
+# запрос) — bootstrap темы в index.html. 'unsafe-inline' для script не нужен.
+# style-src держит 'unsafe-inline' — style="" в разметке; сами стили —
+# внешние, 'self'. connect-src 'self' не даёт внедрённому коду
 # эксфильтрировать данные fetch'ем на сторонний домен.
 def _csp(nonce: str) -> str:
     return (
         "default-src 'none'; "
-        f"script-src 'nonce-{nonce}'; "
-        "style-src 'unsafe-inline'; "
+        f"script-src 'self' 'nonce-{nonce}'; "
+        "style-src 'self' 'unsafe-inline'; "
         "connect-src 'self'; "
         "img-src 'self' data:; "
         "base-uri 'none'; "
@@ -340,11 +343,40 @@ def _require_local_or_auth() -> None:
                                "set one (install.sh --with-auth) first")
 
 
+# --- Аудит действий (SEC-08) -------------------------------------------------
+# Кто и что менял: одна JSONL-запись на действие. Секреты сюда НЕ передаём —
+# только структурированные поля (имена, версии, rc): файл читается из UI,
+# и маскирование постфактум не спасёт уже записанное.
+
+def _audit_actor() -> str:
+    """Актор записи: user@addr из request-context, иначе 'system'.
+
+    Вне запроса (потоки монитора) caller обязан передать actor явно.
+    """
+    if has_request_context() and request.remote_addr:
+        user = request.authorization.username if request.authorization else None
+        return f"{user or '?'}@{request.remote_addr}"
+    return "system"
+
+
+def _audit(event: str, actor: str | None = None, **fields: Any) -> None:
+    """Дописать событие в журнал аудита; сбой записи не должен ронять запрос."""
+    try:
+        rec = {"t": int(time.time()), "event": event,
+               "actor": actor or _audit_actor(), **fields}
+        cfg.PANEL_AUDIT.parent.mkdir(parents=True, exist_ok=True)
+        with cfg.PANEL_AUDIT.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except OSError as exc:
+        log.warning("audit write failed: %s", exc)
+
+
 __all__ = [
     "DEFAULT_ALLOWED_HOSTS",
     "_AUTH_CACHE_LIMIT", "_AUTH_CACHE_TTL", "_AUTH_FAIL_LIMIT",
     "_AUTH_FAIL_WINDOW", "_admin_pass_stamp", "_auth_cache", "_auth_fails",
-    "_auth_register_failure", "_auth_throttled", "_csrf_protect", "_csp",
+    "_auth_register_failure", "_auth_throttled", "_audit", "_audit_actor",
+    "_csrf_protect", "_csp",
     "_enforce_host_allowlist", "_htpasswd_replace", "_htpasswd_verify",
     "_inject_csp_nonce", "_make_csp_nonce", "_panel_is_exposed_without_auth",
     "_reject_unauthenticated_exposure", "_require_auth",

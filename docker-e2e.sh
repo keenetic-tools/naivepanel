@@ -51,10 +51,13 @@ trap 'rm -rf "$WORK"' EXIT
 
 WWW="$WORK/www/keenetic-tools/naivepanel/$REF"
 mkdir -p "$WWW/templates" "$WWW/panel"
-cp "$REPO_DIR/install.sh" "$REPO_DIR/SHA256SUMS" "$REPO_DIR/naivepanel.py" \
+cp "$REPO_DIR/install.sh" "$REPO_DIR/SHA256SUMS" "$REPO_DIR/SHA256SUMS.minisig" \
+   "$REPO_DIR/naivepanel.py" \
    "$REPO_DIR/S99naivepanel" "$REPO_DIR/S99naiveproxy" "$WWW/"
 cp "$REPO_DIR/templates/index.html" "$WWW/templates/"
 cp "$REPO_DIR"/panel/*.py "$WWW/panel/"
+mkdir -p "$WWW/panel/static"
+cp "$REPO_DIR"/panel/static/app.js "$REPO_DIR"/panel/static/styles.css "$WWW/panel/static/"
 
 # --- сертификаты -----------------------------------------------------------
 
@@ -272,6 +275,31 @@ fi
 grep -q "exposes the panel" /tmp/bind-preflight.log \
   && echo "SEC-01 preflight: OK (dies on LAN bind without password)" \
   || { echo "FAIL: unexpected install failure"; cat /tmp/bind-preflight.log; exit 1; }
+# SEC-07: встроенный верификатор из install.sh — позитив на релизных файлах
+# и негатив на подменённом SHA256SUMS (тот код, что гоняется при каждой
+# установке и self-update; здесь он же, извлечённый маркерами)
+curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/$REF/install.sh > /tmp/np-install.sh
+sed -n '/^#@np-verify-begin/,/^#@np-verify-end/p' /tmp/np-install.sh > /tmp/npverify.py
+np_keyid=\$(grep '^NP_SIGN_KEYID=' /tmp/np-install.sh | cut -d'"' -f2)
+np_pub=\$(grep '^NP_SIGN_PUBKEY=' /tmp/np-install.sh | cut -d'"' -f2)
+rel=/www/keenetic-tools/naivepanel/$REF
+np_py=/opt/bin/python3
+[ -x "\$np_py" ] || np_py=python3
+if NP_VERIFY_KEYID="\$np_keyid" NP_VERIFY_PUB="\$np_pub" \
+   NP_VERIFY_SIG="\$rel/SHA256SUMS.minisig" NP_VERIFY_DATA="\$rel/SHA256SUMS" \
+   "\$np_py" /tmp/npverify.py 2>/tmp/npverify-err.log; then
+  echo "SEC-07 verify: OK (embedded verifier accepts the release)"
+else
+  echo "FAIL: embedded verifier rejects the release"; cat /tmp/npverify-err.log; exit 1
+fi
+cp "\$rel/SHA256SUMS" /tmp/tampered-sums && echo "deadbeef  naivepanel.py" >> /tmp/tampered-sums
+if NP_VERIFY_KEYID="\$np_keyid" NP_VERIFY_PUB="\$np_pub" \
+   NP_VERIFY_SIG="\$rel/SHA256SUMS.minisig" NP_VERIFY_DATA=/tmp/tampered-sums \
+   "\$np_py" /tmp/npverify.py 2>/dev/null; then
+  echo "FAIL: embedded verifier accepted tampered SHA256SUMS"; exit 1
+else
+  echo "SEC-07 tamper: OK (embedded verifier rejects tampered data)"
+fi
 if grep -q '/opt/etc/naive/proxy/config.json' /opt/etc/init.d/S99naiveproxy \
    && ! grep -q '/opt/etc/naiveproxy' /opt/etc/init.d/S99naiveproxy; then
   echo "stale S99naiveproxy replaced: OK"

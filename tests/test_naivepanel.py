@@ -23,6 +23,18 @@ APP_DIR = Path(__file__).resolve().parents[1]
 
 CSRF = {"X-Requested-With": "naivepanel"}
 
+UI_HTML = APP_DIR / "templates" / "index.html"
+UI_JS = APP_DIR / "panel" / "static" / "app.js"
+UI_CSS = APP_DIR / "panel" / "static" / "styles.css"
+
+
+def _ui_all() -> str:
+    """Весь UI одной строкой — для assert'ов «строка есть в интерфейсе».
+
+    ARCH-03: HTML/JS/CSS разделены (panel/static), большинство строковых
+    assert'ов не различают источник; кому важно — читает файл напрямую."""
+    return "\n".join(f.read_text(encoding="utf-8") for f in (UI_HTML, UI_JS, UI_CSS))
+
 
 @pytest.fixture()
 def env(tmp_path, monkeypatch):
@@ -927,6 +939,76 @@ def test_logs_src_defaults_and_unknown_to_proxy(client, env):
     assert "proxy line" in client.get("/api/logs?src=bogus").get_json()["content"]
 
 
+# --- журнал аудита действий (SEC-08, Task 20) ---------------------------------
+
+def _audit_lines(env):
+    path = env / "panel" / "audit.jsonl"
+    if not path.exists():
+        return []
+    out = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:  # обрыв записи — пропускаем, как читатель
+            continue
+    return out
+
+
+def test_audit_create_activate_delete_and_service(client, app, env):
+    stub, _ = _stub_init(env)
+    app.cfg.INIT_SCRIPT = stub
+    r, _ = _create(client, name="home")
+    assert r.status_code == 201
+    assert client.post("/api/configs/home/activate", headers=CSRF).status_code == 200
+    assert client.post("/api/service/restart", headers=CSRF).status_code == 200
+    assert client.post("/api/configs/home/duplicate", headers=CSRF).status_code == 201
+    assert client.delete("/api/configs/home-copy", headers=CSRF).status_code == 200
+
+    events = [e["event"] for e in _audit_lines(env)]
+    for expected in ("preset.create", "preset.activate", "service.restart",
+                     "preset.duplicate", "preset.delete"):
+        assert expected in events, (expected, events)
+
+
+def test_audit_records_actor_and_detail(client, env):
+    _create(client, name="home")
+    (entries := _audit_lines(env)) or pytest.fail("audit.jsonl is empty")
+    rec = next(e for e in entries if e["event"] == "preset.create")
+    assert rec["name"] == "home"
+    assert rec["actor"].endswith("@127.0.0.1"), rec
+    assert isinstance(rec["t"], int)
+
+
+def test_audit_never_contains_credentials(client, env):
+    _create(client, name="home", password="p@ss:word")
+    raw = (env / "panel" / "audit.jsonl").read_text(encoding="utf-8")
+    assert "p@ss:word" not in raw
+    assert "user" not in raw  # username upstream — тоже не аудируем
+
+
+def test_logs_src_audit_reads_audit_journal(client, env):
+    _create(client, name="home")
+    d = client.get("/api/logs?src=audit&lines=10").get_json()
+    assert "preset.create" in d["content"]
+    assert "home" in d["content"]
+
+
+def test_audit_failover_and_update_events(app, client, env, monkeypatch):
+    # авто-события фейловера и запуск обновления — в журнале с actor=monitor
+    app.mon._report_failover_event(
+        {"event": "switched", "from": "home", "to": "backup"})
+    monkeypatch.setattr(app.upd, "_latest_release",
+                        lambda: {"tag": "v9.9.9", "notes": "", "url": ""})
+    monkeypatch.setattr(app.mon, "_http_get", lambda *a, **k: "#!/bin/sh\n")
+    r = client.post("/api/update/apply", headers=CSRF)
+    assert r.status_code == 202
+    entries = _audit_lines(env)
+    sw = next(e for e in entries if e["event"] == "failover.switch")
+    assert sw["actor"] == "monitor" and sw["to"] == "backup"
+    upd = next(e for e in entries if e["event"] == "update.apply")
+    assert upd["target"] == "v9.9.9"
+
+
 # --- JSON-ошибки для API ------------------------------------------------------
 
 def test_api_errors_are_json(client):
@@ -958,21 +1040,23 @@ def test_security_headers_on_pages_and_api(client):
 def test_csp_uses_nonce_and_drops_unsafe_inline_script(client):
     r = client.get("/")
     csp = r.headers["Content-Security-Policy"]
-    assert "script-src 'nonce-" in csp
+    # ARCH-03: same-origin статика + nonce только для inline bootstrap-темы
+    assert "script-src 'self' 'nonce-" in csp
     assert "script-src 'unsafe-inline'" not in csp
-    assert "style-src 'unsafe-inline'" in csp  # inline-стили и style="" остаются
-    nonce = csp.split("script-src 'nonce-", 1)[1].split("'", 1)[0]
+    assert "style-src 'self' 'unsafe-inline'" in csp  # style="" остаются
+    nonce = csp.split("'nonce-", 1)[1].split("'", 1)[0]
     assert f'nonce="{nonce}"' in r.get_data(as_text=True)
 
 
 def test_ui_has_no_inline_event_handlers(app):
-    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    # inline-обработчики могут быть только в разметке; JS/CSS не проверяем
+    html = UI_HTML.read_text(encoding="utf-8")
     assert not re.search(r"\son[a-z]+\s*=", html), "inline-обработчики блокирует nonce-CSP"
 
 
 def test_ui_svc_message_reflects_rc(app):
     # REL-05: svc() показывал «Сервис перезапущен» даже при rc!=0
-    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    html = _ui_all()
     m = re.search(r"async function svc\(action\) \{.*?\n\}", html, re.S)
     assert m, "svc() не найден в index.html"
     body = m.group(0)
@@ -983,7 +1067,7 @@ def test_ui_svc_message_reflects_rc(app):
 def test_ui_naive_update_distinguishes_restart_failure(app):
     # «бинарник заменён» и «рестарт удался» — разные события; UI обязан
     # различать их по restart_rc
-    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    html = _ui_all()
     assert "restart_rc" in html, "UI не различает failed restart после смены бинарника"
 
 
@@ -1003,7 +1087,7 @@ def _wcag_contrast(hex_fg: str, hex_bg: str = "ffffff") -> float:
 def test_light_accent_meets_wcag_aa(app):
     # UX-01: светлый --acc #0e8a5f давал 4.36:1 на белом — текст на бейджах,
     # ссылки, галочки. Токен обязан держать AA для normal text
-    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    html = _ui_all()
     m = re.search(r'\[data-theme="light"\][^{]*\{[^}]*?--acc:#([0-9a-fA-F]{6})', html)
     assert m, "light --acc не найден"
     assert _wcag_contrast(m.group(1)) >= 4.5, _wcag_contrast(m.group(1))
@@ -1011,7 +1095,7 @@ def test_light_accent_meets_wcag_aa(app):
 
 def test_mobile_touch_targets_and_input_font(app):
     # UX-02: на ≤800px цели ≥44px; поля ≥16px, иначе iOS приближает страницу
-    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    html = _ui_all()
     blocks = re.findall(r"@media \(max-width:800px\) \{.*?\n  \}", html, re.S)
     assert blocks, "нет мобильного media-блока"
     mobile = "\n".join(blocks)
@@ -1021,7 +1105,7 @@ def test_mobile_touch_targets_and_input_font(app):
 
 def test_toast_has_keyboard_close(app):
     # UX-03: toast закрывался только кликом по нему — недоступно с клавиатуры
-    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    html = _ui_all()
     m = re.search(r"function flash\(msg, ok, ms\) \{.*?\n\}", html, re.S)
     assert m, "flash() не найден"
     body = m.group(0)
@@ -1031,7 +1115,7 @@ def test_toast_has_keyboard_close(app):
 
 def test_log_focusable_and_labeled(app):
     # UX-03: прокручиваемый лог не получал фокус с клавиатуры
-    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    html = _ui_all()
     assert re.search(r'<pre class="log" id="log"[^>]*tabindex="0"', html), \
         "главный лог не фокусируется"
     assert re.search(r'<pre class="log" id="log"[^>]*aria-label="', html), \
@@ -1040,7 +1124,7 @@ def test_log_focusable_and_labeled(app):
 
 def test_upstream_input_linked_to_hint(app):
     # UX-03: ошибка валидации upstream должна объявляться скринридером
-    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    html = _ui_all()
     assert 'aria-describedby="upHint"' in html, "f_upstream не связан с подсказкой"
     m = re.search(r"function validateUpstream\(\) \{.*?\n\}", html, re.S)
     assert m and "aria-invalid" in m.group(0), "валидация не ставит aria-invalid"
@@ -1049,14 +1133,14 @@ def test_upstream_input_linked_to_hint(app):
 def test_sparkline_has_text_summary(app):
     # UX-03: спарклайн — только красно-зелёные полоски; текстовая сводка
     # обязана существовать для незрячих
-    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    html = _ui_all()
     m = re.search(r"function drawSpark\(d\) \{.*?\n\}", html, re.S)
     assert m and "sr-only" in m.group(0), "у спарклайна нет текстового эквивалента"
 
 
 def test_theme_button_accessible_name_updates(app):
     # UX-03: имя кнопки темы должно отражать целевое состояние
-    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    html = _ui_all()
     m = re.search(r"function setThemeBtn\(theme\) \{.*?\n\}", html, re.S)
     assert m and "aria-label" in m.group(0), "setThemeBtn не ставит aria-label"
     t = re.search(r"function toggleTheme\(\) \{.*?\n\}", html, re.S)
@@ -1065,7 +1149,7 @@ def test_theme_button_accessible_name_updates(app):
 
 def test_no_double_escaping_in_textcontent(app):
     # UX-05: escapeHtml перед textContent показывал пользователю &amp; и т.п.
-    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    html = _ui_all()
     offenders = re.findall(r"textContent[^;\n]*=[^;\n]*escapeHtml\(", html)
     assert not offenders, offenders
 
@@ -1073,7 +1157,7 @@ def test_no_double_escaping_in_textcontent(app):
 def test_select_preset_guards_stale_response(app):
     # UX-05: быстрый выбор A→B — поздний ответ A не должен перезаписывать
     # форму B (out-of-order response)
-    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    html = _ui_all()
     m = re.search(r"async function selectPreset\(name\) \{.*?\n\}", html, re.S)
     assert m, "selectPreset не найден"
     body = m.group(0)
@@ -1087,7 +1171,7 @@ def test_select_preset_guards_stale_response(app):
 def test_save_is_reentry_guarded(app):
     # UX-05: повторный Ctrl+S во время активного save не должен создавать
     # второй PUT
-    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    html = _ui_all()
     m = re.search(r"async function save\(ev\) \{.*?\n  \}", html, re.S)
     assert m, "save() не найден"
     assert "saving" in m.group(0), "нет guard'а от повторного входа"
@@ -1103,14 +1187,14 @@ def test_ui_guidelines_doc_pins_structure(app):
 
 
 def test_design_tokens_defined(app):
-    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    html = _ui_all()
     for token in ("--sp-4:", "--fs-16:", "--font-mono:", "--r-l:",
                   "--z-toast:", "--focus-ring:", "--status-ok:"):
         assert token in html, token
 
 
 def test_section_anchors_exist(app):
-    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    html = _ui_all()
     for anchor in ('id="sec-overview"', 'id="sec-diag"',
                    'id="sec-system"', 'id="sec-settings"'):
         assert anchor in html, anchor
@@ -1118,7 +1202,7 @@ def test_section_anchors_exist(app):
 
 def test_mobile_section_nav(app):
     # табы-якоря четырёх групп: скрыты на desktop, sticky на ≤800px
-    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    html = _ui_all()
     assert 'id="secNav"' in html
     for href in ("#sec-overview", "#sec-diag", "#sec-system", "#sec-settings"):
         assert f'href="{href}"' in html, href
@@ -1129,7 +1213,7 @@ def test_mobile_section_nav(app):
 
 
 def test_icons_are_inline_svg_set(app):
-    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    html = _ui_all()
     assert 'class="ic"' in html, "нет статических inline-SVG"
     m = re.search(r"const IC = \{.*?\};", html, re.S)
     assert m and m.group(0).count("<svg") >= 6, "нет SVG-набора иконок (нужно ≥6)"
@@ -1138,14 +1222,14 @@ def test_icons_are_inline_svg_set(app):
 
 
 def test_theme_button_uses_icon_set(app):
-    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    html = _ui_all()
     m = re.search(r"function setThemeBtn\(theme\) \{.*?\n\}", html, re.S)
     assert m and "IC." in m.group(0), "setThemeBtn не использует SVG-набор"
 
 
 def test_editor_state_chip(app):
     # UX-04: редактор различает «активен» / «изменено» / «сохранено»
-    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    html = _ui_all()
     assert 'id="editorState"' in html, "нет чипа состояния редактора"
     m = re.search(r"function setEditorState\(\w*\) \{.*?\n\}", html, re.S)
     assert m, "нет setEditorState()"
@@ -1155,7 +1239,7 @@ def test_editor_state_chip(app):
 
 
 def test_ops_card_renamed_to_system(app):
-    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    html = _ui_all()
     assert "<h2>Система</h2>" in html, "ops-карточка не названа «Система»"
     assert "<h2>Обслуживание</h2>" not in html, "старый заголовок остался"
 
@@ -1166,10 +1250,13 @@ def test_ui_scripts_parse(app, tmp_path):
     node = shutil.which("node")
     if not node:
         pytest.skip("node недоступен — JS-синтаксис не проверить")
-    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
-    blocks = re.findall(r"<script[^>]*>(.*?)</script>", html, re.S)
-    assert blocks, "script-блоки не найдены"
-    for n, block in enumerate(blocks):
+    # ARCH-03: основной JS — внешний app.js; inline в HTML остался только
+    # bootstrap темы — его тоже проверяем
+    sources = [UI_JS.read_text(encoding="utf-8")]
+    html = UI_HTML.read_text(encoding="utf-8")
+    sources.extend(re.findall(r"<script[^>]*>(.*?)</script>", html, re.S))
+    assert sources, "script-блоки не найдены"
+    for n, block in enumerate(sources):
         js = tmp_path / f"ui{n}.js"
         js.write_text(block, encoding="utf-8")
         r = subprocess.run([node, "--check", str(js)], capture_output=True, text=True)
@@ -1183,6 +1270,38 @@ def test_csp_has_no_external_origins(client):
             assert "://" not in src
 
 
+# --- ARCH-03: статика в panel/static с кэшированием (Task 19) -----------------
+
+def test_static_assets_served_with_long_cache(client):
+    for path, ctype in (("/static/app.js", "javascript"),
+                        ("/static/styles.css", "text/css")):
+        r = client.get(path)
+        assert r.status_code == 200, path
+        assert ctype in r.headers.get("Content-Type", ""), (path, r.headers)
+        cc = r.headers.get("Cache-Control", "")
+        assert "max-age=31536000" in cc and "immutable" in cc, (path, cc)
+
+
+def test_static_assets_versioned_in_html(client):
+    html = client.get("/").get_data(as_text=True)
+    m = re.search(r'src="/static/app\.js\?v=([0-9.]+)"', html)
+    assert m, "app.js не подключён версионированно"
+    assert re.search(r'href="/static/styles\.css\?v=[0-9.]+"', html)
+    # bootstrap темы — единственный inline-скрипт (под nonce); второй —
+    # внешний app.js
+    assert html.count("<script nonce=") == 1
+    assert html.count("</script>") == 2
+    assert "<style" not in html
+
+
+def test_csp_allows_same_origin_static(client):
+    csp = client.get("/").headers["Content-Security-Policy"]
+    assert "script-src 'self'" in csp
+    assert "style-src 'self'" in csp
+    # nonce остаётся — только для inline bootstrap-темы
+    assert "script-src 'self' 'nonce-" in csp
+
+
 def test_export_and_logs_are_no_store(client):
     _create(client)
     assert client.get("/api/configs/export").headers.get("Cache-Control") == "no-store"
@@ -1190,26 +1309,26 @@ def test_export_and_logs_are_no_store(client):
 
 
 def test_ui_uses_dialog_not_native_confirm(app):
-    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    html = _ui_all()
     assert "<dialog" in html
     assert "confirm(" not in html  # нативные confirm() убраны в пользу <dialog>
 
 
 def test_ui_log_viewer_has_controls(app):
-    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    html = _ui_all()
     assert 'data-action="logFilter"' in html
     assert 'data-action="logDownload"' in html
     assert 'data-action="logCopy"' in html
 
 
 def test_ui_has_skeleton_and_live_validation(app):
-    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    html = _ui_all()
     assert "skel" in html
     assert 'id="f_upstream"' in html and 'id="upHint"' in html
 
 
 def test_ui_upstream_hint_accepts_credential_urls(app):
-    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    html = _ui_all()
     m = re.search(r"const UP_OK = /(.+)/;", html)
     assert m, "UP_OK не найден в index.html"
     # JS-экранирование \/ совместимо с Python re после раскрытия
@@ -1223,14 +1342,14 @@ def test_ui_upstream_hint_accepts_credential_urls(app):
 
 
 def test_ui_has_single_light_palette_definition(app):
-    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    html = _ui_all()
     assert html.count("--bg:#f4f5f7") == 1
 
 
 def test_ui_editor_closable_by_button_and_esc(app):
     # Редактор закрывается ✕ в заголовке и по Esc; Esc проверяет видимость
     # редактора, а не current — работает и в режиме нового пресета (current === null)
-    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    html = _ui_all()
     for marker in ('data-action="closeEditor"', 'id="btnCloseEditor"',
                    'id="editorTitleText"', 'closeEditor: () => closeEditor(),',
                    "if (isEditorOpen()"):
@@ -2085,7 +2204,7 @@ def test_update_log_tails_and_is_no_store(client, app, env):
 # --- self-update: UI -----------------------------------------------------------------
 
 def test_ui_has_update_controls(app):
-    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    html = _ui_all()
     for marker in ('data-action="updateCheck"', 'data-action="updateNotes"',
                    'id="updDlg"', 'id="notesDlg"',
                    '/api/update/check', '/api/update/apply', '/api/update/log'):
@@ -2093,7 +2212,7 @@ def test_ui_has_update_controls(app):
 
 
 def test_ui_has_log_source_switch_and_panel_tail_in_update_dlg(app):
-    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    html = _ui_all()
     for marker in ('data-action="logSrc"', 'id="btnSrcPanel"', 'id="updPanelLog"',
                    'naivepanel-logsrc', "src='+logSrc"):
         assert marker in html, marker
@@ -2591,7 +2710,7 @@ def test_install_sh_writes_naive_markers(app):
 # --- UI: секция «Бинарник naive» ------------------------------------------------
 
 def test_ui_has_naive_binary_controls(app):
-    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    html = _ui_all()
     for marker in ('data-action="naiveCheck"',
                    'id="nvInfo"', 'id="btnNvCheck"',
                    '/api/naive/check', '/api/naive/update', '/api/naive/status'):
@@ -2601,7 +2720,7 @@ def test_ui_has_naive_binary_controls(app):
 # --- UI: смена пароля администратора -------------------------------------------
 
 def test_ui_has_password_change_controls(app):
-    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    html = _ui_all()
     for marker in ('id="pwDlg"', 'data-action="pwOpen"', 'id="pwCurrent"',
                    'id="pwNew"', 'id="pwRepeat"', 'autocomplete="new-password"',
                    'id="btnPwChange"', 'id="btnPwChange" hidden', 'role="status"',
@@ -2963,7 +3082,7 @@ def test_watchdog_conf_interval_parsed(conf_env):
 # --- UI: E2E и watchdog ---------------------------------------------------------
 
 def test_ui_has_e2e_and_watchdog_controls(app):
-    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    html = _ui_all()
     for marker in ('data-action="e2e"', 'id="btnE2e"', 'id="e2eInfo"',
                    "/api/e2e", "checkProxy", "watchdog"):
         assert marker in html, marker
@@ -3179,7 +3298,7 @@ def test_failover_switch_restarts_service(client, app, monkeypatch, env):
 # --- UI: фейловер ---------------------------------------------------------------
 
 def test_ui_failover_lives_with_presets(app):
-    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    html = _ui_all()
     for marker in ('id="foInfo"', 'id="foEnabled"', 'id="foAuto"',
                    'id="foCount"', 'data-action="foOrder"',
                    'data-action="foAll"', 'data-action="foToggle"',
@@ -3200,7 +3319,7 @@ def test_ui_failover_lives_with_presets(app):
 
 
 def test_ui_checkboxes_do_not_stretch(app):
-    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    html = _ui_all()
     assert 'input[type="checkbox"] { width:auto' in html
 
 
@@ -3262,7 +3381,7 @@ def test_e2e_history_cycle_writes_entries(client, app, monkeypatch):
 
 
 def test_ui_has_e2e_history_sparkline(app):
-    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    html = _ui_all()
     for marker in ('id="e2eSpark"', "/api/e2e/history", "drawSpark", "loadSpark",
                    'class="spark"'):
         assert marker in html, marker
@@ -3938,7 +4057,7 @@ def test_status_reports_notify_channel(conf_env):
 
 
 def test_ui_has_v014_controls(app):
-    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    html = _ui_all()
     for marker in ('id="foAuto"', 'id="ntInfo"', "auto_return",
                    "return_watch", "ждём возврата"):
         assert marker in html, marker
@@ -4045,7 +4164,7 @@ def test_notify_recovered_supersedes_pending_exhausted(app, monkeypatch):
 # --- Настройка Telegram из панели --------------------------------------------
 
 def test_ui_has_telegram_controls(app):
-    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    html = _ui_all()
     for marker in (
             'id="tgForm"', 'id="tgToken"', 'id="tgChat"', 'id="tgMsg"',
             # токен именно замаскирован (type="password" есть и в других полях)
@@ -4990,7 +5109,7 @@ def test_panel_package_security_extraction(app, env, monkeypatch):
                      "_reject_unauthenticated_exposure", "_csrf_protect",
                      "_require_auth"], names
     assert [f.__name__ for f in app.app.after_request_funcs[None]] == \
-        ["_security_headers"]
+        ["_security_headers", "_static_cache_headers"]
     # security читает конфиг через атрибут модуля-владелеца: патч cfg виден
     monkeypatch.setattr(app.cfg, "_bind_is_loopback", lambda: False)
     assert sec._panel_is_exposed_without_auth() is True
@@ -5310,7 +5429,7 @@ def test_connections_status_survives_snapshot_failure(app, env, monkeypatch):
 
 
 def test_connections_ui_rows(app):
-    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    html = _ui_all()
     m = re.search(r"function renderStatus\(st\) \{.*?\n\}", html, re.S)
     assert m, "renderStatus() не найден в index.html"
     body = m.group(0)
@@ -5500,7 +5619,7 @@ def test_pac_fail_closed_when_exposed_without_password(app, client, env):
 
 
 def test_ui_quick_import_and_pac_wiring(app):
-    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    html = _ui_all()
     assert 'id="quickUri"' in html, "нет строки импорта одной строкой"
     assert "data-action=\"quickImport\"" in html
     assert "data-action=\"copyPac\"" in html
@@ -5631,7 +5750,7 @@ def test_uptime_cycle_observes_before_idle(app, monkeypatch):
 
 
 def test_ui_uptime_stats_row(app):
-    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    html = _ui_all()
     m = re.search(r"function renderStatus\(st\) \{.*?\n\}", html, re.S)
     assert m, "renderStatus() не найден"
     body = m.group(0)
@@ -5647,7 +5766,7 @@ def test_ui_overview_system_split(app):
     Длинные значения (пресет, аптайм) идут wide-строкой: в полуколонке 288px
     они обрезались («gw1.aig…», «19ч 28…») — v0.24.2.
     """
-    html = (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    html = _ui_all()
     m = re.search(r"function renderStatus\(st\) \{.*?\n\}", html, re.S)
     assert m, "renderStatus() не найден"
     body = m.group(0)
@@ -5857,7 +5976,7 @@ def test_untar_xz_pipeline_failure_raises(app, monkeypatch, tmp_path):
 # --- UI P0 (2026-11-15): строки профилей, действия, первый запуск, offline ----
 
 def _ui_html() -> str:
-    return (APP_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    return _ui_all()
 
 
 def _ui_fn(html: str, name: str) -> str:

@@ -116,6 +116,8 @@ def test_sha256sums_matches_every_shipped_file():
         "naivepanel.py",
         "templates/index.html",
         *(f"panel/{p.name}" for p in sorted((APP_DIR / "panel").glob("*.py"))),
+        *(f"panel/static/{p.name}"
+          for p in sorted((APP_DIR / "panel" / "static").glob("*"))),
     ]
     assert set(sums) == set(shipped), "SHA256SUMS covers a different file set"
     for name in shipped:

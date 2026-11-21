@@ -248,6 +248,9 @@ UPDATE_RAW_BASE = os.environ.get("NAIVEPANEL_UPDATE_RAW", "https://raw.githubuse
 PANEL_DIR = Path(os.environ.get("NAIVEPANEL_DIR", "/opt/etc/naive/panel"))
 UPDATE_LOG = Path(os.environ.get("NAIVEPANEL_UPDATE_LOG", "/opt/var/log/naivepanel-update.log"))
 UPDATE_STATE = PANEL_DIR / "update.state"
+# Журнал аудита действий (SEC-08): кто и что менял в панели. JSONL, один
+# файл — записи редки (десятки в день), читатель — /api/logs?src=audit.
+PANEL_AUDIT = PANEL_DIR / "audit.jsonl"
 # Файлы, заменяемые обновлением панели — их же восстанавливает откат
 # (бэкап хранит под именем оригинала; S99naivepanel/S99naiveproxy различаются)
 PANEL_UPDATE_FILES = (PANEL_DIR / "naivepanel.py",
@@ -404,7 +407,7 @@ __all__ = [
     "_FAILOVER_RETURN_ALIVE_INVALID", "_FAILOVER_RETURN_COOLDOWN_RAW",
     "FAILOVER_RETURN_COOLDOWN", "_FAILOVER_RETURN_COOLDOWN_INVALID",
     "UPDATE_REPO", "UPDATE_API_BASE", "UPDATE_RAW_BASE",
-    "PANEL_DIR", "UPDATE_LOG", "UPDATE_STATE", "PANEL_UPDATE_FILES",
+    "PANEL_DIR", "UPDATE_LOG", "UPDATE_STATE", "PANEL_AUDIT", "PANEL_UPDATE_FILES",
     "_TAG_RE", "_UPDATE_CHECK_TTL", "_UPDATE_ERR_TTL", "_UPDATE_STALE_S",
     "NAME_RE", "_ALLOWED_PROXY_SCHEMES", "_PUBLIC_GET_PATHS", "RESERVED_NAMES",
     "APP_VERSION",

@@ -37,9 +37,13 @@ from panel import updates as upd
 # Имя "naivepanel" — осознанно: app.logger = тот же логгер, что во
 # всех модулях пакета. template_folder — от каталога панели (panel/
 # app.py смотрит на ../templates), не от root_path по import_name.
+# static — panel/static: JS/CSS отделены от HTML (ARCH-03), чтобы
+# отдавать их с дальним кэшем (?v=APP_VERSION бьёт кэш при обновлении).
 app = Flask("naivepanel",
             template_folder=str(Path(__file__).resolve().parent.parent
-                                  / "templates"))
+                                  / "templates"),
+            static_folder=str(Path(__file__).resolve().parent / "static"),
+            static_url_path="/static")
 # Конфиги крошечные — гигантский PUT иначе ронял бы память роутера
 app.config["MAX_CONTENT_LENGTH"] = 256 * 1024
 
@@ -64,13 +68,27 @@ def _api_json_errors(exc: HTTPException):
 # --- Security: хуки auth/CSRF/CSP (логика — panel/security.py) ----------------
 # Порядок регистрации воспроизводит исходный: nonce раньше Host-allowlist
 # (nonce нужен и на 403-ответах), host/fail-closed/CSRF раньше auth.
+def _inject_app_version() -> dict[str, str]:
+    """Версия для версионирования статики (?v= бьёт кэш при self-update)."""
+    return {"app_version": cfg.APP_VERSION}
+
+
 app.after_request(sec._security_headers)
 app.before_request(sec._make_csp_nonce)
 app.context_processor(sec._inject_csp_nonce)
+app.context_processor(_inject_app_version)
 app.before_request(sec._enforce_host_allowlist)
 app.before_request(sec._reject_unauthenticated_exposure)
 app.before_request(sec._csrf_protect)
 app.before_request(sec._require_auth)
+
+
+@app.after_request
+def _static_cache_headers(resp: Response) -> Response:
+    """Статика не меняется внутри версии — кэш на год, бusting через ?v=."""
+    if request.path.startswith("/static/"):
+        resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+    return resp
 
 
 # --- Routes ---------------------------------------------------------------
@@ -160,6 +178,8 @@ def api_notify_telegram_save():
         mon._bot_cache.pop(cfgd["token"], None)
     bot = mon._tg_bot_name(token or cfgd["token"])
     app.logger.info("notify: telegram configured by %s", request.remote_addr)
+    sec._audit("notify.telegram", enabled=bool(token or cfgd["token"]),
+               chat=chat)
     return jsonify({"ok": True, "channel": mon._notify_channel(),
                     "telegram": {"configured": True, "chat_id": chat,
                                  "bot": bot},
@@ -197,6 +217,7 @@ def api_notify_telegram_delete():
         except OSError:
             pass
     app.logger.info("notify: telegram disabled by %s", request.remote_addr)
+    sec._audit("notify.telegram", enabled=False)
     return jsonify({"ok": True, "channel": mon._notify_channel(),
                     "warning": warning})
 
@@ -222,6 +243,7 @@ def api_notify_test():
                            detail=True)
     if not ok:
         abort(502, description=f"delivery failed: {err}")
+    sec._audit("notify.test")
     return jsonify({"ok": True})
 
 
@@ -273,6 +295,7 @@ def api_configs_create():
         abort(409, description=f"preset {name!r} already exists")
     cfg._ensure_dirs()
     pres._save_json(path, cfgd)
+    sec._audit("preset.create", name=name)
     return jsonify({"name": name, "saved": True}), 201
 
 
@@ -293,6 +316,7 @@ def api_configs_update(name: str):
         # Активный пресет = работающий конфиг: применяем сразу, как activate,
         # иначе «Сохранено» врало бы — файл обновлён, а naive работает старым.
         restart = mon._apply_active(name, cfgd)
+    sec._audit("preset.update", name=name)
     return jsonify({"name": name, "updated": True, "restart": restart})
 
 
@@ -327,12 +351,15 @@ def api_configs_delete(name: str):
                     app.logger.warning(
                         "failover cleanup after deleting %s failed: %s",
                         name, exc)
+    sec._audit("preset.delete", name=name)
     return jsonify({"name": name, "deleted": True})
 
 
 @app.route("/api/configs/<name>/activate", methods=["POST"])
 def api_configs_activate(name: str):
-    return jsonify(mon._activate_preset(name))
+    result = mon._activate_preset(name)
+    sec._audit("preset.activate", name=name)
+    return jsonify(result)
 
 
 @app.route("/api/configs/<name>/duplicate", methods=["POST"])
@@ -359,6 +386,7 @@ def api_configs_duplicate(name: str):
         candidate = f"{base}{n}"
         n += 1
     pres._save_json(cfg.CONF_D / f"{candidate}.json", cfgd)
+    sec._audit("preset.duplicate", name=candidate, copied_from=name)
     return jsonify({"name": candidate, "copied_from": name}), 201
 
 
@@ -393,6 +421,7 @@ def api_configs_export():
     })
     resp.headers["Content-Disposition"] = 'attachment; filename="naivepanel-presets.json"'
     resp.headers["Cache-Control"] = "no-store"  # ответ содержит секреты
+    sec._audit("presets.export")
     return resp
 
 
@@ -499,6 +528,8 @@ def api_configs_import():
                             fo_res = {"applied": True, "reason": None}
     if imported:
         app.logger.info("import: created %s", ", ".join(imported))
+    sec._audit("presets.import", imported=len(imported),
+               skipped=len(skipped))
     return jsonify({"imported": imported, "skipped": skipped,
                     "failover": fo_res})
 
@@ -535,7 +566,9 @@ def api_service(action: str):
     if action not in {"start", "stop", "restart"}:
         abort(400, description="action must be start|stop|restart")
     with mon._SERVICE_LOCK:
-        return jsonify(svc._service(action))
+        result = svc._service(action)
+    sec._audit(f"service.{action}", rc=result.get("rc"))
+    return jsonify(result)
 
 
 @app.route("/api/e2e", methods=["POST"])
@@ -647,6 +680,8 @@ def api_failover_put():
         cfg._ensure_dirs()
         pres._save_json(cfg.FAILOVER_CONF, {"enabled": enabled, "chain": chain_raw,
                                    "auto_return": auto_return})
+    sec._audit("failover.update", enabled=enabled,
+               chain=",".join(chain_raw) or "-", auto_return=auto_return)
     return jsonify(mon._failover.snapshot())
 
 
@@ -659,6 +694,7 @@ def api_failover_delete():
             pass
         except OSError as exc:
             abort(500, description=f"cannot remove failover.json: {exc}")
+    sec._audit("failover.delete")
     return jsonify(mon._failover.snapshot())
 
 
@@ -685,6 +721,7 @@ def api_panel_restart():
         start_new_session=True,
     )
     app.logger.warning("panel self-restart triggered by %s", request.remote_addr)
+    sec._audit("panel.restart")
     return jsonify({"restart": True, "note": "panel restarting in ~1s"}), 202
 
 
@@ -715,6 +752,7 @@ def api_password():
     sec._write_admin_pass(user, new)
     app.logger.info("password changed: user=%r addr=%s", user,
                     request.remote_addr)
+    sec._audit("password.change", user=user)
     return jsonify({"ok": True})
 
 
@@ -854,6 +892,7 @@ def api_update_apply():
         upd._update_state_write({"phase": "running", "target": tag,
                              "started": time.time(), "pid": proc.pid})
     app.logger.warning("self-update to %s triggered by %s", tag, request.remote_addr)
+    sec._audit("update.apply", target=tag)
     return jsonify({"started": True, "target": tag, "current": cfg.APP_VERSION,
                     "log": str(cfg.UPDATE_LOG)}), 202
 
@@ -972,6 +1011,7 @@ def api_naive_update():
             abort(500, description=f"cannot start update worker: {exc}")
     app.logger.warning("naive binary update to %s triggered by %s",
                        tag, request.remote_addr)
+    sec._audit("naive.update", target=tag)
     return jsonify({"started": True, "target": tag, "log": str(cfg.NAIVE_UPDATE_LOG)}), 202
 
 
@@ -1037,6 +1077,7 @@ def api_rollback_post():
             if st.get("phase") == "running" and not st.get("stale"):
                 abort(409, description=f"naive update to {st.get('target')} already "
                                        f"in progress — log: {cfg.NAIVE_UPDATE_LOG}")
+            sec._audit("rollback.binary")
             return upd._rollback_binary()
     version = str(body.get("panel") or "")
     if not cfg._TAG_RE.match(version):
@@ -1079,6 +1120,20 @@ def api_rollback_post():
                     shutil.copy2(src, tmp)
                     os.replace(tmp, dst)
                     restored.append("panel/" + src.name)
+                # статика UI (ARCH-03) — тот же точечный возврат, иначе
+                # откат оставил бы новый JS/CSS под старым HTML
+                static_backup = pkg_backup / "static"
+                if static_backup.is_dir():
+                    (cfg.PANEL_DIR / "panel" / "static").mkdir(
+                        parents=True, exist_ok=True)
+                    for src in static_backup.glob("*"):
+                        if not src.is_file():
+                            continue
+                        dst = cfg.PANEL_DIR / "panel" / "static" / src.name
+                        tmp = dst.with_name(dst.name + ".restore")
+                        shutil.copy2(src, tmp)
+                        os.replace(tmp, dst)
+                        restored.append("panel/static/" + src.name)
             if "naivepanel.py" not in restored:  # проверено выше, но после копий — надёжнее
                 abort(500, description="restore produced no naivepanel.py")
             cfg.UPDATE_LOG.parent.mkdir(parents=True, exist_ok=True)
@@ -1111,6 +1166,7 @@ def api_rollback_post():
                              "rollback": True})
     app.logger.warning("rollback to %s triggered by %s", version,
                        request.remote_addr)
+    sec._audit("rollback.panel", target=version)
     return jsonify({"started": True, "target": version,
                     "current": cfg.APP_VERSION, "restored": restored,
                     "log": str(cfg.UPDATE_LOG)}), 202
@@ -1133,6 +1189,7 @@ def api_rollback_delete(version: str):
     left = [v["version"] for v in upd._rollback_panel_versions()]
     app.logger.info("backup %s removed by %s, left: %s", version,
                     request.remote_addr, ", ".join(left) or "none")
+    sec._audit("rollback.delete", version=version)
     return jsonify({"deleted": version, "left": left})
 
 
@@ -1158,12 +1215,14 @@ def api_rollback_cleanup():
     if removed:
         app.logger.info("backups removed by %s: %s", request.remote_addr,
                         ", ".join(removed))
+    sec._audit("rollback.cleanup", removed=len(removed))
     return jsonify({"removed": removed,
                     "left": [v["version"] for v in upd._rollback_panel_versions()]})
 
 
-# Лог какого хвоста показывать: по умолчанию — naive, src=panel — сама панель
-LOG_SOURCES: dict[str, Path] = {"proxy": cfg.LOG_FILE, "panel": cfg.PANEL_LOG}
+# Лог какого хвоста показывать: naive / панель / журнал аудита (SEC-08)
+LOG_SOURCES: dict[str, Path] = {"proxy": cfg.LOG_FILE, "panel": cfg.PANEL_LOG,
+                                "audit": cfg.PANEL_AUDIT}
 
 
 @app.route("/api/logs")

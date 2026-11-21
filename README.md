@@ -691,12 +691,14 @@ ln -sf /opt/naiveproxy/bin/naiveproxy /opt/bin/naive
 ```bash
 # 1. Копируем файлы (через sshfs, scp или WebUI Keenetic)
 ssh root@router
-mkdir -p /opt/etc/naive/panel/templates
+mkdir -p /opt/etc/naive/panel/templates /opt/etc/naive/panel/panel/static
 mkdir -p /opt/etc/naive/proxy/conf.d
 
-# Положить naivepanel.py + templates/index.html (нужен для render_template)
+# Положить naivepanel.py + templates/index.html + пакет panel/ (модули +
+# статика app.js/styles.css — без них UI не загрузится)
 scp naivepanel.py root@router:/opt/etc/naive/panel/
 scp -r templates  root@router:/opt/etc/naive/panel/
+scp -r panel      root@router:/opt/etc/naive/panel/
 scp S99naivepanel   root@router:/opt/etc/init.d/
 scp S99naiveproxy   root@router:/opt/etc/init.d/    # если у тебя ещё нет
 ssh root@router "chmod +x /opt/etc/init.d/S99naiveproxy /opt/etc/init.d/S99naivepanel"
@@ -835,6 +837,13 @@ NaivePanel собирает минимальный JSON, совместимый 
   торчать в сети). Loopback без пароля остаётся законным режимом локальной
   разработки.
 - `config.json`, `.active`, `*.json` в `conf.d/`, `panel.conf` — `chmod 0600`.
+- **Подпись релизов (с v0.27.0, SEC-07):** install.sh перед установкой
+  верифицирует Ed25519-подпись `SHA256SUMS` (minisign-формат, верификатор —
+  python3 stdlib-only, встроен в сам install.sh). Публичный ключ зашит в
+  install.sh как trust anchor, приватный ключ maintainer'а живёт офлайн
+  (`tools/release_sign.py`): компрометация репозитория больше не позволяет
+  подменить файлы и суммы молча. Отсутствие/битая подпись — отказ установки
+  и self-update. См. «Разработка» — как подписать релиз.
 - **Дорогие операции ограничены** (с v0.18.0): probe/E2E/update-check — не
   больше 4 одновременно, сверх — немедленный `429` без ожидания (залп не
   исчерпывает worker-потоки waitress); параллельные update-check
@@ -958,8 +967,24 @@ E2E на настоящем Entware (нужен Docker):
 `SHA256SUMS` должен соответствовать рабочей копии — иначе `sha256sum -c` упадёт:
 
 ```bash
-shasum -a 256 S99naivepanel S99naiveproxy naivepanel.py templates/index.html > SHA256SUMS
+{ shasum -a 256 S99naivepanel S99naiveproxy naivepanel.py templates/index.html
+  shasum -a 256 panel/*.py panel/static/app.js panel/static/styles.css; } > SHA256SUMS
 ```
+
+Подпись релиза (SEC-07): после изменения файлов релиза пересоздать суммы и
+подписать их приватным ключом (minisign-формат; ключ генерируется один раз и
+хранится офлайн, в репозиторий не коммитится — `naivepanel-release.sec` в
+`.gitignore`):
+
+```bash
+python3 tools/release_sign.py keygen --secret naivepanel-release.sec   # один раз
+python3 tools/release_sign.py sign --secret naivepanel-release.sec --data SHA256SUMS
+python3 tools/release_sign.py verify-repo                              # контрольная проверка
+```
+
+Публичный ключ (`keyid` + `pub` из вывода keygen) зашит в install.sh
+(`NP_SIGN_KEYID` / `NP_SIGN_PUBKEY`) — при смене ключа обновить обе константы
+и подписать релиз новым ключом.
 
 Smoke-тест после каждого изменения в `naivepanel.py`:
 

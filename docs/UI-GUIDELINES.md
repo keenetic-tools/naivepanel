@@ -5,6 +5,13 @@
 bundl'ера и фреймворков; vanilla CSS/JS; system font stack; nonce-CSP
 (никаких inline-обработчиков и внешних origin'ов).
 
+**Структура файлов (ARCH-03):** разметка — `templates/index.html`, стили —
+`panel/static/styles.css`, скрипты — `panel/static/app.js` (подключаются
+версионированно, `?v=APP_VERSION`, кэш на год). Inline в HTML остался
+только bootstrap темы (до первой отрисовки, под nonce). Новые стили — в
+`styles.css` по токенам ниже, новый JS — в `app.js`; единственный inline-
+script в HTML менять нельзя без синхронной правки CSP-теста.
+
 ## Информационная архитектура
 
 Четыре смысловые группы (аудит UX-04). Физически UI остаётся 2–3-колоночным

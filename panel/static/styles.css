@@ -1,0 +1,363 @@
+  /* Тёмная тема — базовая, светлая — единственный набор ниже:
+     data-theme всегда выставляется bootstrap-скриптом (localStorage или система). */
+  :root { color-scheme:dark;
+    --bg:#0f1115; --fg:#e6e6e6; --mut:#9aa; --acc:#5dd2a4; --err:#ff7070; --warn:#e0b657;
+    --btn-fg:#0f1115; --card:#181b22; --border:#2a2f38; --border-sel:#57606e;
+    --sel-bg:rgba(255,255,255,.04); --hov:rgba(255,255,255,.07);
+    --acc-tint:rgba(93,210,164,.07); --badge-bg:rgba(93,210,164,.18); --mut-tint:rgba(154,170,170,.18);
+    --err-tint:rgba(255,112,112,.09);
+    --badge-mut:#aab3bf;
+    --input-bg:#0f1115; --log-bg:#000; --log-fg:#bfe;
+    --bg-glow:rgba(93,210,164,.045); --bg-glow2:rgba(97,140,255,.035);
+    --hdr-bg:rgba(15,17,21,.96); --hdr-blur:rgba(15,17,21,.78);
+    --dot-halo:rgba(93,210,164,.16);
+    /* elevation: тени в тёмной теме едва заметны — держат форму карточек */
+    --shadow-1:0 1px 2px rgba(0,0,0,.25);
+    --shadow-2:0 2px 6px rgba(0,0,0,.35), 0 10px 28px rgba(0,0,0,.30); }
+  :root[data-theme="light"] { color-scheme:light;
+    /* --acc #0b7a53: 5.35:1 на белом (WCAG AA для normal text; прежний
+       #0e8a5f давал 4.36:1 — не проходил на бейджах/ссылках/галочках) */
+    --bg:#f4f5f7; --fg:#1c2128; --mut:#69707a; --acc:#0b7a53; --err:#c43e3e; --warn:#8a6a1d;
+    --btn-fg:#ffffff; --card:#ffffff; --border:#d6dae0; --border-sel:#9aa3ad;
+    --sel-bg:rgba(0,0,0,.04); --hov:rgba(0,0,0,.06);
+    --acc-tint:rgba(11,122,83,.04); --badge-bg:#e8f5ef; --mut-tint:#eef0f2;
+    --err-tint:rgba(196,62,62,.07);
+    --badge-mut:#4f5762;
+    --input-bg:#ffffff; --log-bg:#fbfcfd; --log-fg:#24292f;
+    --bg-glow:rgba(11,122,83,.05); --bg-glow2:rgba(58,106,255,.05);
+    --hdr-bg:#ffffff; --hdr-blur:rgba(255,255,255,.72);
+    --dot-halo:rgba(11,122,83,.15);
+    --shadow-1:0 1px 2px rgba(24,33,40,.06);
+    --shadow-2:0 2px 6px rgba(24,33,40,.07), 0 10px 28px rgba(24,33,40,.10); }
+  /* Semantic tokens (docs/UI-GUIDELINES.md): новые правила — только токены;
+     существующие переводятся по мере правки. Тематические цвета через
+     var-ссылки разрешаются на момент использования — темам переопределять
+     их не нужно. */
+  :root {
+    --sp-1:4px; --sp-2:8px; --sp-3:12px; --sp-4:16px; --sp-5:20px; --sp-6:24px;
+    --fs-11:11px; --fs-12:12px; --fs-13:13px; --fs-14:14px; --fs-16:16px;
+    --font-mono:ui-monospace,Menlo,monospace;
+    --r-s:8px; --r-m:10px; --r-l:12px;
+    --z-header:5; --z-nav:6; --z-banner:9; --z-toast:10;
+    --conn-banner-h:66px; --hdr-h:53px; --nav-h:0px;
+    --focus-ring:2px solid var(--acc);
+    --status-ok:var(--acc); --status-err:var(--err); --status-warn:var(--warn);
+  }
+  * { box-sizing:border-box; }
+  /* Авторские display-правила (например .spark) сильнее UA-правила [hidden];
+     атрибут обязан скрывать элемент всегда, пока его не снимут из JS. */
+  [hidden] { display:none !important; }
+  /* Фон на html красит канву напрямую, включая зону overscroll («резинку»).
+     Распространение фона body на канву Safari ломает на композитных слоях
+     (backdrop-filter шапки, fixed body::before) — внизу мигала полоса цвета
+     системной темы. */
+  html { background:var(--bg); }
+  body { margin:0; font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;
+         background:var(--bg); color:var(--fg); }
+  /* Тонкий статичный градиент: один раз рисуется композитором, не анимируется */
+  body::before { content:""; position:fixed; inset:0; z-index:-1; pointer-events:none;
+    background:
+      radial-gradient(1100px 480px at 18% -12%, var(--bg-glow), transparent 70%),
+      radial-gradient(900px 420px at 108% 8%, var(--bg-glow2), transparent 65%); }
+  header { position:sticky; top:0; z-index:var(--z-header); padding:14px var(--sp-5); display:flex; gap:12px; align-items:center;
+           border-bottom:1px solid var(--border); background:var(--hdr-bg); }
+  @supports (backdrop-filter:blur(8px)) or (-webkit-backdrop-filter:blur(8px)) {
+    header { background:var(--hdr-blur); backdrop-filter:blur(8px); -webkit-backdrop-filter:blur(8px); }
+  }
+  header h1 { font-size:16px; margin:0; letter-spacing:-.01em; display:flex; align-items:center; gap:10px; }
+  .logo { width:24px; height:24px; border-radius:7px; flex:none;
+          background:linear-gradient(135deg, var(--acc), #4a8cf7);
+          display:inline-flex; align-items:center; justify-content:center;
+          color:#fff; font-weight:800; font-size:13px; box-shadow:var(--shadow-1); }
+  #status { color:var(--mut); margin-left:auto; min-width:0; max-width:52%;
+            overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+            font-variant-numeric:tabular-nums; }
+  .on { color:var(--acc); } .off { color:var(--err); }
+  /* Живая точка статуса: пульс только на transform/opacity, один элемент.
+     prefers-reduced-motion — без анимации (доступность). */
+  .dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:5px;
+         vertical-align:1px; box-shadow:0 0 0 3px var(--dot-halo); }
+  .dot.on { background:var(--acc); color:var(--acc); }
+  .dot.off { background:var(--err); }
+  @media (prefers-reduced-motion: no-preference) {
+    .dot.on { animation:pulse 2.4s ease-in-out infinite; }
+  }
+  @keyframes pulse {
+    0%, 100% { transform:scale(1); opacity:1; }
+    50% { transform:scale(1.35); opacity:.55; }
+  }
+  main { display:grid; grid-template-columns: 288px minmax(0,1fr) 320px;
+         grid-template-areas: "aside main ops"; gap:var(--sp-5);
+         padding:var(--sp-5) max(var(--sp-5), calc((100% - 1340px)/2)); }
+  /* средние экраны: как раньше 2 колонки, «Обслуживание» — под левой.
+     minmax(0,·): 1fr-трек иначе берёт min-content строки пресета и рвёт
+     вьюпорт (grid blowout) */
+  @media (max-width:1239px) and (min-width:801px) {
+    main { grid-template-columns: 288px minmax(0,1fr); grid-template-areas: "aside main" "ops main"; }
+  }
+  @media (max-width:800px) { /* телефон: одна колонка, сверху главное */
+    main { grid-template-columns: minmax(0,1fr); grid-template-areas: "aside" "main" "ops"; padding:14px; }
+  }
+  .card { background:var(--card); border:1px solid var(--border); border-radius:var(--r-l);
+          padding:var(--sp-4); box-shadow:var(--shadow-1); }
+  .card h2 { margin:0 0 12px; font-size:12px; font-weight:600; text-transform:uppercase;
+             letter-spacing:.09em; color:var(--mut); display:flex; align-items:center; gap:8px; }
+  .card h2::after { content:""; flex:1; height:1px; background:var(--border); opacity:.6; }
+  h2.sect { margin-top:24px; padding-top:18px; border-top:1px solid var(--border); }
+  h2.sect::after { display:none; }
+  /* ✕ закрытия редактора: order=2 ставит его за разделительной линией заголовка */
+  #editorTitle .close { order:2; flex:none; background:none; border:none; box-shadow:none;
+                        color:var(--mut); font-size:13px; font-weight:400; padding:2px 7px;
+                        border-radius:6px; cursor:pointer; }
+  #editorTitle .close:hover { background:var(--hov); color:var(--fg); filter:none; box-shadow:none; }
+  .svcinfo { display:grid; grid-template-columns:1fr 1fr; gap:2px 14px; margin-bottom:14px; font-size:13px; }
+  .svcinfo .kv { display:flex; justify-content:space-between; gap:10px; min-width:0;
+                 padding:2px 6px; margin:0 -6px; border-radius:6px; }
+  /* длинные значения (имя пресета, аптайм с доступностью) — во всю ширину;
+     значение переносится, а не обрезается многоточием */
+  .svcinfo .kv.wide { grid-column:1 / -1; }
+  .svcinfo .kv.wide b { white-space:normal; text-align:right; }
+  .spark { display:flex; flex-direction:column; gap:3px; margin-bottom:14px; }
+  .spark svg { display:block; width:100%; height:16px; border-radius:3px; overflow:hidden; }
+  .spark .cap { font-size:11px; color:var(--mut); white-space:nowrap;
+                overflow:hidden; text-overflow:ellipsis; }
+  .svcinfo .kv span { color:var(--mut); white-space:nowrap; }
+  .svcinfo .kv b { font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+                   font-variant-numeric:tabular-nums; }
+  ul.presets { list-style:none; padding:0; margin:0; }
+  #search { margin-bottom:10px; }
+  /* Строка пресета — две строки: имя+статус сверху, host/роли снизу;
+     действия спрятаны в одно меню ⋯, а не столбиком иконок. */
+  ul.presets li { border:1px solid var(--border); border-radius:var(--r-m); margin-bottom:6px;
+                  display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:center;
+                  background:var(--input-bg); min-width:0;
+                  transition:border-color .14s ease, transform .14s ease, box-shadow .14s ease; }
+  ul.presets li:hover { border-color:var(--acc); transform:translateY(-1px); box-shadow:var(--shadow-1); }
+  ul.presets li.selected { border-color:var(--border-sel); background:var(--sel-bg); }
+  /* active (запущенный) важнее selected — его зелёная рамка переопределяет */
+  ul.presets li.active { border-color:var(--acc); background:var(--acc-tint); }
+  ul.presets .sel { display:flex; flex-direction:column; align-items:flex-start; gap:2px;
+                    min-width:0; padding:9px 6px 9px 12px; background:none; border:none;
+                    color:inherit; font:inherit; text-align:left; cursor:pointer;
+                    border-radius:9px; width:100%; box-shadow:none; }
+  ul.presets .sel:hover { background:var(--hov); filter:none; box-shadow:none; }
+  ul.presets .ptop { display:flex; align-items:center; gap:6px; min-width:0; width:100%; }
+  ul.presets .name { font-weight:600; min-width:0; flex:0 1 auto;
+                     overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  ul.presets .pmeta { display:flex; align-items:center; gap:6px; min-width:0; width:100%;
+                      color:var(--mut); font-size:12px; }
+  ul.presets .proxy { min-width:0; flex:1 1 auto; overflow:hidden;
+                      text-overflow:ellipsis; white-space:nowrap; }
+  ul.presets .pbadges { display:flex; align-items:center; gap:4px; flex:none; margin-left:auto; }
+  ul.presets .badge { font-size:11px; font-weight:600; padding:2px 7px; border-radius:999px;
+                      background:var(--badge-bg); color:var(--acc); white-space:nowrap; }
+  ul.presets .badge.listen { background:var(--mut-tint); color:var(--badge-mut); }
+  ul.presets .kebab { width:36px; height:36px; padding:0; margin-right:4px;
+                      display:inline-flex; align-items:center; justify-content:center;
+                      background:none; border:none; border-radius:8px; color:var(--mut);
+                      box-shadow:none; cursor:pointer; }
+  ul.presets .kebab:hover { background:var(--hov); color:var(--fg); filter:none; }
+  ul.presets .empty { display:flex; flex-direction:column; align-items:center; gap:6px;
+                      text-align:center; padding:26px 12px; border-style:dashed; }
+  ul.presets li.empty:hover { border-color:var(--border); transform:none; box-shadow:none; }
+  ul.presets .empty .ic { width:22px; height:22px; opacity:.55; }
+  ul.presets .empty b { font-weight:600; color:var(--fg); }
+  ul.presets .empty .hint { display:block; font-size:12px; opacity:.85; margin:0; }
+  ul.presets .empty button { margin-top:6px; }
+  .skel { list-style:none; height:38px; border-radius:10px; margin-bottom:6px;
+          border:1px solid var(--border); background:var(--sel-bg); }
+  @media (prefers-reduced-motion: no-preference) {
+    .skel { animation:skel 1.4s ease-in-out infinite; }
+    @keyframes skel { 0%,100% { opacity:.55; } 50% { opacity:1; } }
+  }
+  .hint-bad { color:var(--err); font-size:11px; margin-top:4px; display:none; }
+  .hint-bad.show { display:block; }
+  button { background:var(--acc); color:var(--btn-fg); border:none; border-radius:var(--r-s); padding:7px 13px;
+           cursor:pointer; font-weight:600; box-shadow:var(--shadow-1);
+           transition:filter .12s ease, transform .08s ease, box-shadow .14s ease; }
+  button:hover:not(:disabled) { filter:brightness(1.1); box-shadow:var(--shadow-2); }
+  button:active:not(:disabled) { transform:scale(.97); box-shadow:var(--shadow-1); }
+  button.ghost, a.btn { background:transparent; color:var(--fg); border:1px solid var(--border); box-shadow:none; }
+  /* Включённое состояние ghost-переключателей (aria-pressed=true):
+     button.ghost по специфичности перебивает голый .on, поэтому здесь */
+  button.ghost[aria-pressed="true"] { color:var(--acc); border-color:var(--acc); }
+  button.ghost:hover:not(:disabled) { border-color:var(--acc); filter:none; background:var(--hov); box-shadow:none; }
+  button.danger { background:var(--err); color:var(--btn-fg); }
+  /* Серьёзные, но обратимые действия (диалоги отката, смена пароля —
+     открывашка покрашена в тон своему «Сменить»): контурный danger на
+     уровне ghost — сплошная заливка для необратимых и «Стоп».
+     Специфичность (0,4,1) перебивает и button.danger, и hover-правила ghost */
+  button.ghost.danger { background:transparent; color:var(--err); border-color:var(--err); }
+  button.ghost.danger:hover:not(:disabled) { filter:none; box-shadow:none;
+                                             border-color:var(--err); background:var(--err-tint); }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  .iconbtn { padding:4px 9px; border-radius:var(--r-s); }
+  /* inline-SVG icon set (UX-06, docs/UI-GUIDELINES.md): stroke наследует
+     цвет контрола; доступное имя даёт сам контрол, svg — aria-hidden */
+  .ic { width:14px; height:14px; vertical-align:-2px; pointer-events:none; }
+  a.btn { display:inline-block; padding:7px 13px; border-radius:8px; text-decoration:none;
+          font:inherit; font-weight:600; }
+  a.btn:hover { border-color:var(--acc); background:var(--hov); }
+  button:focus-visible, input:focus-visible, textarea:focus-visible, summary:focus-visible,
+  a:focus-visible, pre.log:focus-visible {
+    outline:var(--focus-ring); outline-offset:1px; }
+  label { display:block; font-size:12px; color:var(--mut); margin-top:12px; }
+  input,textarea { width:100%; padding:var(--sp-2) 11px; background:var(--input-bg); color:var(--fg);
+                   border:1px solid var(--border); border-radius:var(--r-s); font:var(--fs-13)/1.5 var(--font-mono);
+                   transition:border-color .14s ease, box-shadow .14s ease; }
+  /* checkbox не должен наследовать width:100% — иначе подпись уезжает вправо */
+  input[type="checkbox"] { width:auto; padding:0; margin:0; accent-color:var(--acc); }
+  input:hover, textarea:hover { border-color:var(--border-sel); }
+  input:focus, textarea:focus { border-color:var(--acc); box-shadow:0 0 0 3px var(--dot-halo); outline:none; }
+  textarea { min-height:120px; resize:vertical; }
+  .apply-hint { margin-top:12px; color:var(--warn); font-size:12px; }
+  /* Кнопочные группы карточек — той же ровной сеткой, что и «Обзор»
+     (v0.24.3): пара делит строку поровну, нечётный хвост — во всю ширину
+     (Импорт, Удалить, Отключить, Что нового, одиночки вроде Перезапуска).
+     nth-child считает и [hidden]-детей: у «Проверить» со спрятанной парой
+     остаётся полуширина + пустая клетка — фиксированная геометрия вместо
+     рваного flex-wrap. Диалоги и строки «поле + кнопка» — не сетка. */
+  .actions { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:14px; }
+  .actions > :last-child:nth-child(odd) { grid-column:1 / -1; }
+  /* Поток обновлений — одна морфящая кнопка: без обновления «Проверить
+     обновления» — единственная видимая, во всю ширину («solo»); когда
+     обновление есть, она становится акцентной «Обновить до vX.Y.Z» и у
+     панели делит строку с «Что нового». Класс ставит JS: у панели
+     «Что нового» — скрытый sibling, nth-child его считает, odd-tail
+     правило resting-состояние не накроет */
+  .actions > .solo { grid-column:1 / -1; }
+  /* Сервисные кнопки «Обзора» — ровная сетка вместо рваного flex-wrap:
+     пара Стоп/Рестарт делит строку поровну, Запуск и утилиты — во всю
+     ширину карточки. Проверить прокси — последняя строка, сразу над
+     #e2eInfo (кнопка рядом с её результатом). Запуск при остановленном
+     сервисе — единственная кнопка строки (hidden-кнопки grid не занимает) */
+  .svcbtns { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:14px; }
+  .svcbtns > #btnStart, .svcbtns > #btnE2e, .svcbtns > #btnPac { grid-column:1 / -1; }
+  pre.log { background:var(--log-bg); color:var(--log-fg); padding:var(--sp-3); border:1px solid var(--border);
+            border-radius:var(--r-m); box-shadow:inset 0 1px 4px rgba(0,0,0,.12);
+            max-height:260px; overflow:auto; font:12px/1.55 ui-monospace,Menlo,monospace;
+            white-space:pre-wrap; font-variant-numeric:tabular-nums; }
+  pre.log .lvl-err { color:var(--err); }
+  pre.log .lvl-warn { color:var(--warn); }
+  #toasts { position:fixed; right:var(--sp-4); bottom:var(--sp-4); display:flex; flex-direction:column; gap:var(--sp-2);
+            z-index:var(--z-toast); max-width:min(420px, calc(100vw - 32px)); }
+  .toast { padding:10px 13px; border-radius:var(--r-m); font-size:var(--fs-13); cursor:pointer; white-space:pre-line;
+           background:var(--card); border:1px solid var(--border); box-shadow:var(--shadow-2);
+           animation:toast-in .18s ease; }
+  @keyframes toast-in { from { opacity:0; transform:translateY(6px); } to { opacity:1; transform:none; } }
+  .toast.ok { border-color:var(--acc); color:var(--acc); }
+  .toast.err { border-color:var(--err); color:var(--err); }
+  /* мини-крест закрытия тоста: закрывается и с клавиатуры (UX-03) */
+  .toast-x { background:none; border:none; color:inherit; opacity:.6; cursor:pointer;
+             padding:0 2px; margin-left:8px; font-size:12px; font-weight:400;
+             box-shadow:none; }
+  .toast-x:hover { opacity:1; filter:none; box-shadow:none; background:none; }
+  /* Offline-баннер: фиксированная полоса над тостами. body.has-conn-banner
+     поднимает тосты и добавляет отступ, чтобы баннер не накрывал контент. */
+  #connBanner { position:fixed; left:var(--sp-4); right:var(--sp-4); bottom:var(--sp-4);
+                z-index:var(--z-banner); display:flex; align-items:center; gap:var(--sp-2);
+                padding:10px var(--sp-3); border:1px solid var(--err); border-radius:var(--r-m);
+                background:var(--card); box-shadow:var(--shadow-2); font-size:var(--fs-13); }
+  #connBanner .dot { margin-right:0; flex:none; }
+  #connBanner button { margin-left:auto; }
+  body.has-conn-banner { padding-bottom:calc(var(--conn-banner-h, 66px) + 32px); }
+  body.has-conn-banner #toasts { bottom:calc(var(--conn-banner-h, 66px) + 40px); }
+  @media (max-width:800px) {
+    #connBanner { left:12px; right:12px; bottom:calc(12px + env(safe-area-inset-bottom)); }
+  }
+  dialog { border:1px solid var(--border); border-radius:var(--r-l); background:var(--card);
+           color:var(--fg); padding:18px; max-width:min(420px, calc(100vw - 32px));
+           box-shadow:var(--shadow-2); }
+  dialog::backdrop { background:rgba(0,0,0,.45); }
+  #confirmMsg { margin:0; white-space:pre-line; }
+  .dlgtitle { margin:0; font-weight:600; }
+  .dlgsub { margin:4px 0 0; font-size:12px; color:var(--mut); }
+  .pmenu { display:flex; flex-direction:column; gap:8px; margin-top:14px; }
+  .pmenu button { width:100%; text-align:left; }
+  .dlg-actions { display:flex; gap:8px; justify-content:flex-end; margin-top:16px; }
+  .order-list { list-style:none; margin:12px 0 0; padding:0; display:flex;
+                flex-direction:column; gap:6px; max-height:320px; overflow:auto; }
+  .order-item { display:grid; grid-template-columns:20px minmax(0,1fr) 44px 44px;
+                align-items:center; gap:6px; padding:4px 0;
+                border-bottom:1px solid var(--border); }
+  .order-item .onum { color:var(--mut); font-size:12px; text-align:right; }
+  .order-item .oname { min-width:0; overflow:hidden; text-overflow:ellipsis;
+                       white-space:nowrap; }
+  .order-list .empty { list-style:none; text-align:center; color:var(--mut);
+                       font-size:12px; padding:12px; }
+  /* Строка версии в диалоге отката */
+  .rbrow { display:flex; align-items:center; gap:8px; padding:5px 6px;
+           border-radius:8px; cursor:pointer; }
+  .rbrow:hover { background:var(--hov); }
+  .rbrow .rbname { font-variant-numeric:tabular-nums; white-space:nowrap; }
+  .rbrow .rbmeta { color:var(--mut); font-size:12px; margin-left:auto;
+                   white-space:nowrap; }
+  .rbrow .del { background:none; border:none; color:var(--err); cursor:pointer;
+                padding:0 4px; font-size:14px; }
+  .rbrow .del:hover { background:var(--hov); }
+  /* radio в строке отката: без flex:none base-правило width:100% растягивало
+     его на всю строку и ломало подпись версии. */
+  .rbrow input[type="radio"] { flex:none; width:18px; height:18px; margin:0;
+                               accent-color:var(--acc); }
+  /* Визуально скрытый aria-live: текст flash() анонсируется скринридером,
+     а пользователь видит toast (двойной вывод был бы шумным). */
+  .sr-only { position:absolute; width:1px; height:1px; margin:-1px; overflow:hidden;
+             clip:rect(0 0 0 0); white-space:nowrap; }
+  /* Мобильная навигация по 4 группам IA (UX-04): desktop скрыта */
+  #secNav { display:none; }
+  section[id] { scroll-margin-top:64px; }
+  /* чип состояния редактора: активен / изменено / сохранено (UX-04) */
+  .edstate { font-size:var(--fs-11); font-weight:400; color:var(--mut);
+             border:1px solid var(--border); border-radius:999px;
+             padding:1px 8px; margin-left:var(--sp-2); }
+  .edstate.dirty { color:var(--warn); border-color:var(--warn); }
+  .edstate.active { color:var(--status-ok); border-color:var(--acc); }
+  /* Пустое состояние центральной карточки: редактор закрыт, но пресеты есть.
+     Закрытый редактор не оставляет пустой заголовок с линией. */
+  .edempty { display:flex; align-items:center; flex-wrap:wrap; gap:10px;
+             font-size:13px; color:var(--mut); padding:2px 0 14px;
+             border-bottom:1px solid var(--border); margin-bottom:14px; }
+  #mainCard.no-editor #sec-diag { margin-top:0; padding-top:0; border-top:0; }
+  #editorTitle { scroll-margin-top:64px; }
+  /* Телефон (≤800px): пальцы вместо мыши — цели ≥44px; поля 16px, иначе
+     iOS приближает страницу при фокусе (UX-02). Блок обязан идти ПОСЛЕ
+     базовых input/button правил — cascade. */
+  @media (max-width:800px) {
+    input, textarea, select { font-size:16px; }
+    button { min-height:44px; }
+    .iconbtn { min-height:44px; min-width:44px; }
+    /* ⋯ — единственная цель строки, поэтому строго 44×44; сама строка
+       остаётся ≤72px: 9 + 21 + 18 + 2 + 9 + рамка */
+    ul.presets .kebab { width:44px; height:44px; min-width:44px; min-height:44px; margin-right:0; }
+    /* кликабельные подписи-чекбоксы: строка целиком — цель, но и высоту
+       держим пальцеприемлемой */
+    label.chk { min-height:44px; }
+    /* мини-крест закрытия тоста — исключение: сам тост остаётся большой
+       кликабельной/тапабельной целью */
+    .toast-x { min-height:0; min-width:0; }
+  }
+  /* sticky-табы групп под шапкой — только на телефоне. Высоты берутся из
+     переменных: JS меряет реальную шапку (--hdr-h), --nav-h — высота табов. */
+  @media (max-width:800px) {
+    :root { --nav-h:53px; }
+    #status { font-size:12px; }
+    #secNav { display:flex; position:sticky; top:var(--hdr-h); z-index:var(--z-nav);
+              gap:var(--sp-1); padding:var(--sp-1) 14px; overflow-x:auto;
+              background:var(--hdr-blur); backdrop-filter:blur(8px);
+              -webkit-backdrop-filter:blur(8px);
+              border-bottom:1px solid var(--border); }
+    #secNav a { display:flex; align-items:center; flex:none; min-height:44px;
+                padding:8px 10px; border-radius:999px;
+                font-size:var(--fs-13); font-weight:600; text-decoration:none;
+                color:var(--mut); }
+    #secNav a:hover { color:var(--fg); background:var(--hov); }
+    /* #sec-diag/#sec-settings — h2, а не <section>: селектор по id покрывает
+       все четыре якоря, иначе два из них уезжали под sticky-табы. */
+    section[id], h2[id^="sec-"], #editorTitle { scroll-margin-top:calc(var(--hdr-h) + var(--nav-h) + 8px); }
+    /* цели 44px: крест редактора и импорт URI — самые мелкие кнопки */
+    #btnCloseEditor { min-width:44px; }
+    #btnQuickUri { min-width:44px; }
+    /* поля: чекбоксы/радио — исключения, у них своя геометрия */
+    input:not([type="checkbox"]):not([type="radio"]), textarea, select { min-height:44px; }
+  }
+  @media (prefers-reduced-motion: no-preference) { html { scroll-behavior:smooth; } }

@@ -186,6 +186,15 @@ def _backup_panel_files() -> Path:
         pkg_backup.mkdir(parents=True, exist_ok=True)
         for f in pkg.glob("*.py"):
             shutil.copy2(f, pkg_backup / f.name)
+        # статика UI (ARCH-03): backup/vX/panel/static/* — откат меняет код
+        # панели, HTML и JS/CSS должны вернуться на месте вместе с ним
+        static_dir = pkg / "static"
+        if static_dir.is_dir():
+            static_backup = pkg_backup / "static"
+            static_backup.mkdir(parents=True, exist_ok=True)
+            for f in static_dir.glob("*"):
+                if f.is_file():
+                    shutil.copy2(f, static_backup / f.name)
     return backup
 
 

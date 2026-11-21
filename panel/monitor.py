@@ -33,6 +33,7 @@ from werkzeug.exceptions import HTTPException
 from panel import config as cfg
 from panel import connections
 from panel import presets as pres
+from panel import security as sec
 from panel import service as svc
 
 log = logging.getLogger("naivepanel")
@@ -1005,6 +1006,8 @@ def _watchdog_loop() -> None:
             ev = _watchdog.observe()
             if ev is not None:
                 if ev["event"] == "restarted":
+                    sec._audit("watchdog.restart", actor="monitor",
+                               rc=ev.get("rc"))
                     if ev.get("rc") == 0:
                         log.warning(
                             "watchdog: naive упал — перезапущен (рестартов: %d)",
@@ -1020,6 +1023,7 @@ def _watchdog_loop() -> None:
                                 "NaivePanel: naive упал, перезапуск НЕ удался — "
                                 "загляните в панель")
                 elif ev["event"] == "tripped":
+                    sec._audit("watchdog.tripped", actor="monitor")
                     log.error(
                         "watchdog: naive падает %d раз за %dс — авто-рестарт "
                         "отключён до перезапуска панели; проверьте лог прокси",
@@ -1303,6 +1307,8 @@ def _report_failover_event(ev: dict[str, Any]) -> None:
     if ev["event"] == "switched":
         rst = ev.get("restart") or {}
         rc = rst.get("rc") if isinstance(rst, dict) else None
+        sec._audit("failover.switch", actor="monitor",
+                   frm=ev.get("from"), to=ev["to"], rc=rc)
         if isinstance(rc, int) and rc != 0:
             log.error(
                 "фейловер: %s не прошёл E2E-проверки — переключение"
@@ -1317,6 +1323,8 @@ def _report_failover_event(ev: dict[str, Any]) -> None:
                 f"NaivePanel: {ev['from']} не работает — "
                 f"переключение на {ev['to']}")
     elif ev["event"] == "returned":
+        sec._audit("failover.return", actor="monitor",
+                   frm=ev.get("from"), to=ev["to"])
         log.warning(
             "авто-возврат: %s жив (TCP %d подряд + проба E2E) — "
             "возврат с %s", ev["to"], cfg.FAILOVER_RETURN_ALIVE, ev["from"])
@@ -1336,6 +1344,7 @@ def _report_failover_event(ev: dict[str, Any]) -> None:
             "фейловер: активация %s не удалась (валидация)",
             ev["to"])
     elif ev["event"] == "exhausted":
+        sec._audit("failover.exhausted", actor="monitor", name=ev["active"])
         log.error(
             "фейловер: цепочка исчерпана — %s не работает и "
             "запасных больше нет; проверка продолжается, возврат "

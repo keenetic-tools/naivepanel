@@ -123,7 +123,8 @@ def _trim_logs_once() -> list[tuple[Path, int, int]]:
     """Один проход по всем известным логам; возвращает обрезанные (путь, было, стало)."""
     if LOG_TRIM_MAX <= 0:
         return []
-    targets: set[Path] = {LOG_FILE, PANEL_LOG, UPDATE_LOG, NAIVE_UPDATE_LOG}
+    targets: set[Path] = {LOG_FILE, PANEL_LOG, UPDATE_LOG, NAIVE_UPDATE_LOG,
+                          PANEL_AUDIT}
     extra = _active_extra_log()
     if extra:
         targets.add(extra)
