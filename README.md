@@ -972,19 +972,28 @@ E2E на настоящем Entware (нужен Docker):
 ```
 
 Подпись релиза (SEC-07): после изменения файлов релиза пересоздать суммы и
-подписать их приватным ключом (minisign-формат; ключ генерируется один раз и
-хранится офлайн, в репозиторий не коммитится — `naivepanel-release.sec` в
-`.gitignore`):
+подписать их приватным ключом (minisign-формат). Ключ проекта хранится в
+связке ключей macOS maintainer'а (сервис `naivepanel-release`, аккаунт
+`signing-key`) — не в файле и не в репозитории. Доставание и подпись:
 
 ```bash
-python3 tools/release_sign.py keygen --secret naivepanel-release.sec   # один раз
-python3 tools/release_sign.py sign --secret naivepanel-release.sec --data SHA256SUMS
-python3 tools/release_sign.py verify-repo                              # контрольная проверка
+{ shasum -a 256 S99naivepanel S99naiveproxy naivepanel.py templates/index.html
+  shasum -a 256 panel/*.py panel/static/app.js panel/static/styles.css; } > SHA256SUMS
+# ключ из связки ключей во временный файл (600), подпись, удаление файла
+sec=$(mktemp /tmp/npsec.XXXXXX) && chmod 600 "$sec"
+security find-generic-password -w -s "naivepanel-release" -a "signing-key" \
+  | xxd -r -p > "$sec" && printf '\n' >> "$sec"   # связка съедает конечный \n
+python3 tools/release_sign.py sign --secret "$sec" --data SHA256SUMS
+rm -f "$sec"
+python3 tools/release_sign.py verify-repo   # контрольная проверка
 ```
 
-Публичный ключ (`keyid` + `pub` из вывода keygen) зашит в install.sh
-(`NP_SIGN_KEYID` / `NP_SIGN_PUBKEY`) — при смене ключа обновить обе константы
-и подписать релиз новым ключом.
+Первичная генерация (только если ключ ещё не создан):
+`python3 tools/release_sign.py keygen --secret <путь>` — вывести pub/keyid,
+зашить в install.sh (`NP_SIGN_KEYID` / `NP_SIGN_PUBKEY`), секрет убрать в
+связку ключей командой выше и удалить файл. Ротация: новая пара, обновить
+обе константы, подписать релиз новым ключом (на переходном релизе верификатор
+должен принимать оба keyid — см. план Task 18).
 
 Smoke-тест после каждого изменения в `naivepanel.py`:
 
