@@ -555,7 +555,7 @@ verify_release_signature() {  # $1=sigfile $2=datafile
     if [ ! -x "$PYTHON" ] && ! command -v "$PYTHON" >/dev/null 2>&1; then
         die "python3 is required to verify the release signature"
     fi
-    if ! NP_VERIFY_KEYID="$NP_SIGN_KEYID" NP_VERIFY_PUB="$NP_SIGN_PUBKEY" \
+    if NP_VERIFY_KEYID="$NP_SIGN_KEYID" NP_VERIFY_PUB="$NP_SIGN_PUBKEY" \
        NP_VERIFY_SIG="$1" NP_VERIFY_DATA="$2" "$PYTHON" - <<'PYEOF'
 #@np-verify-begin
 import base64

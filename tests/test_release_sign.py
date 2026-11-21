@@ -106,3 +106,8 @@ def test_install_sh_embeds_verifier_markers():
     # подпись обязательна: fetch .minisig и fail-closed
     assert 'fetch "$BASE/SHA256SUMS.minisig"' in src
     assert "release signature verification failed" in src
+    # регрессия v0.27.1: «if ! verify; then return 0» убивал УСПЕШНЫЙ путь
+    # (ловится только e2e на теге — закрепляем структурно)
+    call = re.search(r'^    if (!?)\s+NP_VERIFY_KEYID=', src, re.M)
+    assert call and call.group(1) == "", \
+        "verify call must not be negated (v0.27.1 regression)"
