@@ -2273,7 +2273,8 @@ def test_update_waiter_does_not_overwrite_new_attempt(app):
     waiter = app._start_update_waiter(proc, "v9.9.9", started)
     replacement = {"phase": "running", "target": "v9.9.10",
                    "started": started + 1, "pid": os.getpid()}
-    app._update_state_write(replacement)
+    with app.upd._UPDATE_LAUNCH_LOCK:
+        app._update_state_write(replacement)
     waiter.join(timeout=5)
     assert not waiter.is_alive()
     assert app._update_state_read() == replacement
