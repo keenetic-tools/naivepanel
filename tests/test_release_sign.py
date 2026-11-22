@@ -9,6 +9,7 @@ install.sh встраивает ту же verify-логику хердоком �
 import importlib.util
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -20,6 +21,12 @@ def _tool():
     spec = importlib.util.spec_from_file_location(
         "release_sign", APP_DIR / "tools" / "release_sign.py")
     mod = importlib.util.module_from_spec(spec)
+    # Регистрация в sys.modules обязательна: у модуля `from __future__
+    # import annotations` + @dataclass, и dataclasses в py<3.14 ищет
+    # модуль аннотаций через sys.modules.get(cls.__module__).__dict__ —
+    # без записи там None.__dict__ ронял ВЕСЬ сбор тестов на CI-матрице
+    # 3.10–3.13 (локальный 3.15 пути не касается) — красный CI с v0.27.0
+    sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)
     return mod
 
