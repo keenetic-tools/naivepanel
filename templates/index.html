@@ -265,12 +265,22 @@
     <button class="ghost" value="close">Закрыть</button>
   </form>
 </dialog>
-<dialog id="updDlg" aria-labelledby="updMsg">
-  <p id="updMsg" role="status" style="margin:0 0 10px"></p>
-  <pre class="log" id="updLog" style="max-height:180px"></pre>
-  <p id="updPanelLogTitle" style="margin:10px 0 4px;font-size:12px;color:var(--mut)">Лог панели (naivepanel.log)</p>
-  <pre class="log" id="updPanelLog" style="max-height:140px"></pre>
+<dialog id="updDlg" aria-labelledby="updTitle">
+  <p id="updTitle" class="dlgtitle">Обновление панели</p>
+  <div class="upd-status" id="updStatus">
+    <p id="updMsg" role="status"></p>
+    <p id="updError" role="alert" hidden></p>
+  </div>
+  <details class="upd-log" id="updLogDetails" open>
+    <summary>Лог установщика</summary>
+    <pre class="log" id="updLog"></pre>
+  </details>
+  <details class="upd-log" id="updPanelLogDetails">
+    <summary id="updPanelLogTitle">Лог панели (naivepanel.log)</summary>
+    <pre class="log" id="updPanelLog"></pre>
+  </details>
   <form method="dialog" class="dlg-actions">
+    <button id="btnUpdRetry" type="button" data-action="updateRetry" hidden>Проверить релиз и повторить</button>
     <button class="ghost" value="close" title="Обновление продолжит идти в фоне">Свернуть</button>
   </form>
 </dialog>

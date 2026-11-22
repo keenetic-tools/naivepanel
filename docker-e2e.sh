@@ -16,7 +16,8 @@
 set -eu
 
 REPO_DIR=$(cd "$(dirname "$0")" && pwd)
-REF=v0.27.3
+REF=v0.27.4
+NEXT_REF=v0.27.5
 BASE_IMAGE="${BASE_IMAGE:-debian:bookworm-slim}"
 AUTH_FLAG=""
 MODE_FLAGS="--yes"
@@ -58,6 +59,64 @@ cp "$REPO_DIR/templates/index.html" "$WWW/templates/"
 cp "$REPO_DIR"/panel/*.py "$WWW/panel/"
 mkdir -p "$WWW/panel/static"
 cp "$REPO_DIR"/panel/static/app.js "$REPO_DIR"/panel/static/styles.css "$WWW/panel/static/"
+
+# Оба served-релиза подписываются одноразовым ключом: рабочая копия уже может
+# отличаться от последней опубликованной подписи. Файлы репозитория не меняем.
+NEXT_WWW="$WORK/www/keenetic-tools/naivepanel/$NEXT_REF"
+cp -R "$WWW" "$NEXT_WWW"
+KEYGEN_OUT=$(python3 "$REPO_DIR/tools/release_sign.py" keygen --secret "$WORK/release.sec")
+TEST_KEYID=$(printf '%s\n' "$KEYGEN_OUT" | sed -n 's/^keyid: //p')
+TEST_PUB=$(printf '%s\n' "$KEYGEN_OUT" | sed -n 's/^pub:   //p')
+python3 - "$WWW" "$NEXT_WWW" "$TEST_KEYID" "$TEST_PUB" <<'PY'
+import hashlib
+import re
+import sys
+from pathlib import Path
+
+current, next_release = map(Path, sys.argv[1:3])
+keyid, pub = sys.argv[3:]
+for root in (current, next_release):
+    installer = root / "install.sh"
+    text = installer.read_text(encoding="utf-8")
+    text = re.sub(r'^NP_SIGN_KEYID=.*$', f'NP_SIGN_KEYID="{keyid}"', text,
+                  flags=re.M)
+    text = re.sub(r'^NP_SIGN_PUBKEY=.*$', f'NP_SIGN_PUBKEY="{pub}"', text,
+                  flags=re.M)
+    if root == next_release:
+        config = root / "panel/config.py"
+        config.write_text(re.sub(r'^APP_VERSION = .*$', 'APP_VERSION = "0.27.5"',
+                                 config.read_text(encoding="utf-8"), flags=re.M),
+                          encoding="utf-8")
+        text = text.replace("set -u\n", """set -u
+
+if [ ! -f /tmp/naivepanel-e2e-update.failed ]; then
+    : > /tmp/naivepanel-e2e-update.failed
+    echo "E2E: intentional self-update failure (rc=3)" >&2
+    exit 3
+fi
+""", 1)
+    installer.write_text(text, encoding="utf-8")
+    sums = root / "SHA256SUMS"
+    lines = []
+    for line in sums.read_text(encoding="utf-8").splitlines():
+        name = line.split(maxsplit=1)[1]
+        digest = hashlib.sha256((root / name).read_bytes()).hexdigest()
+        lines.append(f"{digest}  {name}")
+    sums.write_text("\n".join(lines) + "\n", encoding="utf-8")
+PY
+for release in "$WWW" "$NEXT_WWW"; do
+    python3 "$REPO_DIR/tools/release_sign.py" sign --secret "$WORK/release.sec" \
+        --data "$release/SHA256SUMS" >/dev/null
+done
+
+API="$WORK/www/api/repos/keenetic-tools/naivepanel"
+mkdir -p "$API/releases"
+cat > "$API/releases/latest" <<EOF
+{"tag_name":"$NEXT_REF","body":"E2E signed update","html_url":"https://example.invalid/$NEXT_REF"}
+EOF
+cat > "$API/tags" <<EOF
+[{"name":"$NEXT_REF"}]
+EOF
 
 # --- сертификаты -----------------------------------------------------------
 
@@ -114,6 +173,8 @@ curl -fsSL https://bin.entware.net/$ENTWARE_ARCH/installer/alternative.sh | sh
 /opt/bin/opkg install libgcc
 echo /opt/lib >> /etc/ld-musl-$(uname -m).path
 export PATH=/opt/bin:/opt/sbin:\$PATH
+export NAIVEPANEL_UPDATE_API=https://raw.githubusercontent.com/api
+export NAIVEPANEL_UPDATE_RAW=https://raw.githubusercontent.com
 echo "==> install: curl -fsSL .../install.sh | sh -s -- $AUTH_FLAG \$EXTRA"
 curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/$REF/install.sh | sh -s -- $AUTH_FLAG \$EXTRA
 echo "==> post-install state"
@@ -310,6 +371,119 @@ fi
 if [ -x /opt/bin/naive ]; then
   echo "naive survived upgrade rerun: \$(/opt/bin/naive --version 2>&1 | head -n 1)"
 fi
+echo "==> self-update: first attempt fails with rc=3 (expect \"exit_code\": 3)"
+PANEL_URL=http://127.0.0.2:8089
+before=\$(sha256sum /opt/etc/naive/panel/naivepanel.py | cut -d' ' -f1)
+code=\$(curl -s -o /tmp/self-update-first.json -w '%{http_code}' \$H -X POST \
+  \$PANEL_URL/api/update/apply)
+echo "first apply=\$code (expect 202)"
+[ "\$code" = "202" ] || { cat /tmp/self-update-first.json; exit 1; }
+python3 - <<'PY'
+import json
+attempt = json.load(open("/tmp/self-update-first.json", encoding="utf-8"))
+assert attempt["started"] is True
+assert attempt["attempt_started"] > 0
+assert attempt["pid"] > 0
+assert attempt["target"] == "v0.27.5"
+PY
+phase=""
+for i in \$(seq 1 60); do
+  curl -s "\$PANEL_URL/api/update/log?lines=30" > /tmp/self-update-first-state.json
+  phase=\$(python3 -c 'import json; print(json.load(open("/tmp/self-update-first-state.json"))["state"].get("phase", ""))')
+  [ "\$phase" = "failed" ] && break
+  sleep 1
+done
+[ "\$phase" = "failed" ] || {
+  echo "FAIL: first self-update did not fail (phase=\$phase)"
+  cat /tmp/self-update-first-state.json; exit 1
+}
+python3 - <<'PY'
+import json
+state = json.load(open("/tmp/self-update-first-state.json", encoding="utf-8"))["state"]
+assert state["exit_code"] == 3, state
+assert state["target"] == "v0.27.5", state
+assert "code 3" in state["error"], state
+PY
+after=\$(sha256sum /opt/etc/naive/panel/naivepanel.py | cut -d' ' -f1)
+[ "\$before" = "\$after" ] || { echo "FAIL: failed attempt changed panel files"; exit 1; }
+curl -fsS "\$PANEL_URL/api/status" > /tmp/self-update-before-retry.json
+python3 -c 'import json; assert json.load(open("/tmp/self-update-before-retry.json"))["version"] == "0.27.4"'
+
+echo "==> self-update: manual retry installs the signed release"
+code=\$(curl -s -o /tmp/self-update-retry.json -w '%{http_code}' \$H -X POST \
+  \$PANEL_URL/api/update/apply)
+echo "retry apply=\$code (expect 202)"
+[ "\$code" = "202" ] || { cat /tmp/self-update-retry.json; exit 1; }
+python3 - <<'PY'
+import json
+first = json.load(open("/tmp/self-update-first.json", encoding="utf-8"))
+retry = json.load(open("/tmp/self-update-retry.json", encoding="utf-8"))
+assert retry["attempt_started"] >= first["attempt_started"]
+assert retry["pid"] != first["pid"]
+assert retry["target"] == "v0.27.5"
+PY
+updated=0
+for i in \$(seq 1 120); do
+  if curl -fsS --connect-timeout 2 --max-time 3 "\$PANEL_URL/api/status" \
+      > /tmp/self-update-status.json 2>/dev/null; then
+    version=\$(python3 -c 'import json; print(json.load(open("/tmp/self-update-status.json"))["version"])')
+    if [ "\$version" = "0.27.5" ]; then
+      updated=1
+      break
+    fi
+  fi
+  sleep 1
+done
+[ "\$updated" = "1" ] || {
+  echo "FAIL: signed retry did not bring up v0.27.5"
+  cat /opt/var/log/naivepanel-update.log /opt/var/log/naivepanel.log; exit 1
+}
+curl -fsS "\$PANEL_URL/api/update/log?lines=60" > /tmp/self-update-final.json
+python3 - <<'PY'
+import json
+state = json.load(open("/tmp/self-update-final.json", encoding="utf-8"))["state"]
+assert state["phase"] == "done", state
+assert state["target"] == "v0.27.5", state
+PY
+grep -q 'release signature verified' /opt/var/log/naivepanel-update.log \
+  || { echo "FAIL: retry did not verify the release signature"; exit 1; }
+echo "self-update: signed retry succeeded (v0.27.5, state done)"
+
+echo "==> non-child zombie detection via procfs"
+cat > /tmp/zombie-parent.py <<'PY'
+import os
+import time
+from pathlib import Path
+
+pid = os.fork()
+if pid == 0:
+    os._exit(0)
+print(pid, flush=True)
+release = Path("/tmp/naivepanel-e2e-zombie.release")
+deadline = time.time() + 30
+while not release.exists() and time.time() < deadline:
+    time.sleep(0.1)
+if release.exists():
+    os.waitpid(pid, 0)
+PY
+"\$np_py" /tmp/zombie-parent.py > /tmp/zombie-child.pid &
+zparent=\$!
+zombie_ok=0
+for i in \$(seq 1 50); do
+  if [ -s /tmp/zombie-child.pid ]; then
+    child=\$(cat /tmp/zombie-child.pid)
+    if "\$np_py" -c 'import sys; sys.path.insert(0, "/opt/etc/naive/panel"); from panel.updates import _pid_alive; sys.exit(1 if _pid_alive(int(sys.argv[1])) else 0)' "\$child"; then
+      zombie_ok=1
+      break
+    fi
+  fi
+  sleep 1
+done
+touch /tmp/naivepanel-e2e-zombie.release
+wait "\$zparent"
+[ "\$zombie_ok" = "1" ] || { echo "FAIL: non-child zombie still looks alive"; exit 1; }
+echo "non-child zombie: OK"
+
 echo "==> E2E DONE"
 EOF
 

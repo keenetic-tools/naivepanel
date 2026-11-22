@@ -116,7 +116,8 @@ def _update_state_read() -> dict[str, Any]:
 # spawn → запись «running») — под локом. Без этого два параллельных запроса
 # на медленной сети проходят гейт до первой записи «running» и поднимают
 # два установщика/воркера над одними файлами.
-_UPDATE_LAUNCH_LOCK = threading.Lock()        # panel apply + panel rollback
+_UPDATE_LAUNCH_LOCK = threading.RLock()       # panel apply + panel rollback + waiter
+_UPDATE_WAITERS: set[tuple[int, float]] = set()
 _NAIVE_UPDATE_LAUNCH_LOCK = threading.Lock()  # naive update + naive rollback
 
 
@@ -125,35 +126,65 @@ def _update_state_write(st: dict[str, Any]) -> None:
         # атомарно (rename): неатомарный write_text оставлял читателю пустой
         # файл, ридер возвращал {} — панель сочла бы апдейт завершённым
         pres._save_json(cfg.UPDATE_STATE, st)
+        fd = os.open(cfg.UPDATE_STATE.parent,
+                     os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
     except OSError as exc:  # state не критичен: обновление переживёт и без него
         log.warning("cannot write %s: %s", cfg.UPDATE_STATE, exc)
 
 
-def _pid_alive(pid: Any) -> bool:
-    """Жив ли процесс установщика (pid пишем в state с v0.8.1).
+def _start_update_waiter(proc: subprocess.Popen, target: str,
+                         started: float) -> threading.Thread:
+    """Дождаться своего установщика и сохранить код его сбоя."""
+    key = (proc.pid, started)
 
-    Зомби считается мёртвым: отсоединённая обёртка установщика — ребёнок
-    панели, и до wait() висит defunct — os.kill(pid, 0) по такому
-    преуспевает, state застревал в «running» и блокировал повторный apply
-    фиктивным 409 (ловушка упавшего self-update). Своих детей жнём
-    waitpid(WNOHANG) — заодно reap; чужой pid (state пережил рестарт
-    панели) — состояние Z в /proc/<pid>/stat (на цели /proc есть),
-    без /proc — осмотрительный os.kill как раньше.
+    def wait() -> None:
+        try:
+            rc = proc.wait()
+            if rc == 0:
+                return
+            with _UPDATE_LAUNCH_LOCK:
+                st = _update_state_read()
+                if (st.get("phase") == "running" and st.get("target") == target
+                        and st.get("pid") == proc.pid and st.get("started") == started):
+                    st.update({"phase": "failed", "finished": time.time(),
+                               "exit_code": rc,
+                               "error": f"installer exited with code {rc}"})
+                    _update_state_write(st)
+        finally:
+            with _UPDATE_LAUNCH_LOCK:
+                _UPDATE_WAITERS.discard(key)
+
+    waiter = threading.Thread(target=wait, name=f"panel-update-{proc.pid}", daemon=True)
+    with _UPDATE_LAUNCH_LOCK:
+        _UPDATE_WAITERS.add(key)
+        waiter.start()
+    return waiter
+
+
+def _boot_id() -> str | None:
+    """Идентификатор текущей загрузки Linux, если procfs доступен."""
+    try:
+        return Path("/proc/sys/kernel/random/boot_id").read_text(
+            encoding="utf-8").strip() or None
+    except OSError:
+        return None
+
+
+def _pid_alive(pid: Any) -> bool:
+    """Жив ли процесс из старого state, не забирая его exit status.
+
+    Зомби на Linux считается мёртвым по /proc/<pid>/stat. Своих детей здесь
+    не жнём: waiter владеет proc.wait() и кодом возврата установщика.
     """
     try:
         pid = int(pid)
     except (TypeError, ValueError):
         return False  # pid нет (state от версии до v0.8.1) — считаем мёртвым
     if pid <= 0:
-        return False
-    try:
-        done, _ = os.waitpid(pid, os.WNOHANG)
-        if done == pid:
-            return False  # наш ребёнок вышел — пожали и признали мёртвым
-        return True  # наш ребёнок жив (waitpid вернул 0)
-    except ChildProcessError:
-        pass  # не наш ребёнок — ниже по цепочке
-    except OSError:
         return False
     try:
         # поле state — первое после «)»: имя процесса может содержать скобки
@@ -179,17 +210,25 @@ def _update_state() -> dict[str, Any]:
     state помечается «failed» и не блокирует retry фиктивным
     «already in progress». Записи без pid протухают через _UPDATE_STALE_S.
     """
-    st = _update_state_read()
-    if st.get("phase") == "running":
-        if str(st.get("target") or "").lstrip("vV") == cfg.APP_VERSION:
-            _update_state_write({**st, "phase": "done", "finished": time.time()})
-            st["phase"] = "done"
-        elif not _pid_alive(st.get("pid")):
-            st["phase"] = "failed"
-            _update_state_write(st)
-        elif time.time() - float(st.get("started") or 0) > cfg._UPDATE_STALE_S:
-            st["stale"] = True
-    return st
+    with _UPDATE_LAUNCH_LOCK:
+        st = _update_state_read()
+        if st.get("phase") == "running":
+            if str(st.get("target") or "").lstrip("vV") == cfg.APP_VERSION:
+                _update_state_write({**st, "phase": "done", "finished": time.time()})
+                st["phase"] = "done"
+            elif (st.get("boot_id") and (current_boot := _boot_id())
+                  and st["boot_id"] != current_boot):
+                st.update({"phase": "failed", "finished": time.time(),
+                           "error": "update interrupted by router reboot"})
+                _update_state_write(st)
+            elif not _pid_alive(st.get("pid")):
+                if (st.get("pid"), st.get("started")) not in _UPDATE_WAITERS:
+                    st.update({"phase": "failed", "finished": time.time(),
+                               "error": "installer process is not running"})
+                    _update_state_write(st)
+            elif time.time() - float(st.get("started") or 0) > cfg._UPDATE_STALE_S:
+                st["stale"] = True
+        return st
 
 
 def _backup_panel_files() -> Path:
@@ -658,6 +697,7 @@ __all__ = [
     "_NAIVE_UPDATE_LAUNCH_LOCK",
     "_UPDATE_LAUNCH_LOCK",
     "_backup_panel_files",
+    "_boot_id",
     "_http_download",
     "_latest_release",
     "_naive_bin_version",
@@ -675,6 +715,7 @@ __all__ = [
     "_pid_alive",
     "_rollback_binary",
     "_rollback_panel_versions",
+    "_start_update_waiter",
     "_update_check_cache",
     "_update_state",
     "_update_state_read",

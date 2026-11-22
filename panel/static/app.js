@@ -1444,6 +1444,61 @@ function showNotes() {
   $('notesDlg').showModal();
 }
 
+function resetUpdateDialog(showPanelLog) {
+  $('updStatus').classList.remove('failed');
+  $('updError').hidden = true;
+  $('updError').textContent = '';
+  $('btnUpdRetry').hidden = true;
+  $('btnUpdRetry').disabled = false;
+  $('btnUpdRetry').textContent = 'Проверить релиз и повторить';
+  $('updLog').textContent = '';
+  $('updPanelLog').textContent = '';
+  $('updLogDetails').hidden = false;
+  $('updLogDetails').open = true;
+  $('updPanelLogDetails').hidden = !showPanelLog;
+  $('updPanelLogDetails').open = false;
+}
+
+async function refreshUpdateRetry(checked = false) {
+  const btn = $('btnUpdRetry');
+  btn.hidden = false;
+  btn.disabled = true;
+  btn.textContent = 'Проверяю релиз…';
+  if (!checked) await checkUpdate(true);
+  if (!upd || upd.error) {
+    btn.disabled = false;
+    btn.textContent = 'Повторить проверку';
+  } else if (upd.available) {
+    btn.disabled = false;
+    btn.textContent = 'Обновить до v' + upd.latest;
+  } else {
+    btn.textContent = 'Новой версии нет';
+  }
+}
+
+async function retryUpdate() {
+  const btn = $('btnUpdRetry');
+  if (btn.disabled) return;
+  btn.disabled = true;
+  btn.textContent = 'Проверяю релиз…';
+  await checkUpdate(true);
+  await refreshUpdateRetry(true);
+  if (upd && !upd.error && upd.available) await applyUpdate();
+}
+
+function showUpdateFailure(state, d, want) {
+  $('updStatus').classList.add('failed');
+  $('updMsg').textContent = 'Обновление до v' + want + ' не удалось';
+  const reason = state.error || 'Установщик завершился с ошибкой — см. лог ниже';
+  const code = Number.isInteger(state.exit_code) ? 'Код выхода: ' + state.exit_code + ' · ' : '';
+  $('updError').textContent = code + reason + '. Подробности: '
+    + String(d.log || '/opt/var/log/naivepanel-update.log');
+  $('updError').hidden = false;
+  $('updLogDetails').open = true;
+  flash('Обновление не удалось — см. лог обновления', false);
+  refreshUpdateRetry();  // без await: повторный apply здесь не запускается
+}
+
 async function applyUpdate() {
   if (!upd || !upd.available) return;
   const ok = await askConfirm(
@@ -1454,13 +1509,9 @@ async function applyUpdate() {
   try { d = await jpost('/api/update/apply', null); }
   catch (e) { flash('Обновление не запущено: '+e.message, false); return; }
   const want = String(d.target || ('v'+upd.latest)).replace(/^v/, '');
+  resetUpdateDialog(true);
+  $('updTitle').textContent = 'Обновление панели';
   $('updMsg').textContent = 'Обновление до v'+want+'…';
-  $('updLog').textContent = '';
-  $('updPanelLog').textContent = '';
-  // диалог переиспользуется обновлением бинарника naive, которое прячет хвост
-  // лога панели — возвращаем перед апдейтом самой панели
-  $('updPanelLogTitle').style.display = '';
-  $('updPanelLog').style.display = '';
   $('updDlg').showModal();
   flash('Обновление до v'+want+' запущено', true);
   // Детект завершения — на клиенте (state на сервере не переживает рестарт):
@@ -1471,17 +1522,10 @@ async function applyUpdate() {
     await new Promise(res => setTimeout(res, 1000));
     let lg = null;
     try { lg = await jget('/api/update/log?lines=30'); renderUpdLog(lg); } catch (e) { /* рестарт панели */ }
-    // Установщик умер (сеть/подпись/диск): сервер диагностирует «running»
-    // с мёртвым pid как failed — не жмём 3-минутный таймаут. Сразу форсируем
-    // перепроверку: метка кнопки морфится из кэша чека и может отставать от
-    // свежего тега, а apply всегда ставит свежерезолвленный (кейс v0.27.1:
-    // кнопка говорила 0.27.1, падение повторялось, «Проверить обновления»
-    // из UI не вернуть — после фикса кнопка сама покажет новый тег)
-    if (lg && lg.state && lg.state.phase === 'failed') {
-      $('updMsg').textContent = 'Обновление не удалось — лог ниже; подробности в '
-        + String(d.log || '/opt/var/log/naivepanel-update.log');
-      flash('Обновление не удалось — см. лог обновления', false);
-      checkUpdate(true);  // без await: диалог с логом важнее, кнопка обновится за ним
+    if (lg && lg.state && lg.state.phase === 'failed'
+        && d.pid != null && d.attempt_started != null
+        && lg.state.pid === d.pid && lg.state.started === d.attempt_started) {
+      showUpdateFailure(lg.state, d, want);
       return;
     }
     let st = null;
@@ -1582,11 +1626,9 @@ async function updateNaive() {
   let d;
   try { d = await jpost('/api/naive/update', null); }
   catch (e) { flash('Обновление бинарника не запущено: ' + e.message, false); btn.disabled = false; return; }
-  // тот же диалог, что у обновления панели; хвост лога панели не нужен
-  $('updPanelLogTitle').style.display = 'none';
-  $('updPanelLog').style.display = 'none';
+  resetUpdateDialog(false);  // naive
+  $('updTitle').textContent = 'Обновление бинарника naive';
   $('updMsg').textContent = 'Бинарник naive → ' + d.target + '…';
-  $('updLog').textContent = '';
   $('updDlg').showModal();
   flash('Обновление бинарника до ' + d.target + ' запущено', true);
   // Панель при этом живёт: завершение видно в state, падений сервера ждать не надо
@@ -1708,11 +1750,9 @@ async function rollbackPanel() {
   // тот же диалог и цикл ожидания, что у обновления: панель должна упасть и
   // подняться уже старым кодом — ловим смену версии в /api/status
   const want = String(d.target || ver).replace(/^v/, '');
+  resetUpdateDialog(true);  // rollback
+  $('updTitle').textContent = 'Откат панели';
   $('updMsg').textContent = 'Откат панели на v' + want + '…';
-  $('updLog').textContent = '';
-  $('updPanelLog').textContent = '';
-  $('updPanelLogTitle').style.display = '';
-  $('updPanelLog').style.display = '';
   $('updDlg').showModal();
   flash('Откат до v' + want + ' запущен', true);
   const t0 = Date.now(), deadline = t0 + 120000; // файлы локальные — 2 мин за глаза
@@ -2014,6 +2054,7 @@ const ACTIONS = {
   panelRestart: () => panelRestart(),
   // одна кнопка на поток: есть обновление → применить, нет → перепроверить
   updateCheck: () => (upd && upd.available) ? applyUpdate() : checkUpdate(true),
+  updateRetry: () => retryUpdate(),
   updateNotes: () => showNotes(),
   naiveCheck: () => (nv && nv.latest && (nv.available || !(nv.tag || nv.version)))
     ? updateNaive() : checkNaive(true),

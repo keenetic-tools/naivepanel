@@ -160,8 +160,8 @@ HTML page — no CDN, no build step. MIT-licensed.
 | `POST` | `/api/service/{start,stop,restart}` | управление через S99naiveproxy |
 | `POST` | `/api/panel/restart` | перезапуск самой панели (после обновления файлов) |
 | `GET` | `/api/update/check?force=1` | сверить версию с последним релизом GitHub (`{current, latest, available, notes, url}`; кэш 6ч, `force` обходит; сеть недоступна → 200 с `error`) |
-| `POST` | `/api/update/apply` | запустить self-update: spawn отсоединённого `install.sh --yes --from-update --ref <тег>`; exit-код установщика пишется в лог; `202 {target,...}`, повторный запуск → `409` |
-| `GET` | `/api/update/log?lines=60` | tail лога установщика + хвост лога панели (`panel`) + state обновления, `no-store` |
+| `POST` | `/api/update/apply` | запустить self-update: spawn отсоединённого `install.sh --yes --from-update --ref <тег>`; `202 {started:true, attempt_started, pid, target, current, log}`, повторный запуск при живой попытке → `409` |
+| `GET` | `/api/update/log?lines=60` | tail лога установщика + хвост лога панели (`panel`) + state обновления, `no-store`; state содержит `phase`, `target`, `started`, `pid`, `boot_id`, а после завершения — `finished` и при сбое `exit_code`/`error` |
 | `GET` | `/api/rollback` | что можно откатить: `{current, panel:[{version,size,ts}], binary:{present,tag,size}}` — версии панели в `backup/` + прошлый бинарник |
 | `POST` | `/api/rollback` | откат: `{"panel":"vX.Y.Z"}` — восстановить файлы из бэкапа и перезапустить панель (текущая версия тоже уходит в бэкап, откат обратим); `{"binary":true}` — вернуть `naive.previous` и перезапустить прокси, если работал. Гейт как у update/apply |
 | `DELETE` | `/api/rollback/<vX.Y.Z>` | удалить один бэкап панели |
@@ -199,7 +199,7 @@ Entware с `opkg`). Скачивает файлы, закреплённые за
 контрольные суммы (`SHA256SUMS`), ставит init-скрипты и запускает панель:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/v0.27.3/install.sh | sh -s -- --with-auth
+curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/v0.27.4/install.sh | sh -s -- --with-auth
 ```
 
 Запуск через пайп безопасен: подтверждение установки и ввод пароля читаются
@@ -213,7 +213,7 @@ curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/v0.27.3/i
 | `--with-auth` | интерактивно создаёт `/opt/etc/naive/panel/admin.pass` (HTTP Basic) |
 | `--bind HOST:PORT` | пишет `NAIVEPANEL_BIND` в `/opt/etc/naive/panel/panel.conf` |
 | `--hosts LIST` | пишет `NAIVEPANEL_HOSTS` в `panel.conf` |
-| `--ref TAG` | устанавливает конкретный тег (по умолчанию `v0.27.3`) |
+| `--ref TAG` | устанавливает конкретный тег (по умолчанию `v0.27.4`) |
 | `--naive-target TGT` | openwrt-таргет бинарника naive, поверх авто-детекта |
 | `--naive-ref TAG` | конкретный тег klzgrad/naiveproxy вместо последнего |
 | `--naive-force` | переустановить бинарник naive, даже если он уже есть |
@@ -248,7 +248,7 @@ curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/v0.27.3/i
 Пример с LAN-доступом:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/v0.27.3/install.sh \
+curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/v0.27.4/install.sh \
   | sh -s -- --with-auth --bind 192.168.1.1:8089 --hosts '192.168.1.1:8089,router.local:8089'
 ```
 
@@ -275,19 +275,31 @@ curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/v0.27.3/i
 - Перед запуском старые файлы копируются в `/opt/etc/naive/panel/backup/v<старой>/`
   (`naivepanel.py`, `index.html`, init-скрипты) — оттуда же работает кнопка
   «Откат версий…» (см. ниже); вручную по SSH их тоже можно вернуть.
-- Повторный `apply` при живом установщике → `409`. Умерший установщик
-  распознаётся по pid в `update.state` (state → `failed`, retry сразу);
-  записи без pid (версии до v0.8.1) протухают через 15 минут. Зомби —
-  мёртв: обёртка установщика — ребёнок панели, и до wait() висит
-  `defunct`, по которому `os.kill(pid, 0)` успевает — _pid_alive жнёт
-  своих детей `waitpid(WNOHANG)`, чужие (state пережил рестарт панели)
-  проверяются по полю `Z` в `/proc/<pid>/stat` (ловушка v0.27.x: state
-  вечно «running», retry — фиктивный 409 до 15 минут).
-- Провал установщика UI детектит по `state.failed` из `/api/update/log`
-  за секунды (не дожидаясь 3-минутного таймаута на подъём панели) и
-  сразу перепроверяет релизы: кнопка «Обновить до vX» морфится из кэша
-  чека (6ч) и может отставать от свежего тега, а `apply` всегда ставит
-  свежерезолвленный тег — после падения кнопка сама покажет актуальный.
+- Отдельный daemon waiter единолично вызывает `proc.wait()` для каждой
+  попытки. Shell-обёртка возвращает код установщика (`exit "$rc"`), поэтому
+  при ненулевом коде state сразу становится `failed` и содержит `exit_code`,
+  `error` и `finished`. После rc=0 новая версия сама переводит state в `done`
+  после перезапуска. Реестр активных waiter'ов не даёт polling-запросу
+  опередить waiter и стереть настоящий код завершения.
+- Повторный `apply` при живом установщике → `409`. `_pid_alive()` не вызывает
+  `waitpid`: на Linux zombie определяется по `/proc/<pid>/stat`, а без procfs
+  используется `os.kill(pid, 0)`. Записи legacy без pid протухают через
+  15 минут.
+- В state сохраняется Linux boot ID. Если после запуска панели он изменился,
+  незавершённая попытка сразу помечается `failed` с причиной reboot — сохранённый
+  pid мог достаться другому процессу. Если целевая версия успела установиться,
+  она имеет приоритет и state становится `done`. State пишется атомарно с
+  `fsync` файла и каталога.
+- UI показывает статус, причину и код ошибки; логи доступны в сворачиваемых
+  блоках. После сбоя происходит принудительная проверка релиза. Ручной retry
+  повторно проверяет актуальную версию и требует подтверждения; stale apply
+  и автоматический retry не используются. Ответ apply связывается с state по
+  `pid` и `attempt_started` (в state это поле `started`).
+- Атомарность state не делает атомарной установку всего набора файлов. Текущий
+  `install.sh` заменяет package-файлы последовательно: внезапное отключение
+  питания в этой фазе всё ещё может оставить частичную установку и потребовать
+  восстановления через SSH. Power-loss-safe layout вынесен в отдельную P1-задачу
+  [roadmap](docs/ROADMAP.md).
 - `apply` разрешён только с паролем (`--with-auth`) либо при loopback-bind:
   обновление меняет код панели, отдавать его в LAN без auth нельзя.
 - GitHub недоступен с роутера (типично для этих сетей) — `check` отвечает
@@ -956,11 +968,13 @@ naiveproxy-panel/
 Перед PR-ом (то же, что гоняет CI):
 
 ```bash
-./.venv/bin/python -c "import ast; ast.parse(open('naivepanel.py').read())"  # syntax
-sh -n S99naiveproxy && sh -n S99naivepanel                                    # shell syntax
-./.venv/bin/python -m pytest -q                                              # API-тесты, без сети
-./.venv/bin/ruff check naivepanel.py tests/                                  # линт
-./.venv/bin/bandit -q -ll -r naivepanel.py                                   # security-скан
+./.venv/bin/python -m pytest -q
+./.venv/bin/ruff check .
+./.venv/bin/bandit -q -ll -r naivepanel.py panel
+sh -n install.sh S99naiveproxy S99naivepanel docker-e2e.sh
+node --check panel/static/app.js
+shasum -a 256 -c SHA256SUMS
+git diff --check
 ```
 
 E2E на настоящем Entware (нужен Docker):
@@ -970,16 +984,20 @@ E2E на настоящем Entware (нужен Docker):
 ./docker-e2e.sh --with-auth  # интерактивно: Basic auth
 ```
 
-Скрипт поднимает локальный HTTPS-сервер, имитирующий
-`raw.githubusercontent.com`, и прогоняет `install.sh` в контейнере с Entware:
-сверка контрольных сумм, запуск панели, CSRF, write-only пароли, маскировка и
-`no-store` списка, отклонение схем `proxy`, апгрейд-миграции. Перед запуском
-`SHA256SUMS` должен соответствовать рабочей копии — иначе `sha256sum -c` упадёт:
+Скрипт поднимает локальный HTTPS-сервер, имитирующий GitHub raw/API, и прогоняет
+`install.sh` в контейнере с Entware: сверка контрольных сумм и подписи, запуск
+панели, CSRF, write-only пароли, маскировка и `no-store` списка, апгрейд-миграции.
+Для self-update создаётся следующий тестовый тег: первая попытка обязана завершиться
+`failed` с `exit_code=3`, ручной retry — пройти подписанную установку и перезапуск.
+Отдельно проверяется распознавание чужого zombie через procfs. Оба served-релиза
+получают временные суммы и одноразовую подпись только внутри временного каталога;
+`SHA256SUMS`, `SHA256SUMS.minisig` и настоящий ключ репозитория не используются
+и не изменяются.
 
-```bash
-{ shasum -a 256 S99naivepanel S99naiveproxy naivepanel.py templates/index.html
-  shasum -a 256 panel/*.py panel/static/app.js panel/static/styles.css; } > SHA256SUMS
-```
+Перед созданием release tag нужно вручную запустить workflow **E2E** через
+`workflow_dispatch` на release candidate (Actions → E2E → Run workflow) и дождаться
+успеха. Существующие запуски по тегам и nightly сохраняются: ручной pre-tag прогон
+нужен, чтобы не обнаружить ошибку уже на неизменяемом теге.
 
 Подпись релиза (SEC-07): после изменения файлов релиза пересоздать суммы и
 подписать их приватным ключом (minisign-формат). Ключ проекта хранится в

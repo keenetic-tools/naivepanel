@@ -79,6 +79,22 @@ def test_docker_e2e_ships_panel_package_and_is_arch_aware():
     assert 'bin.entware.net/$ENTWARE_ARCH/' in script
 
 
+def test_docker_e2e_self_update_failure_retry_and_zombie():
+    script = (APP_DIR / "docker-e2e.sh").read_text(encoding="utf-8")
+    for marker in (
+        "NEXT_REF=v0.27.5",
+        "tools/release_sign.py",
+        "keygen --secret",
+        "NAIVEPANEL_UPDATE_API",
+        "attempt_started",
+        'state["exit_code"] == 3',
+        "self-update: signed retry succeeded",
+        "non-child zombie: OK",
+    ):
+        assert marker in script, marker
+    assert script.count("/api/update/apply") >= 2
+
+
 def test_docker_e2e_upgrade_bind_is_reachable():
     # Позитивный upgrade-сценарий обязан ставить панель на реально
     # доступный в контейнере адрес (любой 127/8), иначе restart падает,

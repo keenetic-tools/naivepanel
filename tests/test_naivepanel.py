@@ -1930,6 +1930,7 @@ def _apply_stub(env, monkeypatch, app, tag="v9.9.9"):
 
 def test_apply_spawns_installer_and_backs_up(client, app, env, monkeypatch):
     marker = _apply_stub(env, monkeypatch, app)
+    monkeypatch.setattr(app.upd, "_boot_id", lambda: "test-boot", raising=False)
     r = client.post("/api/update/apply", headers=CSRF)
     assert r.status_code == 202
     body = r.get_json()
@@ -1940,6 +1941,10 @@ def test_apply_spawns_installer_and_backs_up(client, app, env, monkeypatch):
     # state зафиксировал «running» с целью
     st = json.loads(app.UPDATE_STATE.read_text())
     assert st["phase"] == "running" and st["target"] == "v9.9.9"
+    assert body["started"] is True
+    assert body["pid"] == st["pid"]
+    assert body["attempt_started"] == st["started"]
+    assert st["boot_id"] == "test-boot"
     # пролог панелью: даже умерший до первой строки установщик оставит след
     assert app.UPDATE_LOG.read_text().startswith("== self-update")
     for _ in range(50):  # установщик spawn'ится отсоединённо — ждём маркер
@@ -2014,6 +2019,14 @@ def test_apply_wrapper_records_installer_exit_code(client, app, env, monkeypatch
             break
         time.sleep(0.1)
     assert "installer exit code: 3" in app.UPDATE_LOG.read_text()
+    for _ in range(50):
+        st = app._update_state_read()
+        if st.get("phase") == "failed":
+            break
+        time.sleep(0.1)
+    assert st["phase"] == "failed"
+    assert st["exit_code"] == 3
+    assert "code 3" in st["error"]
 
 
 def test_apply_refuses_exposed_panel_without_password(client, app, monkeypatch):
@@ -2075,6 +2088,9 @@ def test_apply_concurrent_single_installer(client, app, env, monkeypatch):
 
     class _Proc:
         pid = os.getpid()  # живой: reconciler не должен закрыть «running»
+
+        def wait(self):
+            return 0
 
     def fake_popen(*a, **k):
         popens.append(1)
@@ -2176,18 +2192,128 @@ def test_update_state_marks_failed_when_installer_dead(app):
     assert json.loads(app.UPDATE_STATE.read_text())["phase"] == "failed"
 
 
-def test_update_state_marks_failed_when_installer_zombie(app):
-    # регрессия ловушки v0.27.x: обёртка установщика — ребёнок панели и
-    # после выхода без wait() висит зомби; os.kill(pid, 0) по зомби
-    # преуспевает, state застревал в «running», повторный apply — 409
+def test_pid_alive_detects_zombie_without_reaping(app, monkeypatch):
+    pid = 424242
+    waitpid_calls = []
+    monkeypatch.setattr(app.os, "waitpid",
+                        lambda *args: waitpid_calls.append(args) or (pid, 0))
+    real_read = Path.read_text
+
+    def fake_read(path, *args, **kwargs):
+        if str(path) == f"/proc/{pid}/stat":
+            return f"{pid} (installer) Z 1 1 1"
+        return real_read(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", fake_read)
+    assert app._pid_alive(pid) is False
+    assert waitpid_calls == []
+
+
+def test_update_state_reboot_does_not_trust_reused_pid(app, monkeypatch):
+    monkeypatch.setattr(app.upd, "_boot_id", lambda: "new-boot", raising=False)
+    app._update_state_write({"phase": "running", "target": "v9.9.9",
+                             "started": time.time(), "pid": os.getpid(),
+                             "boot_id": "old-boot"})
+    st = app._update_state()
+    assert st["phase"] == "failed"
+    assert st["finished"] >= st["started"]
+    assert "reboot" in st["error"]
+
+
+def test_update_state_target_version_done_after_reboot(app, monkeypatch):
+    monkeypatch.setattr(app.upd, "_boot_id", lambda: "new-boot", raising=False)
+    app._update_state_write({"phase": "running", "target": "v" + app.APP_VERSION,
+                             "started": time.time(), "pid": os.getpid(),
+                             "boot_id": "old-boot"})
+    assert app._update_state()["phase"] == "done"
+
+
+def test_update_state_write_fsyncs_parent_directory(app, monkeypatch):
+    directory_flag = getattr(os, "O_DIRECTORY", 0)
+    real_open, real_fsync = os.open, os.fsync
+    directory_fds, fsynced = [], []
+
+    def tracked_open(path, flags, *args):
+        fd = real_open(path, flags, *args)
+        if flags & directory_flag:
+            directory_fds.append(fd)
+        return fd
+
+    def tracked_fsync(fd):
+        if fd in directory_fds:
+            fsynced.append(fd)
+        return real_fsync(fd)
+
+    monkeypatch.setattr(app.os, "open", tracked_open)
+    monkeypatch.setattr(app.os, "fsync", tracked_fsync)
+    app._update_state_write({"phase": "running"})
+    assert directory_fds and fsynced == directory_fds
+
+
+def test_update_waiter_records_exit_code(app):
+    started = time.time()
     proc = subprocess.Popen(["/bin/sh", "-c", "exit 3"])
-    deadline = time.time() + 10
-    while time.time() < deadline and app._pid_alive(proc.pid):
-        time.sleep(0.05)  # ребёнок вышел → _pid_alive жнёт зомби и скажет False
-    assert app._pid_alive(proc.pid) is False
-    app._update_state_write({"phase": "running", "target": "v0.0.1",
-                             "started": time.time(), "pid": proc.pid})
-    assert app._update_state()["phase"] == "failed"
+    app._update_state_write({"phase": "running", "target": "v9.9.9",
+                             "started": started, "pid": proc.pid})
+    waiter = app._start_update_waiter(proc, "v9.9.9", started)
+    waiter.join(timeout=5)
+    assert not waiter.is_alive()
+    st = app._update_state_read()
+    assert st["phase"] == "failed"
+    assert st["exit_code"] == 3
+    assert st["finished"] >= started
+    assert "code 3" in st["error"]
+
+
+def test_update_waiter_does_not_overwrite_new_attempt(app):
+    started = time.time()
+    proc = subprocess.Popen(["/bin/sh", "-c", "exit 4"])
+    app._update_state_write({"phase": "running", "target": "v9.9.9",
+                             "started": started, "pid": proc.pid})
+    waiter = app._start_update_waiter(proc, "v9.9.9", started)
+    replacement = {"phase": "running", "target": "v9.9.10",
+                   "started": started + 1, "pid": os.getpid()}
+    app._update_state_write(replacement)
+    waiter.join(timeout=5)
+    assert not waiter.is_alive()
+    assert app._update_state_read() == replacement
+
+
+def test_update_waiter_success_waits_for_restart(app):
+    started = time.time()
+    proc = subprocess.Popen(["/bin/sh", "-c", "exit 0"])
+    app._update_state_write({"phase": "running", "target": "v9.9.9",
+                             "started": started, "pid": proc.pid})
+    waiter = app._start_update_waiter(proc, "v9.9.9", started)
+    waiter.join(timeout=5)
+    assert not waiter.is_alive()
+    assert app._update_state_read()["phase"] == "running"
+
+
+def test_update_poll_waits_for_registered_waiter(app, monkeypatch):
+    release = threading.Event()
+    started = time.time()
+
+    class Proc:
+        pid = 424242
+
+        def wait(self):
+            release.wait(timeout=5)
+            return 3
+
+    monkeypatch.setattr(app.upd, "_pid_alive", lambda pid: False)
+    app._update_state_write({"phase": "running", "target": "v9.9.9",
+                             "started": started, "pid": Proc.pid})
+    waiter = app._start_update_waiter(Proc(), "v9.9.9", started)
+    try:
+        assert app._update_state()["phase"] == "running"
+    finally:
+        release.set()
+        waiter.join(timeout=5)
+    assert not waiter.is_alive()
+    st = app._update_state_read()
+    assert st["phase"] == "failed"
+    assert st["exit_code"] == 3
 
 
 def test_bind_is_loopback_variants(app):
@@ -2223,6 +2349,23 @@ def test_ui_has_update_controls(app):
                    'id="updDlg"', 'id="notesDlg"',
                    '/api/update/check', '/api/update/apply', '/api/update/log'):
         assert marker in html, marker
+
+
+def test_ui_update_failure_has_focused_retry_and_collapsible_logs(app):
+    html = UI_HTML.read_text()
+    js = UI_JS.read_text()
+    for marker in ('id="updDlg" aria-labelledby="updTitle"',
+                   'id="updTitle"', 'id="updError" role="alert" hidden',
+                   'id="updLogDetails" open', 'id="updPanelLogDetails"',
+                   'id="btnUpdRetry" type="button" data-action="updateRetry" hidden'):
+        assert marker in html, marker
+    assert 'lg.state.pid === d.pid && lg.state.started === d.attempt_started' in js
+    retry = re.search(r'async function retryUpdate\(\) \{(.*?)\n\}', js, re.S)
+    assert retry and 'await checkUpdate(true)' in retry.group(1)
+    assert 'refreshUpdateRetry();' in js
+    assert 'updateRetry: () => retryUpdate()' in js
+    for marker in ("resetUpdateDialog(false);  // naive", "resetUpdateDialog(true);  // rollback"):
+        assert marker in js, marker
 
 
 def test_ui_has_log_source_switch_and_panel_tail_in_update_dlg(app):

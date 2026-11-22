@@ -864,8 +864,8 @@ def api_update_apply():
         # (Entware) не передаёт позиционные аргументы после `sh -c 'строка'`
         # — реальные $1..$3 оказываются пустыми, и v0.9.0–v0.9.1 умирали
         # молча, не сумев открыть `>>""` (кейс тихой смерти self-update).
-        # Обёртка без exec дожидается установщика и дописывает его exit-код
-        # в лог: мгновенная смерть перестаёт быть невидимой. --from-update:
+        # Обёртка без exec дожидается установщика, дописывает его exit-код
+        # в лог и возвращает его waiter'у: мгновенная смерть не невидима. --from-update:
         # python/flask уже подняты самим фактом работы панели — установщик
         # пропускает их проверки и не форкает python на тесной памяти.
         env = {**os.environ,
@@ -875,7 +875,7 @@ def api_update_apply():
                 ["/bin/sh", "-c",
                  '/bin/sh "$NP_STAGE" --yes --from-update --ref "$NP_TAG" '
                  '>>"$NP_LOG" 2>&1; '
-                 'rc=$?; echo "installer exit code: $rc" >>"$NP_LOG"'],
+                 'rc=$?; echo "installer exit code: $rc" >>"$NP_LOG"; exit "$rc"'],
                 env=env,
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 start_new_session=True,
@@ -889,12 +889,16 @@ def api_update_apply():
             abort(500, description=f"cannot spawn installer: {exc}")
         # pid в state: умерший установщик распознаётся при следующем же запросе,
         # а не через 15 минут (upd._update_state помечает такой state «failed»)
+        started = time.time()
         upd._update_state_write({"phase": "running", "target": tag,
-                             "started": time.time(), "pid": proc.pid})
+                                 "started": started, "pid": proc.pid,
+                                 "boot_id": upd._boot_id()})
+        upd._start_update_waiter(proc, tag, started)
     app.logger.warning("self-update to %s triggered by %s", tag, request.remote_addr)
     sec._audit("update.apply", target=tag)
-    return jsonify({"started": True, "target": tag, "current": cfg.APP_VERSION,
-                    "log": str(cfg.UPDATE_LOG)}), 202
+    return jsonify({"started": True, "attempt_started": started,
+                    "target": tag, "current": cfg.APP_VERSION,
+                    "pid": proc.pid, "log": str(cfg.UPDATE_LOG)}), 202
 
 
 @app.route("/api/update/log")
