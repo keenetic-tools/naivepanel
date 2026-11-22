@@ -130,13 +130,37 @@ def _update_state_write(st: dict[str, Any]) -> None:
 
 
 def _pid_alive(pid: Any) -> bool:
-    """Жив ли процесс установщика (pid пишем в state с v0.8.1)."""
+    """Жив ли процесс установщика (pid пишем в state с v0.8.1).
+
+    Зомби считается мёртвым: отсоединённая обёртка установщика — ребёнок
+    панели, и до wait() висит defunct — os.kill(pid, 0) по такому
+    преуспевает, state застревал в «running» и блокировал повторный apply
+    фиктивным 409 (ловушка упавшего self-update). Своих детей жнём
+    waitpid(WNOHANG) — заодно reap; чужой pid (state пережил рестарт
+    панели) — состояние Z в /proc/<pid>/stat (на цели /proc есть),
+    без /proc — осмотрительный os.kill как раньше.
+    """
     try:
         pid = int(pid)
     except (TypeError, ValueError):
         return False  # pid нет (state от версии до v0.8.1) — считаем мёртвым
     if pid <= 0:
         return False
+    try:
+        done, _ = os.waitpid(pid, os.WNOHANG)
+        if done == pid:
+            return False  # наш ребёнок вышел — пожали и признали мёртвым
+        return True  # наш ребёнок жив (waitpid вернул 0)
+    except ChildProcessError:
+        pass  # не наш ребёнок — ниже по цепочке
+    except OSError:
+        return False
+    try:
+        # поле state — первое после «)»: имя процесса может содержать скобки
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        return stat.rsplit(")", 1)[1].split()[0] != "Z"
+    except (OSError, IndexError):
+        pass
     try:
         os.kill(pid, 0)
     except ProcessLookupError:

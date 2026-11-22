@@ -1469,7 +1469,21 @@ async function applyUpdate() {
   let wentDown = false;
   for (;;) {
     await new Promise(res => setTimeout(res, 1000));
-    try { renderUpdLog(await jget('/api/update/log?lines=30')); } catch (e) { /* рестарт панели */ }
+    let lg = null;
+    try { lg = await jget('/api/update/log?lines=30'); renderUpdLog(lg); } catch (e) { /* рестарт панели */ }
+    // Установщик умер (сеть/подпись/диск): сервер диагностирует «running»
+    // с мёртвым pid как failed — не жмём 3-минутный таймаут. Сразу форсируем
+    // перепроверку: метка кнопки морфится из кэша чека и может отставать от
+    // свежего тега, а apply всегда ставит свежерезолвленный (кейс v0.27.1:
+    // кнопка говорила 0.27.1, падение повторялось, «Проверить обновления»
+    // из UI не вернуть — после фикса кнопка сама покажет новый тег)
+    if (lg && lg.state && lg.state.phase === 'failed') {
+      $('updMsg').textContent = 'Обновление не удалось — лог ниже; подробности в '
+        + String(d.log || '/opt/var/log/naivepanel-update.log');
+      flash('Обновление не удалось — см. лог обновления', false);
+      checkUpdate(true);  // без await: диалог с логом важнее, кнопка обновится за ним
+      return;
+    }
     let st = null;
     try { st = await (await fetch('/api/status', {cache:'no-store'})).json(); }
     catch (e) { wentDown = true; }

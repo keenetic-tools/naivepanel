@@ -2176,6 +2176,20 @@ def test_update_state_marks_failed_when_installer_dead(app):
     assert json.loads(app.UPDATE_STATE.read_text())["phase"] == "failed"
 
 
+def test_update_state_marks_failed_when_installer_zombie(app):
+    # регрессия ловушки v0.27.x: обёртка установщика — ребёнок панели и
+    # после выхода без wait() висит зомби; os.kill(pid, 0) по зомби
+    # преуспевает, state застревал в «running», повторный apply — 409
+    proc = subprocess.Popen(["/bin/sh", "-c", "exit 3"])
+    deadline = time.time() + 10
+    while time.time() < deadline and app._pid_alive(proc.pid):
+        time.sleep(0.05)  # ребёнок вышел → _pid_alive жнёт зомби и скажет False
+    assert app._pid_alive(proc.pid) is False
+    app._update_state_write({"phase": "running", "target": "v0.0.1",
+                             "started": time.time(), "pid": proc.pid})
+    assert app._update_state()["phase"] == "failed"
+
+
 def test_bind_is_loopback_variants(app):
     assert app._bind_is_loopback() is True            # дефолт 127.0.0.1:8089
     for bind in ("localhost:8089", "[::1]:8089", "127.0.0.1:8089"):
