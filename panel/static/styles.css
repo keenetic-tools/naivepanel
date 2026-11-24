@@ -371,4 +371,27 @@
     /* поля: чекбоксы/радио — исключения, у них своя геометрия */
     input:not([type="checkbox"]):not([type="radio"]), textarea, select { min-height:44px; }
   }
+  /* Баннер сломанного рантайма: панель работает, но не переживёт рестарт
+     (Entware сменил Python). Обычный блок НАД сеткой карточек, в самом верху
+     страницы; боковые отступы повторяет у main, чтобы стоять с ним в одну
+     колонку. Вес — предупреждение: сплошной красный здесь только у
+     необратимого. Кнопки — той же парной сеткой, что .actions карточек. */
+  #rtBanner { margin:var(--sp-5) max(var(--sp-5), calc((100% - 1340px)/2)) 0;
+              padding:var(--sp-3) var(--sp-4); border:1px solid var(--warn);
+              border-left-width:3px; border-radius:var(--r-m); background:var(--card);
+              box-shadow:var(--shadow-1); font-size:var(--fs-13); }
+  #rtBanner p { margin:0 0 var(--sp-1); }
+  #rtBanner .rt-title { font-weight:600; color:var(--warn); }
+  #rtBanner .rt-detail { font-family:var(--font-mono); font-size:var(--fs-12); overflow-wrap:anywhere; }
+  #rtBanner .rt-hint { color:var(--mut); font-size:var(--fs-12); }
+  /* рецепт для SSH — моноширинным, длинная команда переносится, а не рвёт вьюпорт */
+  #rtBanner .rt-hint code { font-family:var(--font-mono); font-size:var(--fs-12);
+                            color:var(--fg); overflow-wrap:anywhere; }
+  .rt-actions { display:grid; grid-template-columns:1fr 1fr; gap:var(--sp-2); margin-top:var(--sp-3); }
+  /* телефон: отступы — как у main, кнопки — в столбик (после базовых правил:
+     та же специфичность, мобильные должны идти позже по каскаду) */
+  @media (max-width:800px) {
+    #rtBanner { margin:14px 14px 0; }
+    .rt-actions { grid-template-columns:1fr; }
+  }
   @media (prefers-reduced-motion: no-preference) { html { scroll-behavior:smooth; } }

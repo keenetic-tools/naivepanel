@@ -509,7 +509,121 @@ function renderStatus(st) {
     $('sysinfo').innerHTML = sysHtml;
     lastSysHtml = sysHtml;
   }
+  renderRuntime(st);
   renderEditorChrome();
+}
+
+// --- Рантайм: панель работает, но может не пережить рестарт -------------------
+// /api/status → runtime: {state: ok|broken|unknown, reason, detail}. «broken» —
+// СВЕЖИЙ интерпретатор не импортирует flask/waitress/bcrypt (реальный кейс:
+// `opkg upgrade` в Entware сменил minor Python, pip-пакеты остались в каталоге
+// старой версии). Работающая панель этого не видит: код уже в памяти. Тогда
+// «Перезапуск» и откат отвечают 409, а баннер предлагает ремонт — установщик
+// текущей версии чинит зависимости и перезапускает панель.
+let rtState = null;  // null = статус ещё не приходил: первое show — без тоста
+function renderRuntime(st) {
+  const rt = st.runtime || {};
+  const broken = rt.state === 'broken';
+  if (!broken) {
+    if (rtState === 'broken') {
+      $('rtBanner').hidden = true;
+      if (rt.state === 'ok') flash('Зависимости панели в порядке — её снова можно перезапускать', true);
+    }
+    rtState = rt.state || 'unknown';
+    return;
+  }
+  const reason = rt.reason || 'Зависимости панели повреждены на диске.';
+  const detail = rt.detail || '';
+  if (rtState !== 'broken') {
+    $('rtBanner').hidden = false;
+    // при первой отрисовке баннер и так первый на странице — тост не нужен
+    if (rtState !== null) flash('Панель не запустится после перезапуска — см. предупреждение вверху страницы', false);
+  }
+  if ($('rtReason').textContent !== reason) $('rtReason').textContent = reason;
+  if ($('rtDetail').textContent !== detail) $('rtDetail').textContent = detail;
+  $('rtDetail').hidden = !detail;
+  // рецепт для SSH — теми же командами, что чинит установщик: «Исправить»
+  // может быть недоступен (нет хода к GitHub), а текст уже перед глазами
+  const hint = rt.hint || '';
+  if ($('rtHint').textContent !== hint) $('rtHint').textContent = hint;
+  $('rtSsh').hidden = !hint;
+  rtState = 'broken';
+}
+
+async function runtimeRecheck() {
+  const btn = $('btnRtRecheck');
+  btn.disabled = true;
+  try {
+    const d = await jpost('/api/runtime/check', null);
+    if (lastStatus) { lastStatus.runtime = d.runtime; renderRuntime(lastStatus); }
+    if (d.runtime && d.runtime.state === 'broken') {
+      flash('Всё ещё сломано: ' + (d.runtime.detail || 'зависимости не импортируются'), false);
+    }
+  } catch (e) { flash('Не удалось перепроверить: ' + e.message, false); }
+  finally { btn.disabled = false; }
+}
+
+// Ремонт = переустановка ТЕКУЩЕЙ версии установщиком (--from-update): его
+// deps_check чинит зависимости свежим интерпретатором и только потом
+// перезапускает панель; не вышло — умирает до подмены файлов, и эта панель
+// продолжает работать. Поэтому успех — не смена версии (её нет), а ДРУГОЙ
+// процесс панели (panel.started в /api/status).
+async function runtimeRepair() {
+  const ok = await askConfirm(
+    'Восстановить зависимости и перезапустить панель?\nУстановщик заново поставит текущую версию: '
+    + 'проверит Python и модули свежим интерпретатором, доустановит недостающее и перезапустит панель. '
+    + 'Прокси (naive) продолжит работать.',
+    {ok: 'Исправить'});
+  if (!ok) return;
+  const before = lastStatus && lastStatus.panel ? lastStatus.panel.started : null;
+  let d;
+  try { d = await jpost('/api/update/repair', null); }
+  catch (e) { flash('Ремонт не запущен: ' + e.message, false); return; }
+  const want = String(d.target || '').replace(/^v/, '');
+  resetUpdateDialog(true);
+  $('updTitle').textContent = 'Восстановление зависимостей';
+  $('updMsg').textContent = 'Переустановка v' + want + ': установщик чинит зависимости и перезапускает панель…';
+  $('updDlg').showModal();
+  flash('Ремонт запущен', true);
+  const deadline = Date.now() + 180000;
+  let wentDown = false;
+  for (;;) {
+    await new Promise(res => setTimeout(res, 1000));
+    let lg = null;
+    try { lg = await jget('/api/update/log?lines=30'); renderUpdLog(lg); } catch (e) { /* рестарт панели */ }
+    if (lg && lg.state && lg.state.phase === 'failed'
+        && d.pid != null && d.attempt_started != null
+        && lg.state.pid === d.pid && lg.state.started === d.attempt_started) {
+      $('updStatus').classList.add('failed');
+      $('updMsg').textContent = 'Восстановить зависимости не удалось';
+      const reason = lg.state.error || 'Установщик завершился с ошибкой — см. лог ниже';
+      const code = Number.isInteger(lg.state.exit_code) ? 'Код выхода: ' + lg.state.exit_code + ' · ' : '';
+      $('updError').textContent = code + reason + '. Панель продолжает работать прежним кодом, '
+        + 'рецепт — в логе установщика. Подробности: '
+        + String(d.log || '/opt/var/log/naivepanel-update.log');
+      $('updError').hidden = false;
+      $('updLogDetails').open = true;
+      flash('Не удалось восстановить зависимости — см. лог установщика', false);
+      return;
+    }
+    let st = null;
+    try { st = await (await fetch('/api/status', {cache:'no-store'})).json(); }
+    catch (e) { wentDown = true; }
+    const restarted = st && st.panel && (before != null
+      ? st.panel.started !== before           // другой процесс — надёжно и без наблюдённого «упал»
+      : wentDown && st.panel.started);        // страховка: панель успела упасть и подняться между поллами
+    if (restarted) {
+      $('updMsg').textContent = 'Зависимости восстановлены — перезагружаю страницу…';
+      setTimeout(() => location.reload(), 900);
+      return;
+    }
+    if (Date.now() > deadline) {
+      $('updMsg').textContent = 'Панель не перезапустилась за 3 мин — лог ниже; подробности в '
+        + String(d.log || '/opt/var/log/naivepanel-update.log');
+      flash('Ремонт не завершился вовремя — см. лог установщика', false);
+      return;
+    }
+  }
 }
 
 let tgConfigured = false;
@@ -1369,7 +1483,16 @@ async function panelRestart() {
   if (!(await askConfirm('Перезапустить саму панель? Страница перезагрузится, когда сервер поднимется.', {ok:'Перезапустить'}))) return;
   try {
     const r = await fetch('/api/panel/restart', {method:'POST', headers:CSRF});
-    if (!(r.ok || r.status === 202)) { flash(await r.text(), false); return; }
+    if (!(r.ok || r.status === 202)) {
+      // 409 «не запустится после перезапуска» приходит JSON-ошибкой: показываем
+      // её текст (рецепт), а не сырое тело; баннер с кнопкой ремонта поднимет
+      // следующий же poll статуса
+      let msg = await r.text();
+      try { msg = JSON.parse(msg).error || msg; } catch { /* не JSON — как есть */ }
+      flash(msg, false, 12000);
+      pollStatus();
+      return;
+    }
   } catch (e) {
     flash('Не удалось отправить команду: '+e.message, false); return;
   }
@@ -2052,6 +2175,8 @@ const ACTIONS = {
   foUp: (arg) => foMove(arg, -1),
   foDown: (arg) => foMove(arg, 1),
   panelRestart: () => panelRestart(),
+  rtFix: () => runtimeRepair(),
+  rtRecheck: () => runtimeRecheck(),
   // одна кнопка на поток: есть обновление → применить, нет → перепроверить
   updateCheck: () => (upd && upd.available) ? applyUpdate() : checkUpdate(true),
   updateRetry: () => retryUpdate(),

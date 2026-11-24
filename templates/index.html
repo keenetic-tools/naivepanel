@@ -33,6 +33,22 @@
   <a href="#sec-system">Система</a>
   <a href="#sec-settings">Настройки</a>
 </nav>
+<!-- Сломанный рантайм (Entware сменил Python и т.п.): панель работает кодом из
+     памяти, но не переживёт рестарт. role=alert появляется только в этом
+     состоянии; текст ставит renderRuntime() из /api/status → runtime. -->
+<div id="rtBanner" role="alert" hidden>
+  <p class="rt-title">Панель не запустится после перезапуска</p>
+  <p id="rtReason"></p>
+  <p id="rtDetail" class="rt-detail"></p>
+  <p class="rt-hint" id="rtSsh" hidden>По SSH: <code id="rtHint"></code></p>
+  <p class="rt-hint">«Перезапуск» и откат версий заблокированы до исправления. Прокси (naive) работает как прежде.</p>
+  <div class="rt-actions">
+    <button type="button" id="btnRtFix" data-action="rtFix"
+            title="Переустановить текущую версию установщиком: он проверит Python и модули свежим интерпретатором, доустановит недостающее и перезапустит панель">Исправить и перезапустить</button>
+    <button type="button" class="ghost" id="btnRtRecheck" data-action="rtRecheck"
+            title="Проверить свежим интерпретатором, что панель снова сможет стартовать (после починки по SSH)">Перепроверить</button>
+  </div>
+</div>
 <main>
   <section class="card" id="sec-overview" style="grid-area:aside">
     <h2>Обзор</h2>

@@ -703,6 +703,11 @@ def _status() -> dict[str, Any]:
                    "pending": len(_notify_pending_all())},
         "auth": {"enabled": cfg.PANEL_ADMIN_PASS.exists(),
                  "user": auth.username if auth else None},
+        # момент старта процесса: UI отличает «та же панель» от перезапущенной
+        # там, где версия не меняется (ремонт зависимостей)
+        "panel": {"started": svc.PANEL_STARTED},
+        # сможет ли СВЕЖИЙ интерпретатор поднять панель после рестарта
+        "runtime": svc._runtime_status(),
     }
 
 # --- Уведомления: очередь + sender-поток --------------------------------------
@@ -725,6 +730,24 @@ def _notify(event: str, text: str, dedupe_s: float = 60.0) -> None:
         return
     _notify_last[event] = now
     _notify_queue.put((event, text))
+
+
+def _runtime_alert(res: dict[str, Any]) -> None:
+    """Рантайм сломан под работающей панелью — событие для уведомлений.
+
+    Баннер и гейт рестарта не помогают, если панель умрёт при перезагрузке
+    роутера, пока никто не смотрит в UI. Дедуп 6ч — как у «доступно
+    обновление»: перепроверки сломанного рантайма идут каждые две минуты.
+    """
+    _notify("runtime_broken",
+            "⚠️ Панель не запустится после перезапуска: "
+            f"{res.get('detail', '')}. {res.get('reason') or ''}".strip()
+            + " Откройте панель — там кнопка «Исправить и перезапустить».",
+            dedupe_s=6 * 3600.0)
+
+
+# service не импортирует monitor (зависимость односторонняя) — крючок вешаем здесь
+svc._RUNTIME_ON_BROKEN = _runtime_alert
 
 
 def _notify_send(event: str, text: str,

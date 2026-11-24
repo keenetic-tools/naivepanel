@@ -708,6 +708,12 @@ def api_panel_restart():
     """
     if not cfg.PANEL_INIT.exists():
         abort(503, description=f"{cfg.PANEL_INIT} not found")
+    # Рестарт — последний для панели, если свежий интерпретатор её не поднимет
+    # (Entware сменил minor Python и т.п.). Вердикт синхронный, не из кэша:
+    # зависимости могли починить по SSH после последней фоновой проверки.
+    if (block := svc._runtime_restart_block()):
+        sec._audit("panel.restart_refused")
+        abort(409, description=block)
     # Новая сессия → ребёнок переживёт смерть Flask-процесса. Путь — через
     # окружение, не позиционные аргументы -c: busybox на Keenetic их не
     # передаёт (тот же баг, что молча убивал self-update в v0.9.0–v0.9.1).
@@ -810,30 +816,23 @@ def api_update_check():
             mon._EXPENSIVE_SEM.release()
 
 
-@app.route("/api/update/apply", methods=["POST"])
-def api_update_apply():
-    """Запуск обновления: spawn отсоединённого `install.sh --yes --from-update
-    --ref <тег>` с записью exit-кода установщика в лог.
+def _spawn_panel_installer(tag: str, repair: bool = False) -> dict[str, Any]:
+    """Отсоединённо запустить `install.sh --yes --from-update --ref <tag>`.
 
-    Установщик скачивает файлы тега, сверяет SHA256SUMS, ставит их и в конце
+    Общий запуск для /api/update/apply (новый релиз) и /api/update/repair
+    (переустановка текущей версии: установщик проверяет зависимости СВЕЖИМ
+    интерпретатором и чинит их — deps_check в install.sh). Установщик
+    скачивает файлы тега, сверяет подпись и SHA256SUMS, ставит их и в конце
     сам делает `S99naivepanel restart` — Flask-процесс умирает посреди
     установки, поэтому ребёнок живёт в новой сессии (как /api/panel/restart).
-    Реф клиент не передаёт: сервер сам резолвит последний тег. Прокси
-    (S99naiveproxy) установщик не перезапускает — соединения не рвутся.
+
+    Скачивание install.sh — до лока: секунды ожидания не должны блокировать
+    конкурентный запрос, который после re-check под локом получит честный 409.
     """
-    # Обновление подменяет код панели: без пароля — только loopback-bind
-    sec._require_local_or_auth()
-    # сетевая фаза (резолв + скачивание install.sh) — до лока: секунды
-    # ожидания не должны блокировать конкурентный запрос, который после
-    # re-check под локом получит честный 409
-    try:
-        rel = upd._latest_release()
-    except RuntimeError as exc:
-        abort(502, description=str(exc))
-    tag = rel["tag"]
+    kind = "repair" if repair else "self-update"
     try:
         installer = mon._http_get(f"{cfg.UPDATE_RAW_BASE}/{cfg.UPDATE_REPO}/{tag}/install.sh",
-                              timeout=30.0)
+                                  timeout=30.0)
     except RuntimeError as exc:
         abort(502, description=f"cannot download install.sh@{tag}: {exc}")
     with upd._UPDATE_LAUNCH_LOCK:
@@ -843,8 +842,11 @@ def api_update_apply():
                                    f"progress — installer log: {cfg.UPDATE_LOG}")
         try:
             cfg.PANEL_DIR.mkdir(parents=True, exist_ok=True)
-            # бэкап заменяемых файлов — для отката из UI после неудачного апдейта
-            upd._backup_panel_files()
+            # бэкап заменяемых файлов — для отката из UI после неудачного апдейта.
+            # Ремонт ставит ту же версию: её «бэкап» был бы бессмысленной строкой
+            # в списке отката (сервер и так отвергает откат на себя)
+            if not repair:
+                upd._backup_panel_files()
             stage = cfg.PANEL_DIR / ".update-install.sh"
             stage.write_text(installer, encoding="utf-8")
             os.chmod(stage, 0o700)
@@ -854,7 +856,7 @@ def api_update_apply():
             # пустым, ничего не отличалось от «лог не создан». Теперь пустой лог
             # после пролога сам по себе диагноз.
             cfg.UPDATE_LOG.write_text(
-                f"== self-update {cfg.APP_VERSION} -> {tag}, "
+                f"== {kind} {cfg.APP_VERSION} -> {tag}, "
                 f"spawn {time.strftime('%Y-%m-%d %H:%M:%S')}\n",
                 encoding="utf-8")
         except OSError as exc:
@@ -865,9 +867,11 @@ def api_update_apply():
         # — реальные $1..$3 оказываются пустыми, и v0.9.0–v0.9.1 умирали
         # молча, не сумев открыть `>>""` (кейс тихой смерти self-update).
         # Обёртка без exec дожидается установщика, дописывает его exit-код
-        # в лог и возвращает его waiter'у: мгновенная смерть не невидима. --from-update:
-        # python/flask уже подняты самим фактом работы панели — установщик
-        # пропускает их проверки и не форкает python на тесной памяти.
+        # в лог и возвращает его waiter'у: мгновенная смерть не невидима.
+        # --from-update: установщик не трогает бинарник naive и проверяет
+        # python/deps одним форком СВЕЖЕГО интерпретатора — работающая панель
+        # не доказывает, что рестарт её поднимет (opkg upgrade мог сменить
+        # Python); не поднимет — он умирает до подмены файлов.
         env = {**os.environ,
                "NP_STAGE": str(stage), "NP_TAG": tag, "NP_LOG": str(cfg.UPDATE_LOG)}
         try:
@@ -890,15 +894,75 @@ def api_update_apply():
         # pid в state: умерший установщик распознаётся при следующем же запросе,
         # а не через 15 минут (upd._update_state помечает такой state «failed»)
         started = time.time()
-        upd._update_state_write({"phase": "running", "target": tag,
-                                 "started": started, "pid": proc.pid,
-                                 "boot_id": upd._boot_id()})
+        running = {"phase": "running", "target": tag, "started": started,
+                   "pid": proc.pid, "boot_id": upd._boot_id()}
+        if repair:
+            running.update(repair=True, panel_pid=os.getpid())
+        upd._update_state_write(running)
         upd._start_update_waiter(proc, tag, started)
+    return {"started": True, "attempt_started": started,
+            "target": tag, "current": cfg.APP_VERSION,
+            "pid": proc.pid, "log": str(cfg.UPDATE_LOG)}
+
+
+@app.route("/api/update/apply", methods=["POST"])
+def api_update_apply():
+    """Запуск обновления: spawn отсоединённого `install.sh --yes --from-update
+    --ref <тег>` с записью exit-кода установщика в лог.
+
+    Установщик скачивает файлы тега, сверяет SHA256SUMS, ставит их и в конце
+    сам делает `S99naivepanel restart` — Flask-процесс умирает посреди
+    установки, поэтому ребёнок живёт в новой сессии (как /api/panel/restart).
+    Реф клиент не передаёт: сервер сам резолвит последний тег. Прокси
+    (S99naiveproxy) установщик не перезапускает — соединения не рвутся.
+    """
+    # Обновление подменяет код панели: без пароля — только loopback-bind
+    sec._require_local_or_auth()
+    # сетевая фаза (резолв релиза) — до лока (см. _spawn_panel_installer)
+    try:
+        rel = upd._latest_release()
+    except RuntimeError as exc:
+        abort(502, description=str(exc))
+    tag = rel["tag"]
+    d = _spawn_panel_installer(tag)
     app.logger.warning("self-update to %s triggered by %s", tag, request.remote_addr)
     sec._audit("update.apply", target=tag)
-    return jsonify({"started": True, "attempt_started": started,
-                    "target": tag, "current": cfg.APP_VERSION,
-                    "pid": proc.pid, "log": str(cfg.UPDATE_LOG)}), 202
+    return jsonify(d), 202
+
+
+@app.route("/api/update/repair", methods=["POST"])
+def api_update_repair():
+    """Переустановить ТЕКУЩУЮ версию установщиком — ремонт зависимостей.
+
+    Сценарий: `opkg upgrade` в Entware сменил minor Python, pip-пакеты
+    остались в каталоге старой версии. Панель ещё работает (код в памяти), но
+    рестарт был бы последним. Установщик тега текущей версии проверяет
+    зависимости свежим интерпретатором, доустанавливает недостающее и только
+    тогда перезапускает панель; починить не вышло — умирает ДО подмены
+    файлов, и эта панель продолжает работать (state уйдёт в «failed»).
+    """
+    # тот же гейт, что update/apply: установщик исполняется от root
+    sec._require_local_or_auth()
+    tag = f"v{cfg.APP_VERSION}"
+    if not cfg._TAG_RE.match(tag):
+        abort(409, description="repair needs a released vX.Y.Z build")
+    d = _spawn_panel_installer(tag, repair=True)
+    app.logger.warning("runtime repair (reinstall %s) triggered by %s",
+                       tag, request.remote_addr)
+    sec._audit("update.repair", target=tag)
+    return jsonify({**d, "repair": True}), 202
+
+
+@app.route("/api/runtime/check", methods=["POST"])
+def api_runtime_check():
+    """Перепроверить рантайм свежим интерпретатором — кнопка «Перепроверить».
+
+    Фоновая проверка идёт не чаще раза в две минуты: после починки по SSH
+    ждать её не нужно. POST + CSRF, не GET: пробник форкает python, и запрос
+    с таким побочным эффектом не должен срабатывать от ссылки или prefetch.
+    """
+    svc._runtime_refresh()
+    return jsonify({"runtime": svc._runtime_status()})
 
 
 @app.route("/api/update/log")
@@ -1092,6 +1156,13 @@ def api_rollback_post():
     if not (backup / "naivepanel.py").is_file():
         abort(404, description=f"no usable backup {version} "
                                f"(need naivepanel.py inside)")
+    # Откат заканчивается рестартом панели — тем же последним, если свежий
+    # интерпретатор её не поднимет; старые файлы возвращать нельзя: процесс
+    # продолжит работать новым кодом из памяти, а на диске будет смесь.
+    # До лока: пробник синхронный (до 30с) и не должен держать update-лок.
+    if (block := svc._runtime_restart_block()):
+        sec._audit("rollback.panel_refused", target=version)
+        abort(409, description=block)
     with upd._UPDATE_LAUNCH_LOCK:
         # state общий с update/apply: re-check под локом (см. upd._UPDATE_LAUNCH_LOCK)
         state = upd._update_state()

@@ -28,9 +28,12 @@
 #   --naive-force        (re)install the naive binary even if one exists
 #   --skip-naive         never touch the naive binary, warn only
 #   --from-update        internal: spawned by the panel's self-update —
-#                        skips python/deps checks (the running panel already
-#                        proves they work; their forks die on tight router RAM)
-#                        and the naive step (panel updates binary separately)
+#                        verifies python/deps with ONE fresh-interpreter check
+#                        (a running panel keeps old code in memory and cannot
+#                        prove the on-disk runtime still starts), repairs them
+#                        when broken and never restarts a running panel into a
+#                        broken runtime; skips the naive step (the panel
+#                        updates the binary separately)
 #   --no-naive-init      do not install S99naiveproxy init script
 #   --yes                non-interactive (no confirmation prompt)
 #   --uninstall          stop services and remove installed files
@@ -94,7 +97,7 @@ Usage: install.sh [flags]
   --naive-ref TAG      klzgrad/naiveproxy tag (default: latest release)
   --naive-force        (re)install naive binary even if one exists
   --skip-naive         never touch the naive binary
-  --from-update        internal: spawned by self-update, skips python checks
+  --from-update        internal: spawned by self-update, checks python deps once
   --no-naive-init      do not install S99naiveproxy init script
   --yes                non-interactive (no confirmation prompt)
   --uninstall          stop services and remove installed files
@@ -256,33 +259,112 @@ if [ -d "$OLD_PANEL_DIR" ] || [ -d "$OLD_PANEL_ETC" ] || [ -d "$OLD_PROXY_DIR" ]
 fi
 
 # --- python + deps ---------------------------------------------------------
+#@np-deps-begin
+# (маркеры #@np-deps-* — функциональный тест вырезает блок и гоняет его на стабах)
 
 # The panel must run on Entware's python (opkg flask/bcrypt land in /opt as
 # well), so on an opkg system never settle for a system python3.
 PYTHON=/opt/bin/python3
 [ -x "$PYTHON" ] || PYTHON=/opt/bin/python
-
 if [ "$FROM_UPDATE" = 1 ]; then
-    # Проверки ниже трижды форкают python, чтобы убедиться в том, что уже
-    # доказано самим фактом работы панели, из которой мы запущены. На тесной
-    # памяти роутера (naive + панель) именно эти форки — самое вероятное
-    # место тихой смерти фонового обновления (кейс v0.9.0).
     [ -x "$PYTHON" ] || PYTHON=$(command -v python3 2>/dev/null || echo python3)
-    info "python/deps checks skipped (--from-update)"
-else
-    if [ ! -x "$PYTHON" ] && command -v opkg >/dev/null 2>&1; then
-        info "Entware python3 missing — installing via opkg"
-        opkg update >/dev/null
-        opkg install python3 || die "opkg install python3 failed"
-        PYTHON=/opt/bin/python3
-        [ -x "$PYTHON" ] || PYTHON=/opt/bin/python
+fi
+
+# Адрес, который панель будет слушать после рестарта (флаг --bind >
+# panel.conf > 127.0.0.1:8089). Для гейта важен только вопрос «loopback?»:
+# без waitress панель на loopback стартует через Werkzeug, а на LAN-адресе
+# отказывается стартовать (SEC-06).
+bind_host() {  # → stdout: хост bind-адреса
+    b="$BIND"
+    if [ -z "$b" ] && [ -f "$PANEL_CONF" ]; then
+        b=$(sed -n 's/^[[:space:]]*NAIVEPANEL_BIND=//p' "$PANEL_CONF" 2>/dev/null \
+            | head -n 1 | tr -d "\"'")
     fi
-    [ -x "$PYTHON" ] || PYTHON=$(command -v python3 2>/dev/null || echo python3)
+    b="${b:-127.0.0.1:8089}"
+    case "$b" in
+        \[*\]) b=${b#\[}; b=${b%%\]*} ;;
+        *:*)   b=${b%:*} ;;
+    esac
+    printf '%s\n' "$b"
+}
+
+# deps_check — «поднимется ли панель после рестарта» спрашивают не у работающей
+# панели, а у СВЕЖЕГО процесса интерпретатора (тем же путём, что стартует
+# init-скрипт). Работающая держит код в памяти и не замечает, что `opkg
+# upgrade` сменил minor Python (3.13 → 3.14, Entware, ноя 2026): pip-пакеты
+# остаются в каталоге старой версии, и первым о новом интерпретаторе узнаёт
+# рестарт — уже фатальный. Раньше --from-update проверки пропускал, и
+# «Обновить» из UI укладало такую панель насмерть.
+# Один форк вместо трёх. Код возврата:
+#   0 — всё импортируется;
+#   1 — доказано сломано, DEPS_MISSING — что именно (через пробел);
+#   2 — проверка сама не удалась (процесс убит или не стартовал): выводов
+#       нет, ведём себя как до гейта — без блокировок
+deps_check() {
+    DEPS_MISSING=""
+    if [ ! -x "$PYTHON" ]; then
+        DEPS_MISSING="python3"
+        return 1
+    fi
+    deps_want="flask"
+    case "$(bind_host)" in
+        localhost|127.*|::1) ;;
+        *) deps_want="$deps_want waitress" ;;
+    esac
+    if [ "$WITH_AUTH" = 1 ] || [ -f "$PANEL_DIR/admin.pass" ]; then
+        # без bcrypt панель стартует, но не пускает ни одного пользователя
+        deps_want="$deps_want bcrypt"
+    fi
+    # Список модулей — через окружение (NP_DEPS): сам код проверки остаётся
+    # константой, как и у спавнов панели.
+    DEPS_MISSING=$(NP_DEPS="$deps_want" "$PYTHON" -c '
+import importlib, os, sys
+if sys.version_info < (3, 10):
+    print("python3")
+    sys.exit(3)
+missing = []
+for name in os.environ.get("NP_DEPS", "").split():
+    try:
+        importlib.import_module(name)
+    except ImportError:
+        missing.append(name)
+print(" ".join(missing))
+sys.exit(3 if missing else 0)
+' 2>/dev/null)
+    case $? in
+        0) return 0 ;;
+        3) # пробелы/переносы в один разделитель: $DEPS_MISSING печатается в лог
+           # shellcheck disable=SC2086  # разбивка по словам здесь и нужна
+           set -- $DEPS_MISSING; DEPS_MISSING="$*"; return 1 ;;
+        *) DEPS_MISSING=""; return 2 ;;
+    esac
+}
+
+# deps_ensure — поставить недостающее, как при ручной установке: python
+# нужной версии, затем модули — opkg, а где пакета нет (aarch64-k3.10 без
+# python3-flask/waitress) — pip. Само ничего не доказывает и не выходит из
+# скрипта: вердикт и единственная точка выхода с рецептом — deps_check и
+# deps_gate_fail. Скрытая die здесь оставляла в логе «pip install flask
+# failed» без причины и без рецепта.
+deps_ensure() {
+    if [ ! -x "$PYTHON" ]; then
+        if command -v opkg >/dev/null 2>&1; then
+            info "Entware python3 missing — installing via opkg"
+            opkg update >/dev/null
+            opkg install python3 || warn "opkg install python3 failed"
+            PYTHON=/opt/bin/python3
+            [ -x "$PYTHON" ] || PYTHON=/opt/bin/python
+        fi
+        if [ ! -x "$PYTHON" ]; then
+            PYTHON=$(command -v python3 2>/dev/null || echo python3)
+            [ -x "$PYTHON" ] || { warn "no usable python3 yet"; return; }
+        fi
+    fi
 
     if ! "$PYTHON" -c 'import sys; sys.exit(0 if sys.version_info >= (3,10) else 1)' 2>/dev/null; then
         info "python3 >= 3.10 missing — installing via opkg"
         opkg update >/dev/null
-        opkg install python3 || die "opkg install python3 failed"
+        opkg install python3 || warn "opkg install python3 failed"
         PYTHON=/opt/bin/python3
         [ -x "$PYTHON" ] || PYTHON=/opt/bin/python
     fi
@@ -295,8 +377,8 @@ else
         # some Entware targets (e.g. aarch64-k3.10) ship no python3-flask package
         if ! opkg install python3-flask 2>/dev/null; then
             warn "python3-flask unavailable via opkg — falling back to pip"
-            opkg install python3-pip || die "opkg install python3-pip failed"
-            /opt/bin/pip3 install --no-cache-dir flask || die "pip install flask failed"
+            opkg install python3-pip || warn "opkg install python3-pip failed"
+            /opt/bin/pip3 install --no-cache-dir flask || warn "pip install flask failed"
         fi
     fi
 
@@ -305,19 +387,79 @@ else
         opkg update >/dev/null
         if ! opkg install python3-waitress 2>/dev/null; then
             warn "python3-waitress unavailable via opkg — falling back to pip"
-            opkg install python3-pip || die "opkg install python3-pip failed"
+            opkg install python3-pip || warn "opkg install python3-pip failed"
             /opt/bin/pip3 install --no-cache-dir waitress || warn "pip install waitress failed"
         fi
     fi
 
-    if [ "$WITH_AUTH" = 1 ]; then
+    # bcrypt нужен не только по флагу: admin.pass мог остаться от прошлой
+    # установки (при self-update --with-auth не передаётся)
+    if [ "$WITH_AUTH" = 1 ] || [ -f "$PANEL_DIR/admin.pass" ]; then
         if ! "$PYTHON" -c 'import bcrypt' 2>/dev/null; then
             info "python3-bcrypt missing — installing via opkg"
             opkg update >/dev/null
-            opkg install python3-bcrypt || warn "python3-bcrypt unavailable via opkg (fallback: pip install bcrypt)"
+            # всегда с --force-reinstall: пересборка пакета под новый Python
+            # может не сменить версию — opkg install такое считает «already
+            # up to date» и оставляет модуль в каталоге старой версии
+            opkg install --force-reinstall python3-bcrypt \
+                || warn "python3-bcrypt unavailable via opkg (fallback: pip install bcrypt)"
         fi
     fi
+}
+
+deps_gate_fail() {
+    # Файлы панели ещё не тронуты. Работающую панель нельзя перезапускать в
+    # заведомо нерабочее состояние: она продолжает отвечать старым кодом из
+    # памяти, а в логе обновления остаются причина и рецепт.
+    hint="    $PYTHON -m pip install --no-cache-dir flask waitress
+    opkg install --force-reinstall python3-bcrypt   # if bcrypt is listed above"
+    case " $DEPS_MISSING " in
+        *" python3 "*) hint="    opkg install python3" ;;
+    esac
+    if [ "$FROM_UPDATE" = 1 ] || "$INIT_DIR/S99naivepanel" status >/dev/null 2>&1; then
+        die "python deps NOT importable by $PYTHON: $DEPS_MISSING
+  A restart would kill the running panel: its files were NOT replaced and it
+  was NOT restarted. Usually Entware's 'opkg upgrade' changed the Python
+  version and pip-installed packages stayed with the old one. Fix over SSH:
+$hint
+  then retry."
+    fi
+    die "python deps NOT importable by $PYTHON: $DEPS_MISSING
+  The panel would not start after this run, so its files were NOT touched.
+  Usually Entware's 'opkg upgrade' changed the Python version and
+  pip-installed packages stayed with the old one. Fix over SSH:
+$hint
+  then retry."
+}
+
+# --from-update: один форк ради вердикта «можно ли перезапускать». Проверка
+# сама не удалась (убита по памяти, не стартовала) — это не диагноз
+# зависимостям: не делаем выводов и ничего не чиним. Иначе чиним и
+# перепроверяем; не починилось — гейт выше не даст тронуть работающую панель.
+deps_check
+DEPS_RC=$?
+DEPS_SKIP=0
+DEPS_HAD=""
+if [ "$DEPS_RC" = 2 ] && [ "$FROM_UPDATE" = 1 ]; then
+    warn "python/deps check inconclusive — continuing without it"
+    DEPS_SKIP=1
+elif [ "$DEPS_RC" != 0 ]; then
+    DEPS_HAD=${DEPS_MISSING:-unknown}
+    deps_ensure
 fi
+if [ "$DEPS_SKIP" != 1 ]; then
+    if [ "$DEPS_RC" = 0 ]; then
+        [ "$FROM_UPDATE" = 1 ] && info "python/deps OK (fresh interpreter)"
+    else
+        deps_check
+        case $? in
+            0) info "python/deps OK — installed: $DEPS_HAD" ;;
+            1) deps_gate_fail ;;
+            2) warn "python/deps check inconclusive after repair" ;;
+        esac
+    fi
+fi
+#@np-deps-end
 
 # --- naive binary: детект таргета и установка -------------------------------
 

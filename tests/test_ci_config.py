@@ -42,7 +42,7 @@ def test_workflows_use_only_pinned_actions():
 
 def test_ci_has_required_matrix_and_gates():
     ci = _workflow("ci.yml")
-    assert '["3.10", "3.11", "3.12", "3.13"]' in ci
+    assert '["3.10", "3.11", "3.12", "3.13", "3.14"]' in ci
     # мягкое продолжение допустимо только как YAML-ключ с true
     assert not re.search(r"^\s*continue-on-error\s*:\s*true", ci, re.MULTILINE)
     assert "python -m pytest -q" in ci
@@ -79,10 +79,27 @@ def test_docker_e2e_ships_panel_package_and_is_arch_aware():
     assert 'bin.entware.net/$ENTWARE_ARCH/' in script
 
 
+def _app_version() -> str:
+    """Версия из panel/config.py (единственный источник с v0.21.0)."""
+    text = (APP_DIR / "panel" / "config.py").read_text(encoding="utf-8")
+    m = re.search(r'^APP_VERSION = "([0-9.]+)"$', text, re.MULTILINE)
+    assert m, "APP_VERSION not found in panel/config.py"
+    return m.group(1)
+
+
+def _next_patch(version: str) -> str:
+    """Следующий патч-тег: docker-e2e.sh гоняет self-update на синтетический
+    следующий релиз, поэтому REF/NEXT_REF обязаны идти за APP_VERSION."""
+    major, minor, patch = version.split(".")
+    return f"v{major}.{minor}.{int(patch) + 1}"
+
+
 def test_docker_e2e_self_update_failure_retry_and_zombie():
     script = (APP_DIR / "docker-e2e.sh").read_text(encoding="utf-8")
+    ver = _app_version()
     for marker in (
-        "NEXT_REF=v0.27.5",
+        f"REF=v{ver}",
+        f"NEXT_REF={_next_patch(ver)}",
         "tools/release_sign.py",
         "keygen --secret",
         "NAIVEPANEL_UPDATE_API",

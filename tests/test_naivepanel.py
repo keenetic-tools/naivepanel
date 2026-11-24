@@ -12,6 +12,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import types
@@ -52,6 +53,9 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setenv("NAIVEPANEL_DIR", str(tmp_path / "panel"))
     monkeypatch.setenv("NAIVEPANEL_UPDATE_LOG", str(tmp_path / "update.log"))
     monkeypatch.setenv("NAIVEPROXY_UPDATE_LOG", str(tmp_path / "naivepanel-naive.log"))
+    # Пробник рантайма (svc._runtime_probe) иначе форкает настоящий python на
+    # каждом рестарте панели/откате: по умолчанию вердикт «всё на месте».
+    monkeypatch.setenv("NAIVEPANEL_RUNTIME_OVERRIDE", "ok")
     monkeypatch.syspath_prepend(str(APP_DIR))
     return tmp_path
 
@@ -2067,6 +2071,380 @@ def test_apply_502_when_install_sh_fails(client, app, env, monkeypatch):
     assert client.post("/api/update/apply", headers=CSRF).status_code == 502
 
 
+# --- Рантайм: панель работает, но рестарт был бы последним ---------------------
+# Кейс 2026-11: `opkg upgrade` в Entware сменил minor Python (3.13 → 3.14),
+# pip-пакеты flask/waitress остались в каталоге старой версии. Работающая панель
+# этого не видит (код в памяти) — о новом интерпретаторе узнавал рестарт.
+
+def _runtime_real(app, monkeypatch):
+    """Снять тестовую подмену вердикта: дальше решает только пробник."""
+    monkeypatch.delenv("NAIVEPANEL_RUNTIME_OVERRIDE")
+    return app.svc
+
+
+def _runtime_settle(app):
+    """Дождаться фоновой проверки рантайма, если она запущена."""
+    thread = app.svc._RUNTIME["thread"]
+    if thread is not None:
+        thread.join(10)
+    return app.svc._runtime_status()
+
+
+def test_status_reports_runtime_and_panel_start_without_forking(app, monkeypatch):
+    svc = _runtime_real(app, monkeypatch)
+
+    def no_fork(*args, **kwargs):
+        raise AssertionError("healthy panel must not fork a probe for /api/status")
+
+    monkeypatch.setattr(svc.subprocess, "run", no_fork)
+    d = app.app.test_client().get("/api/status").get_json()
+    # признаков подмены нет → верим «ok»: /api/status поллится каждые 3с
+    assert d["runtime"]["state"] == "ok"
+    assert d["panel"]["started"] == svc.PANEL_STARTED
+
+
+def test_runtime_probe_with_real_interpreter(app, monkeypatch):
+    svc = _runtime_real(app, monkeypatch)
+    assert svc._runtime_run(sys.executable, ("flask",))["state"] == "ok"
+    broken = svc._runtime_run(sys.executable, ("flask", "no_such_module_np"))
+    assert broken["state"] == "broken"
+    assert broken["missing"] == ["no_such_module_np"]
+    # сам интерпретатор не запустился — не «сломано», а «неизвестно»: гейт
+    # блокирует только доказанное
+    assert svc._runtime_run(str(APP_DIR / "no-such-python"), ("flask",))["state"] == "unknown"
+
+
+def test_runtime_run_normalizes_probe_failures(app, monkeypatch):
+    svc = _runtime_real(app, monkeypatch)
+
+    def answer(rc, out=""):
+        class R:
+            pass
+        R.returncode, R.stdout = rc, out
+        return lambda *args, **kwargs: R()
+
+    monkeypatch.setattr(svc.subprocess, "run", answer(3, "flask waitress\n"))
+    r = svc._runtime_run("py", ("flask", "waitress"))
+    assert r["state"] == "broken" and r["missing"] == ["flask", "waitress"]
+    # убит (OOM), упал с traceback, завис — выводов не делаем
+    monkeypatch.setattr(svc.subprocess, "run", answer(137))
+    assert svc._runtime_run("py", ("flask",))["state"] == "unknown"
+    monkeypatch.setattr(svc.subprocess, "run", answer(1, "Traceback ..."))
+    assert svc._runtime_run("py", ("flask",))["state"] == "unknown"
+
+    def hang(*args, **kwargs):
+        raise svc.subprocess.TimeoutExpired("py", 30)
+
+    monkeypatch.setattr(svc.subprocess, "run", hang)
+    assert svc._runtime_run("py", ("flask",))["state"] == "unknown"
+
+
+def test_runtime_reason_detects_python_bump(app, monkeypatch):
+    svc = _runtime_real(app, monkeypatch)
+    monkeypatch.setattr(svc, "_runtime_disk_version", lambda: (99, 0))
+    reason = svc._runtime_reason()
+    assert reason.startswith("Python на роутере обновлён:")
+    assert "→ 99.0" in reason
+
+
+def test_runtime_reason_ignores_frozen_modules(app, env, monkeypatch):
+    # Entware: os — frozen, os.__file__ указывает на несуществующий os.py
+    # (пакет ставит только os.pyc). Это не поломка: файла нет по природе
+    # модуля. Ложное срабатывание гоняло пробник на каждом старте панели и
+    # откладывало настоящее обнаружение до двух минут (поймано E2E).
+    svc = _runtime_real(app, monkeypatch)
+    monkeypatch.setattr(svc, "_runtime_disk_version", lambda: sys.version_info[:2])
+    monkeypatch.setattr(svc, "_runtime_modules", lambda: ("fake_frozen",))
+    monkeypatch.setitem(svc.sys.modules, "fake_frozen", types.SimpleNamespace(
+        __spec__=types.SimpleNamespace(origin="frozen"),
+        __file__=str(env / "gone" / "os.py")))
+    assert svc._runtime_reason() is None
+    # настоящий модуль с файлом — отсутствие файла видно
+    monkeypatch.setitem(svc.sys.modules, "fake_frozen", types.SimpleNamespace(
+        __spec__=types.SimpleNamespace(origin=str(env / "site" / "mod.py")),
+        __file__=str(env / "site" / "mod.py")))
+    assert svc._runtime_reason() == \
+        "Зависимости панели удалены или переустановлены на диске."
+
+
+def test_runtime_probe_runs_promptly_when_disk_signs_change(app, monkeypatch):
+    # «здоровый» вердикт закэширован — но признак на диске сменился:
+    # перепроверяем сразу (MIN_S), а не через RECHECK_S
+    svc = _runtime_real(app, monkeypatch)
+    monkeypatch.setattr(svc, "_runtime_disk_version", lambda: sys.version_info[:2])
+    monkeypatch.setattr(svc, "_runtime_modules", lambda: ("fake_mod",))
+    monkeypatch.setitem(svc.sys.modules, "fake_mod", types.SimpleNamespace(
+        __spec__=types.SimpleNamespace(origin=str(APP_DIR / "naivepanel.py")),
+        __file__=str(APP_DIR / "naivepanel.py")))
+    monkeypatch.setattr(svc, "_runtime_run", lambda py, mods: {"state": "ok", "missing": []})
+    assert svc._runtime_status()["state"] == "ok"     # признаков нет — без форков
+    svc._RUNTIME["probed_at"] = time.monotonic() - 10
+    # зависимость «пропала» — признак появился, с последней проверки прошло 10с
+    monkeypatch.setitem(svc.sys.modules, "fake_mod", types.SimpleNamespace(
+        __spec__=types.SimpleNamespace(origin=str(APP_DIR / "gone.py")),
+        __file__=str(APP_DIR / "gone.py")))
+    svc._runtime_status()
+    assert svc._RUNTIME["thread"] is not None          # проверка запущена сразу
+    _runtime_settle(app)
+    assert svc._RUNTIME["state"] == "ok"
+    assert svc._RUNTIME["reason_at_probe"] is not None
+
+
+def test_runtime_reason_detects_removed_dep_files(app, env, monkeypatch):
+    svc = _runtime_real(app, monkeypatch)
+    monkeypatch.setattr(svc, "_runtime_disk_version", lambda: sys.version_info[:2])
+    monkeypatch.setattr(svc.sys.modules["flask"], "__file__",
+                        str(env / "nope" / "__init__.py"))
+    assert svc._runtime_reason() == \
+        "Зависимости панели удалены или переустановлены на диске."
+
+
+def test_runtime_modules_follow_bind_and_auth(app, env, monkeypatch):
+    svc = _runtime_real(app, monkeypatch)
+    assert svc._runtime_modules() == ("flask",)        # loopback: Werkzeug fallback разрешён
+    (env / "admin.pass").write_text(_pass_file(env, "s3cret"))
+    assert svc._runtime_modules() == ("flask", "bcrypt")
+    app.cfg.PANEL_BIND = "192.168.1.1:8089"            # на LAN без waitress не стартует (SEC-06)
+    assert svc._runtime_modules() == ("flask", "waitress", "bcrypt")
+
+
+def test_runtime_hint_matches_installer_recipe(app, env, monkeypatch):
+    # рецепт в баннере и в тосте отказа — те же команды, что чинит deps_ensure
+    svc = _runtime_real(app, monkeypatch)
+    assert svc._runtime_hint() == f"{sys.executable} -m pip install --no-cache-dir flask"
+    (env / "admin.pass").write_text(_pass_file(env, "s3cret"))
+    app.cfg.PANEL_BIND = "192.168.1.1:8089"
+    assert svc._runtime_hint() == (
+        f"{sys.executable} -m pip install --no-cache-dir flask waitress"
+        "; opkg install --force-reinstall python3-bcrypt")   # bcrypt — opkg, не pip (Rust)
+
+
+def test_runtime_broken_transition_notifies_once(app, monkeypatch):
+    # баннер и гейт не спасают, если панель умрёт при перезагрузке роутера,
+    # пока никто не смотрит в UI, — переход в «сломано» уходит в канал
+    sent = []
+    monkeypatch.setattr(app.mon, "_notify",
+                        lambda event, text, dedupe_s=60.0: sent.append((event, text, dedupe_s)))
+    monkeypatch.setenv("NAIVEPANEL_RUNTIME_OVERRIDE", "broken")
+    app.svc._runtime_refresh()
+    assert [e for e, _, _ in sent] == ["runtime_broken"]
+    assert "не запустится после перезапуска" in sent[0][1]
+    assert sent[0][2] == 6 * 3600.0            # перепроверки идут каждые 2 минуты
+    app.svc._runtime_refresh()                 # всё ещё сломано — не событие
+    monkeypatch.setenv("NAIVEPANEL_RUNTIME_OVERRIDE", "ok")
+    app.svc._runtime_refresh()
+    monkeypatch.setenv("NAIVEPANEL_RUNTIME_OVERRIDE", "broken")
+    app.svc._runtime_refresh()                 # сломалось заново — новое событие
+    assert len(sent) == 2
+    # сбой самого уведомления не должен портить вердикт
+    monkeypatch.setattr(app.svc, "_RUNTIME_ON_BROKEN", lambda res: (_ for _ in ()).throw(OSError("x")))
+    monkeypatch.setenv("NAIVEPANEL_RUNTIME_OVERRIDE", "ok")
+    app.svc._runtime_refresh()
+    monkeypatch.setenv("NAIVEPANEL_RUNTIME_OVERRIDE", "broken")
+    assert app.svc._runtime_refresh()["state"] == "broken"
+
+
+def test_status_runtime_carries_ssh_hint(app, monkeypatch):
+    monkeypatch.setenv("NAIVEPANEL_RUNTIME_OVERRIDE", "broken")
+    app.svc._runtime_status()
+    rt = _runtime_settle(app)
+    assert rt["state"] == "broken"
+    assert rt["hint"] == f"{sys.executable} -m pip install --no-cache-dir flask"
+
+
+def test_status_surfaces_broken_runtime_after_background_probe(app, monkeypatch):
+    svc = _runtime_real(app, monkeypatch)
+    monkeypatch.setenv("NAIVEPANEL_RUNTIME_OVERRIDE", "broken")
+    monkeypatch.setattr(svc, "_runtime_disk_version", lambda: (99, 0))
+    first = app.app.test_client().get("/api/status").get_json()["runtime"]
+    # сам запрос не форкает: признак подмены есть — проверка ушла в фон
+    assert first["state"] == "ok" and first["checking"] is True
+    assert first["reason"].startswith("Python на роутере обновлён")
+    rt = _runtime_settle(app)
+    assert rt["state"] == "broken" and "flask" in rt["detail"]
+    assert rt["reason"].startswith("Python на роутере обновлён")
+    # вердикт закэширован — виден каждому следующему поллу
+    assert app.app.test_client().get("/api/status").get_json()["runtime"]["state"] == "broken"
+
+
+def test_status_reflects_forced_broken_verdict_without_disk_signals(app, monkeypatch):
+    # демо/тест: вердикт «сломано» задан подменой, а следов на диске нет —
+    # баннер всё равно должен появиться (фоновый пробник знает о подмене)
+    monkeypatch.setenv("NAIVEPANEL_RUNTIME_OVERRIDE", "broken")
+    app.svc._runtime_status()        # первый полл only запускает фон
+    rt = _runtime_settle(app)
+    assert rt["state"] == "broken" and "flask" in rt["detail"]
+    assert rt["reason"] is None      # причины на диске нет — текст даст UI
+
+
+def test_panel_restart_refused_when_runtime_broken(client, app, env, monkeypatch):
+    monkeypatch.setenv("NAIVEPANEL_RUNTIME_OVERRIDE", "broken")
+    marker = env / "panel-restart.txt"
+    stub = env / "panel-init.sh"
+    stub.write_text(f'#!/bin/sh\necho restart >> "{marker}"\n')
+    stub.chmod(0o755)
+    app.cfg.PANEL_INIT = stub
+    r = client.post("/api/panel/restart", headers=CSRF)
+    assert r.status_code == 409
+    err = r.get_json()["error"]
+    assert "не запустится после перезапуска" in err and "flask" in err
+    assert f"{sys.executable} -m pip install --no-cache-dir flask" in err  # рецепт
+    time.sleep(1.2)  # рестартер сработал бы через sleep 1
+    assert not marker.exists()                                # панель не тронули
+    assert '"event": "panel.restart_refused"' in app.PANEL_AUDIT.read_text(encoding="utf-8")
+    # отказ он же сказал правду UI: следующий полл покажет баннер
+    assert client.get("/api/status").get_json()["runtime"]["state"] == "broken"
+
+
+def test_panel_restart_rechecks_runtime_synchronously(client, app, env, monkeypatch):
+    # в кэше «сломано», а зависимости уже починили по SSH: клик по
+    # «Перезапуск» перепроверяет сам, а не верит кэшу
+    app.svc._RUNTIME.update(state="broken", detail="stale")
+    monkeypatch.setenv("NAIVEPANEL_RUNTIME_OVERRIDE", "ok")
+    marker = env / "panel-restart.txt"
+    stub = env / "panel-init.sh"
+    stub.write_text(f'#!/bin/sh\necho restart >> "{marker}"\n')
+    stub.chmod(0o755)
+    app.cfg.PANEL_INIT = stub
+    assert client.post("/api/panel/restart", headers=CSRF).status_code == 202
+    assert client.get("/api/status").get_json()["runtime"]["state"] == "ok"
+
+
+def test_rollback_panel_refused_when_runtime_broken(client, app, env, monkeypatch):
+    monkeypatch.setenv("NAIVEPANEL_RUNTIME_OVERRIDE", "broken")
+    m = _rb_env_reload(env, monkeypatch)
+    _rb_make_panel(m)
+    _rb_make_backup(m, "v0.9.0", code="# old panel code")
+    r = m.app.test_client().post("/api/rollback", json={"panel": "v0.9.0"}, headers=CSRF)
+    assert r.status_code == 409
+    assert "не запустится после перезапуска" in r.get_json()["error"]
+    # файлы не возвращены: иначе на диске старая версия, а в памяти — новая
+    assert (m.PANEL_DIR / "naivepanel.py").read_text() == "# current panel code"
+    assert not (m.PANEL_DIR / "backup" / f"v{m.APP_VERSION}").exists()
+    assert '"event": "rollback.panel_refused"' in m.PANEL_AUDIT.read_text(encoding="utf-8")
+
+
+def test_runtime_check_endpoint(client, app, monkeypatch):
+    monkeypatch.setenv("NAIVEPANEL_RUNTIME_OVERRIDE", "broken")
+    assert client.get("/api/runtime/check").status_code == 405     # побочные эффекты — только POST
+    assert client.post("/api/runtime/check").status_code == 403    # CSRF
+    assert client.post("/api/runtime/check", headers=CSRF).get_json()["runtime"]["state"] == "broken"
+    monkeypatch.setenv("NAIVEPANEL_RUNTIME_OVERRIDE", "ok")
+    assert client.post("/api/runtime/check", headers=CSRF).get_json()["runtime"]["state"] == "ok"
+    # вердикт закэширован: баннер уйдёт со следующим поллом
+    assert client.get("/api/status").get_json()["runtime"]["state"] == "ok"
+
+
+# Ремонт: переустановка ТЕКУЩЕЙ версии установщиком (--from-update). Его
+# deps_check чинит зависимости свежим интерпретатором и только потом
+# перезапускает панель; не вышло — умирает до подмены файлов, и эта панель
+# продолжает работать.
+
+def test_repair_spawns_installer_of_current_version(client, app, env, monkeypatch):
+    marker = env / "repair-ran.txt"
+    seen = []
+
+    def fake_install(url, timeout=6.0):
+        seen.append(url)
+        return f'#!/bin/sh\necho "ran $*" >> "{marker}"\n'
+
+    def no_release():
+        raise AssertionError("repair reinstalls the running version — no release lookup")
+
+    monkeypatch.setattr(app.mon, "_http_get", fake_install)
+    monkeypatch.setattr(app.upd, "_latest_release", no_release)
+    r = client.post("/api/update/repair", headers=CSRF)
+    assert r.status_code == 202, r.get_json()
+    body = r.get_json()
+    tag = f"v{app.APP_VERSION}"
+    assert body["target"] == tag and body["current"] == app.APP_VERSION
+    assert body["repair"] is True
+    # install.sh качается с тега СВОЕЙ версии — не с последнего релиза
+    assert seen == [f"{app.UPDATE_RAW_BASE}/{app.UPDATE_REPO}/{tag}/install.sh"]
+    st = json.loads(app.UPDATE_STATE.read_text())
+    assert st["phase"] == "running" and st["target"] == tag
+    assert st["repair"] is True and st["panel_pid"] == os.getpid()
+    assert body["pid"] == st["pid"] and body["attempt_started"] == st["started"]
+    assert app.UPDATE_LOG.read_text().startswith("== repair")
+    # ремонт ставит ту же версию: её «бэкап» не нужен — иначе «Откат версий…»
+    # предлагает откатиться на самого себя
+    assert not (app.PANEL_DIR / "backup" / f"v{app.APP_VERSION}").exists()
+    for _ in range(50):  # установщик отсоединён — ждём маркер
+        if marker.exists():
+            break
+        time.sleep(0.1)
+    assert f"--yes --from-update --ref {tag}" in marker.read_text()
+
+
+def test_repair_state_is_closed_only_by_a_new_panel_process(client, app, monkeypatch):
+    # цель ремонта равна версии запустившего процесса: он НЕ закрывает своё
+    # «running» как «done», пока установщик ещё работает (иначе крах
+    # установщика остался бы незамеченным, а retry пускал бы второй)
+    app._update_state_write({"phase": "running", "target": f"v{app.APP_VERSION}",
+                             "started": time.time(), "pid": os.getpid(),
+                             "repair": True, "panel_pid": os.getpid()})
+    assert app._update_state()["phase"] == "running"
+    # перезапущенная панель — другой процесс: закрывает как done
+    st = json.loads(app.UPDATE_STATE.read_text())
+    st["panel_pid"] = _dead_pid()
+    app._update_state_write(st)
+    assert app._update_state()["phase"] == "done"
+
+
+def test_repair_failure_is_recorded_and_panel_keeps_serving(client, app, env, monkeypatch):
+    # установщик умер на гейте зависимостей: сбой зафиксирован, панель жива
+    monkeypatch.setattr(app.mon, "_http_get", lambda url, timeout=6.0: "#!/bin/sh\nexit 3\n")
+    assert client.post("/api/update/repair", headers=CSRF).status_code == 202
+    st = {}
+    for _ in range(50):
+        st = app._update_state_read()
+        if st.get("phase") == "failed":
+            break
+        time.sleep(0.1)
+    assert st["phase"] == "failed" and st["exit_code"] == 3
+    assert "installer exit code: 3" in app.UPDATE_LOG.read_text()
+    assert client.get("/api/status").status_code == 200
+    assert '"event": "update.repair"' in app.PANEL_AUDIT.read_text(encoding="utf-8")
+
+
+def test_repair_gates(client, app, monkeypatch):
+    # тот же гейт, что update/apply: установщик исполняется от root
+    app.cfg.PANEL_BIND = "192.168.1.1:8089"       # admin.pass нет (фикстура)
+    assert client.post("/api/update/repair", headers=CSRF).status_code == 403
+    app.cfg.PANEL_BIND = "127.0.0.1:8089"
+    app._update_state_write({"phase": "running", "target": "v9.9.9",
+                             "started": time.time(), "pid": os.getpid()})
+    assert client.post("/api/update/repair", headers=CSRF).status_code == 409
+    app._update_state_write({"phase": "done"})
+    assert client.post("/api/update/repair").status_code == 403       # CSRF
+    monkeypatch.setattr(app.mon, "_http_get",
+                        lambda url, timeout=6.0: (_ for _ in ()).throw(RuntimeError("404")))
+    assert client.post("/api/update/repair", headers=CSRF).status_code == 502
+    # dev-сборка без строгого тега: качать install.sh не с чего
+    monkeypatch.setattr(app.cfg, "APP_VERSION", "0.28.0-dev")
+    assert client.post("/api/update/repair", headers=CSRF).status_code == 409
+
+
+def test_ui_has_runtime_banner_and_repair_actions():
+    html = UI_HTML.read_text(encoding="utf-8")
+    assert '<div id="rtBanner" role="alert" hidden>' in html
+    assert html.index('id="rtBanner"') < html.index("<main>")     # первый на странице
+    assert "Панель не запустится после перезапуска" in html
+    assert 'data-action="rtFix"' in html and "Исправить и перезапустить" in html
+    assert 'data-action="rtRecheck"' in html and "Перепроверить" in html
+    assert 'id="rtHint"' in html and 'По SSH: <code id="rtHint">' in html
+    js = UI_JS.read_text(encoding="utf-8")
+    assert "rtFix: () => runtimeRepair()" in js
+    assert "rtRecheck: () => runtimeRecheck()" in js
+    assert "renderRuntime(st);" in js
+    assert "$('rtSsh').hidden = !hint;" in js      # нет рецепта — нет и строки
+    assert "/api/update/repair" in js and "/api/runtime/check" in js
+    # причина и детали приходят с сервера (пути, имена модулей): только textContent
+    body = js.split("function renderRuntime(st) {")[1].split("\n}\n")[0]
+    assert "innerHTML" not in body and "textContent" in body
+    assert "#rtBanner" in UI_CSS.read_text(encoding="utf-8")
+
+
 # --- сериализация запуска update workers (REL-03) ------------------------------
 
 def test_apply_concurrent_single_installer(client, app, env, monkeypatch):
@@ -2383,13 +2761,248 @@ def test_install_sh_repo_override_present(app):
     assert 'NAIVEPANEL_REPO:-keenetic-tools/naivepanel' in text
 
 
-def test_install_sh_from_update_skips_python_checks(app):
-    # self-update не должен форкать python ради проверок того, что уже
-    # доказано работающей панелью (тесная память роутера, кейс v0.9.0)
+def test_install_sh_from_update_verifies_deps_before_touching_files(app):
+    """Рабочая панель не доказывает, что рестарт её поднимет: она держит код в
+    памяти и не видит, что `opkg upgrade` сменил minor Python (реальный кейс,
+    ноя 2026) — pip-пакеты остались в каталоге старой версии. Раньше
+    --from-update пропускал проверки, и «Обновить» из UI укладывало панель."""
     text = (APP_DIR / "install.sh").read_text(encoding="utf-8")
     assert '--from-update)    FROM_UPDATE=1 ;;' in text
-    assert 'FROM_UPDATE" = 1' in text
-    assert 'checks skipped (--from-update)' in text
+    assert 'checks skipped (--from-update)' not in text  # слепого пропуска больше нет
+    deps = _install_sh_deps_block(text)
+    assert 'deps_check' in deps
+    assert 'info "python/deps OK (fresh interpreter)"' in deps  # быстрый путь: один форк
+    # bcrypt нужен и без --with-auth: admin.pass мог остаться от прошлой
+    # установки, а без bcrypt панель стартует, но не пускает никого. Ставить —
+    # с --force-reinstall: пересборка под новый Python не меняет версию пакета
+    assert '[ "$WITH_AUTH" = 1 ] || [ -f "$PANEL_DIR/admin.pass" ]' in deps
+    assert 'opkg install --force-reinstall python3-bcrypt' in deps
+    # гейт стоит ДО подмены файлов панели: не починилось — установщик умирает,
+    # а работающая панель даже не узнаёт о попытке
+    assert text.index("deps_gate_fail() {") < text.index("# --- install files ---")
+    assert "files were NOT replaced" in deps
+    # сам пробник не запустился — не диагноз: в --from-update ведём себя как
+    # до гейта, ничего не блокируем
+    assert "python/deps check inconclusive — continuing without it" in deps
+
+
+def _install_sh_deps_block(text: str | None = None) -> str:
+    """Блок python/deps из install.sh — тот, что гоняется на стабах ниже."""
+    text = text or (APP_DIR / "install.sh").read_text(encoding="utf-8")
+    return text.split("#@np-deps-begin")[1].split("#@np-deps-end")[0]
+
+
+_DEPS_FAKE_PYTHON = r"""#!/bin/sh
+# Стаб интерпретатора: NP_DEPS-пробник и `import X` отвечают по маркерам
+# $FAKE_STATE/<mod>.missing — как модуль, оставшийся в каталоге старого Python.
+case "$1" in
+  -V) echo "Python 3.14.0"; exit 0 ;;
+esac
+code="$2"
+case "$code" in
+  # пробник первым: в его коде тоже есть sys.version_info (проверка >= 3.10)
+  *NP_DEPS*)
+    if [ -f "$FAKE_STATE/probe.crash" ]; then exit 99; fi
+    out=""
+    for m in $NP_DEPS; do
+      if [ -f "$FAKE_STATE/$m.missing" ]; then out="$out $m"; fi
+    done
+    echo "$out"
+    if [ -n "$out" ]; then exit 3; fi
+    exit 0 ;;
+  "import sys; sys.exit(0 if sys.version_info >= (3,10) else 1)") exit 0 ;;
+  "import flask"|"import waitress"|"import bcrypt")
+    m=${code#import }
+    if [ -f "$FAKE_STATE/$m.missing" ]; then exit 1; fi
+    exit 0 ;;
+  *) echo "fake python: unexpected code: $code" >&2; exit 98 ;;
+esac
+"""
+
+_DEPS_FAKE_OPKG = r"""#!/bin/sh
+echo "opkg $*" >> "$FAKE_STATE/calls"
+case "$1" in
+  update) exit 0 ;;
+  install)
+    case "$2" in
+      # в фидах Entware этих пакетов нет — установщик уходит в pip
+      python3-flask|python3-waitress) exit 1 ;;
+      # пересборка пакета под новый Python: модуль возвращается на место
+      --force-reinstall) rm -f "$FAKE_STATE/bcrypt.missing"; exit 0 ;;
+      *) exit 0 ;;
+    esac ;;
+esac
+"""
+
+_DEPS_FAKE_PIP = r"""#!/bin/sh
+echo "pip $*" >> "$FAKE_STATE/calls"
+if [ -f "$FAKE_STATE/pip.disabled" ]; then
+  echo "ERROR: Could not find a version that satisfies the requirement" >&2
+  exit 1
+fi
+for m; do :; done   # последний аргумент — имя пакета
+rm -f "$FAKE_STATE/$m.missing"
+exit 0
+"""
+
+
+def _run_deps_block(tmp_path, *, from_update, missing=(), bind=None,
+                    admin_pass=False, pip_disabled=False, probe_crash=False,
+                    panel_running=False, no_python=False):
+    """Прогон реального блока python/deps из install.sh под /bin/sh на стабах.
+
+    → (rc, вывод): rc=0 и «REACHED-INSTALL-FILES» — установщик дошёл до
+    подмены файлов панели; иначе он умер на гейте, файлов не тронув.
+    """
+    state = Path(tempfile.mkdtemp(prefix="run", dir=tmp_path)) / "state"
+    state.mkdir()
+    for mod in missing:
+        (state / f"{mod}.missing").write_text("")
+    if pip_disabled:
+        (state / "pip.disabled").write_text("")
+    if probe_crash:
+        (state / "probe.crash").write_text("")
+    panel = state.parent / "panel"
+    panel.mkdir()
+    if admin_pass:
+        (panel / "admin.pass").write_text("admin:$2b$12$x\n")
+    if bind:
+        (panel / "panel.conf").write_text(f'NAIVEPANEL_BIND="{bind}"\n')
+    init = state.parent / "init"
+    init.mkdir()
+    init_script = init / "S99naivepanel"
+    init_script.write_text(
+        '#!/bin/sh\n[ "$1" = status ] && [ -f "$FAKE_STATE/panel.running" ]\n')
+    init_script.chmod(0o755)
+    if panel_running:
+        (state / "panel.running").write_text("")
+    bin_dir = state.parent / "bin"
+    bin_dir.mkdir()
+    fakes = [("python3", _DEPS_FAKE_PYTHON), ("opkg", _DEPS_FAKE_OPKG),
+             ("pip3", _DEPS_FAKE_PIP)]
+    for name, body in [f for f in fakes if not (no_python and f[0] == "python3")]:
+        (bin_dir / name).write_text(body)
+        (bin_dir / name).chmod(0o755)
+    harness = state.parent / "harness.sh"
+    block = _install_sh_deps_block().replace("/opt/bin/pip3", str(bin_dir / "pip3"))
+    harness.write_text(
+        "#!/bin/sh\nset -u\n"
+        f"FROM_UPDATE={int(from_update)}; WITH_AUTH=0; BIND=\"{bind or ''}\"\n"
+        f'PANEL_DIR="{panel}"; PANEL_CONF="{panel}/panel.conf"; INIT_DIR="{init}"\n'
+        'info() { echo "==> $*"; }\n'
+        'warn() { echo "WARN: $*"; }\n'
+        'die()  { echo "ERROR: $*"; exit 1; }\n'
+        f"{block}\n"
+        'echo "REACHED-INSTALL-FILES"\n')
+    # без интерпретатора в PATH не должно быть вообще — иначе установщик найдёт
+    # системный python3 и сценарий «python пропал» не воспроизведётся
+    path = str(bin_dir) if no_python else f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}"
+    env = {**os.environ, "PATH": path, "FAKE_STATE": str(state)}
+    proc = subprocess.run(["/bin/sh", str(harness)], capture_output=True, text=True,
+                          env=env, timeout=60)
+    calls = (state / "calls").read_text() if (state / "calls").exists() else ""
+    return proc.returncode, proc.stdout + proc.stderr, calls, state
+
+
+def test_deps_from_update_healthy_is_one_probe_and_no_opkg(tmp_path):
+    # быстрый путь: один форк, ничего не ставится, установщик идёт дальше
+    rc, out, calls, _ = _run_deps_block(tmp_path, from_update=True)
+    assert rc == 0 and "REACHED-INSTALL-FILES" in out
+    assert "python/deps OK (fresh interpreter)" in out
+    assert calls == ""
+
+
+def test_deps_from_update_repairs_before_touching_files(tmp_path):
+    # кейс 2026-11: flask остался в каталоге старого Python. opkg пакета не
+    # знает → pip ставит под новый интерпретатор → установщик идёт дальше
+    rc, out, calls, state = _run_deps_block(tmp_path, from_update=True,
+                                            missing=("flask", "waitress"))
+    assert rc == 0 and "REACHED-INSTALL-FILES" in out
+    # на loopback обязателен только flask (waitress — через deps_ensure, как раньше)
+    assert "python/deps OK — installed: flask" in out
+    assert "pip install --no-cache-dir flask" in calls
+    assert "pip install --no-cache-dir waitress" in calls
+    assert not (state / "flask.missing").exists()
+    assert not (state / "waitress.missing").exists()
+
+
+def test_deps_from_update_unrepairable_never_restarts_running_panel(tmp_path):
+    # PyPI недоступен: чинить нечем. Работающая панель обязана остаться в
+    # живых — установщик умирает ДО подмены файлов, с рецептом в логе
+    rc, out, _, _ = _run_deps_block(tmp_path, from_update=True,
+                                    missing=("flask",), pip_disabled=True)
+    assert rc == 1
+    assert "REACHED-INSTALL-FILES" not in out
+    assert "python deps NOT importable" in out and "flask" in out
+    assert "files were NOT replaced" in out
+    assert "-m pip install --no-cache-dir" in out  # рецепт — в логе обновления
+
+
+def test_deps_manual_rerun_guards_running_panel_like_self_update(tmp_path):
+    rc, out, _, _ = _run_deps_block(tmp_path, from_update=False, panel_running=True,
+                                    missing=("flask",), pip_disabled=True)
+    assert rc == 1 and "REACHED-INSTALL-FILES" not in out
+    assert "files were NOT replaced" in out
+
+
+def test_deps_unrepairable_stops_before_touching_files_even_without_panel(tmp_path):
+    # панели нет — рестартить некого, но она и не стартовала бы: раньше
+    # установщик умирал лаконичным «pip install flask failed», теперь —
+    # с причиной и рецептом; файлы в обоих случаях не тронуты
+    rc, out, _, _ = _run_deps_block(tmp_path, from_update=False,
+                                    missing=("flask",), pip_disabled=True)
+    assert rc == 1 and "REACHED-INSTALL-FILES" not in out
+    assert "python deps NOT importable" in out
+    assert "files were NOT touched" in out
+    assert "NOT replaced" not in out
+    assert "-m pip install --no-cache-dir flask waitress" in out
+
+
+def test_deps_missing_python_recipe_is_opkg_not_pip(tmp_path):
+    # интерпретатора нет: умирает там же, до файлов, и рецепт — про python3,
+    # а не «pip install» для несуществующего интерпретатора
+    rc, out, calls, _ = _run_deps_block(tmp_path, from_update=True, no_python=True)
+    assert rc == 1 and "REACHED-INSTALL-FILES" not in out
+    assert "python deps NOT importable" in out
+    assert "opkg install python3" in out and "pip install" not in out
+    assert "opkg install python3" in calls  # установить установщик тоже пытался
+
+
+def test_deps_waitress_required_only_off_loopback(tmp_path):
+    # на loopback панель стартует через Werkzeug (SEC-06 разрешает): пропавший
+    # waitress — не поломка, установки не должно быть
+    rc, out, calls, _ = _run_deps_block(tmp_path, from_update=True,
+                                        missing=("waitress",), pip_disabled=True)
+    assert rc == 0 and "python/deps OK (fresh interpreter)" in out
+    assert calls == ""
+    # на LAN-адресе без waitress панель принципиально не стартует
+    rc, out, _, _ = _run_deps_block(tmp_path, from_update=True, missing=("waitress",),
+                                    bind="192.168.1.1:8089", pip_disabled=True)
+    assert rc == 1 and "NOT importable" in out and "waitress" in out
+
+
+def test_deps_bcrypt_required_when_admin_pass_survives(tmp_path):
+    # пересборка python3-bcrypt под новый Python не меняет версию пакета —
+    # opkg upgrade такое пропускает; ставим заново через --force-reinstall
+    rc, out, calls, state = _run_deps_block(tmp_path, from_update=True,
+                                            missing=("bcrypt",), admin_pass=True)
+    assert rc == 0 and "installed: bcrypt" in out
+    assert "opkg install --force-reinstall python3-bcrypt" in calls
+    assert not (state / "bcrypt.missing").exists()
+    # без admin.pass bcrypt панели не нужен
+    rc, out, calls, _ = _run_deps_block(tmp_path, from_update=True,
+                                        missing=("bcrypt",))
+    assert rc == 0 and calls == ""
+
+
+def test_deps_probe_crash_in_from_update_is_not_a_verdict(tmp_path):
+    # пробник убит (память) или не стартовал — это не диагноз зависимостям:
+    # ничего не чиним и не блокируем, как до гейта
+    rc, out, calls, _ = _run_deps_block(tmp_path, from_update=True,
+                                        missing=("flask",), probe_crash=True)
+    assert rc == 0 and "REACHED-INSTALL-FILES" in out
+    assert "python/deps check inconclusive — continuing without it" in out
+    assert "python/deps OK" not in out and calls == ""
 
 
 # --- периодическая обрезка логов ------------------------------------------------------

@@ -209,11 +209,18 @@ def _update_state() -> dict[str, Any]:
     «done». Умерший установщик (сеть/checksum/диск) распознаём по pid —
     state помечается «failed» и не блокирует retry фиктивным
     «already in progress». Записи без pid протухают через _UPDATE_STALE_S.
+
+    Ремонт зависимостей (/api/update/repair) переустанавливает ту же
+    версию: цель равна версии уже у запустившего процесса, и он не вправе
+    закрыть своё же «running» как «done», пока установщик работает. Такой
+    state несёт panel_pid — закрывает его только ДРУГОЙ процесс, т.е.
+    панель, реально переживший рестарт.
     """
     with _UPDATE_LAUNCH_LOCK:
         st = _update_state_read()
         if st.get("phase") == "running":
-            if str(st.get("target") or "").lstrip("vV") == cfg.APP_VERSION:
+            if (str(st.get("target") or "").lstrip("vV") == cfg.APP_VERSION
+                    and st.get("panel_pid") != os.getpid()):
                 _update_state_write({**st, "phase": "done", "finished": time.time()})
                 st["phase"] = "done"
             elif (st.get("boot_id") and (current_boot := _boot_id())

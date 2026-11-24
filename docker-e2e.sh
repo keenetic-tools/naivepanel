@@ -449,6 +449,104 @@ grep -q 'release signature verified' /opt/var/log/naivepanel-update.log \
   || { echo "FAIL: retry did not verify the release signature"; exit 1; }
 echo "self-update: signed retry succeeded (v0.27.5, state done)"
 
+echo "==> runtime gate: python deps broken under a running panel"
+# Имитируем то, что делает opkg upgrade со сменившимся minor Python: pip-пакеты
+# панели исчезли из site-packages текущего интерпретатора. Работающая панель
+# этого не видит (код в памяти) — раньше любой рестарт был для неё последним.
+jfield() {  # \$1=url \$2=выражение над json -> stdout; пусто, если не ответило
+  curl -s --max-time 5 "\$1" | python3 -c "import json, sys
+try:
+    print((\$2)(json.load(sys.stdin)))
+except Exception:
+    pass"
+}
+site=\$("\$np_py" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')
+echo "site-packages: \$site"
+mkdir -p /tmp/rt-deps-bak
+mv "\$site/flask" /tmp/rt-deps-bak/flask
+for d in "\$site"/flask-*.dist-info; do mv "\$d" /tmp/rt-deps-bak/; done
+started_before=\$(jfield "\$PANEL_URL/api/status" 'lambda d: d["panel"]["started"]')
+runtime=""
+for i in \$(seq 1 60); do
+  runtime=\$(jfield "\$PANEL_URL/api/status" 'lambda d: d["runtime"]["state"]')
+  [ "\$runtime" = "broken" ] && break
+  sleep 1
+done
+[ "\$runtime" = "broken" ] || {
+  echo "FAIL: broken runtime not surfaced (state=\$runtime) after \$i polls"
+  echo "--- diagnostics: /api/status → runtime"; jfield "\$PANEL_URL/api/status" 'lambda d: d.get("runtime")'
+  echo "--- diagnostics: fresh interpreter importing flask"
+  "\$np_py" -c 'import flask; print("IMPORTABLE:", flask.__file__)' 2>&1 | tail -n 3
+  echo "--- diagnostics: flask remnants in site-packages"; ls -d "\$site"/flask* 2>&1 | head -n 5
+  echo "--- diagnostics: panel dir + processes"
+  ls -la /opt/etc/naive/panel/ | head -n 12
+  ps w | grep '[n]aivepanel.py' | cut -c1-120
+  echo "--- diagnostics: forced sync probe (POST /api/runtime/check)"
+  curl -s --max-time 60 \$H -X POST "\$PANEL_URL/api/runtime/check"; echo
+  tail -n 40 /opt/var/log/naivepanel.log; exit 1
+}
+echo "broken runtime surfaced in /api/status: OK (after \$i polls)"
+# рестарт в заведомо нерабочее состояние отклонён — синхронная перепроверка
+code=\$(curl -s -o /tmp/rt-restart.json -w '%{http_code}' --max-time 60 \$H -X POST "\$PANEL_URL/api/panel/restart")
+echo "restart while broken=\$code (expect 409)"
+[ "\$code" = "409" ] || { cat /tmp/rt-restart.json; exit 1; }
+# «Исправить и перезапустить» = переустановка текущей версии установщиком: его
+# deps_check видит пропажу СВЕЖИМ интерпретатором, ставит flask через pip (в
+# фидах Entware python3-flask нет) и только потом перезапускает панель
+code=\$(curl -s -o /tmp/rt-repair.json -w '%{http_code}' \$H -X POST "\$PANEL_URL/api/update/repair")
+echo "repair apply=\$code (expect 202)"
+[ "\$code" = "202" ] || { cat /tmp/rt-repair.json; exit 1; }
+started_after=""
+for i in \$(seq 1 150); do
+  started_after=\$(jfield "\$PANEL_URL/api/status" 'lambda d: d["panel"]["started"]')
+  [ -n "\$started_after" ] && [ "\$started_after" != "\$started_before" ] && break
+  sleep 1
+done
+{ [ -n "\$started_after" ] && [ "\$started_after" != "\$started_before" ]; } || {
+  echo "FAIL: repair did not restart the panel"
+  cat /opt/var/log/naivepanel-update.log; tail -n 20 /opt/var/log/naivepanel.log; exit 1
+}
+grep -q 'python/deps OK .*installed: flask' /opt/var/log/naivepanel-update.log \
+  || { echo "FAIL: installer log has no repair line"; cat /opt/var/log/naivepanel-update.log; exit 1; }
+"\$np_py" -c 'import flask' || { echo "FAIL: flask not importable after repair"; exit 1; }
+runtime=\$(jfield "\$PANEL_URL/api/status" 'lambda d: d["runtime"]["state"]')
+phase=\$(jfield "\$PANEL_URL/api/update/log" 'lambda d: d["state"]["phase"]')
+{ [ "\$runtime" = "ok" ] && [ "\$phase" = "done" ]; } || {
+  echo "FAIL: after repair runtime=\$runtime phase=\$phase (expect ok/done)"; exit 1
+}
+echo "runtime repair: OK (flask reinstalled by installer, panel restarted, state done)"
+
+echo "==> runtime gate: unrepairable deps never restart a running panel"
+# ломаем снова и отбираем у pip индекс: чинить нечем. Установщик обязан уйти
+# ДО подмены файлов — панель остаётся тем же процессом с теми же файлами
+mkdir -p /tmp/rt-deps-bak2
+mv "\$site/flask" /tmp/rt-deps-bak2/
+for d in "\$site"/flask-*.dist-info; do mv "\$d" /tmp/rt-deps-bak2/; done
+sum_before=\$(sha256sum /opt/etc/naive/panel/naivepanel.py | cut -d' ' -f1)
+started_before=\$(jfield "\$PANEL_URL/api/status" 'lambda d: d["panel"]["started"]')
+curl -fsSL https://raw.githubusercontent.com/keenetic-tools/naivepanel/$NEXT_REF/install.sh > /tmp/rt-install.sh
+if PIP_INDEX_URL=http://127.0.0.1:9/simple PIP_RETRIES=0 \
+   sh /tmp/rt-install.sh --yes --from-update --ref $NEXT_REF > /tmp/rt-unrepairable.log 2>&1; then
+  echo "FAIL: installer finished OK with unrepairable deps"; cat /tmp/rt-unrepairable.log; exit 1
+fi
+grep -q 'files were NOT replaced' /tmp/rt-unrepairable.log \
+  && echo "installer gate: OK (died before touching panel files)" \
+  || { echo "FAIL: no gate message in installer log"; cat /tmp/rt-unrepairable.log; exit 1; }
+[ "\$(sha256sum /opt/etc/naive/panel/naivepanel.py | cut -d' ' -f1)" = "\$sum_before" ] \
+  || { echo "FAIL: panel files changed by a refused installer"; exit 1; }
+started_after=\$(jfield "\$PANEL_URL/api/status" 'lambda d: d["panel"]["started"]')
+[ "\$started_after" = "\$started_before" ] \
+  || { echo "FAIL: running panel was restarted with broken deps"; exit 1; }
+echo "running panel untouched: OK"
+# починили по SSH → «Перепроверить» сразу снимает баннер (без ожидания фона)
+mv /tmp/rt-deps-bak2/flask "\$site/"
+for d in /tmp/rt-deps-bak2/flask-*.dist-info; do mv "\$d" "\$site/"; done
+code=\$(curl -s -o /tmp/rt-recheck.json -w '%{http_code}' --max-time 60 \$H -X POST "\$PANEL_URL/api/runtime/check")
+[ "\$code" = "200" ] || { echo "FAIL: runtime check HTTP \$code"; cat /tmp/rt-recheck.json; exit 1; }
+grep -q '"state": *"ok"' /tmp/rt-recheck.json \
+  && echo "runtime recheck after manual fix: OK" \
+  || { echo "FAIL: runtime still not ok after manual fix"; cat /tmp/rt-recheck.json; exit 1; }
+
 echo "==> non-child zombie detection via procfs"
 cat > /tmp/zombie-parent.py <<'PY'
 import os
