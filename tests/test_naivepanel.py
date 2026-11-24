@@ -2408,7 +2408,12 @@ def test_repair_failure_is_recorded_and_panel_keeps_serving(client, app, env, mo
 
 
 def test_repair_gates(client, app, monkeypatch):
-    # тот же гейт, что update/apply: установщик исполняется от root
+    # тот же гейт, что update/apply: установщик исполняется от root.
+    # Скачивание install.sh заглушено с самого начала: у тега текущей версии
+    # может не быть опубликованного релиза (в момент подготовки версии), и
+    # юнит-тест не должен зависеть от сети и порядка проверок в роуте.
+    monkeypatch.setattr(app.mon, "_http_get",
+                        lambda url, timeout=6.0: "#!/bin/sh\nexit 3\n")
     app.cfg.PANEL_BIND = "192.168.1.1:8089"       # admin.pass нет (фикстура)
     assert client.post("/api/update/repair", headers=CSRF).status_code == 403
     app.cfg.PANEL_BIND = "127.0.0.1:8089"
