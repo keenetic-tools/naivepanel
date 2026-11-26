@@ -6738,9 +6738,9 @@ def test_ui_actions_button_grid(app):
 def test_ui_serious_buttons_outlined_danger(app):
     """Три веса подсветки действий: сплошной danger — необратимое (Удалить
     пресет, Отключить TG) и «Стоп»; акцент без класса — рестарт-потоки
-    (Рестарт, Перезапуск, «Откат версий…»); контурный ghost danger —
-    серьёзное, но обратимое, внутри диалогов (оба «Откатить», «Оставить
-    только последнюю», «Сменить» пароль)."""
+    (Рестарт, Перезапуск, «Перезапустить SSH», «Откат версий…»); контурный
+    ghost danger — серьёзное, но обратимое, внутри диалогов (оба «Откатить»,
+    «Оставить только последнюю», «Сменить» пароль)."""
     html = _ui_html()
     css = html.split("</style>", 1)[0]
     assert "button.ghost.danger { background:transparent; color:var(--err); " in css, \
@@ -6760,7 +6760,7 @@ def test_ui_serious_buttons_outlined_danger(app):
             f"{key} должен быть сплошным danger"
     # акцент (как «Сохранить»): рестарт-потоки дашборда, без класса вовсе
     for key in ('id="btnRestart"', 'data-action="panelRestart"',
-                'data-action="rollbackOpen"'):
+                'data-action="rollbackOpen"', 'data-action="sshRestart"'):
         tag = button_tag(key)
         assert "class=" not in tag, \
             f"{key} должен быть акцентной кнопкой без класса"
