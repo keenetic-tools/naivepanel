@@ -2523,7 +2523,7 @@ def test_repair_gates(client, app, monkeypatch):
                         lambda url, timeout=6.0: (_ for _ in ()).throw(RuntimeError("404")))
     assert client.post("/api/update/repair", headers=CSRF).status_code == 502
     # dev-сборка без строгого тега: качать install.sh не с чего
-    monkeypatch.setattr(app.cfg, "APP_VERSION", "0.28.0-dev")
+    monkeypatch.setattr(app.cfg, "APP_VERSION", "0.29.0-dev")
     assert client.post("/api/update/repair", headers=CSRF).status_code == 409
 
 
