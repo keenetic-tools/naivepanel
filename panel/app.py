@@ -571,6 +571,19 @@ def api_service(action: str):
     return jsonify(result)
 
 
+@app.route("/api/ssh/restart", methods=["POST"])
+def api_ssh_restart():
+    """Перезапуск SSH-сервера роутера (dropbear из Entware по умолчанию).
+
+    Только restart: stop из браузера оставил бы роутер без удалённого доступа,
+    а start при загрузке делает init-скрипт. Результат — как у /api/service:
+    `{rc, stdout, stderr, init_script}`, сбой init виден по `rc != 0`.
+    """
+    result = svc._ssh_restart()
+    sec._audit("ssh.restart", rc=result.get("rc"))
+    return jsonify(result)
+
+
 @app.route("/api/e2e", methods=["POST"])
 def api_e2e():
     """E2E-проверка прокси: реальный запрос через listen-порт активного пресета.
@@ -1347,6 +1360,7 @@ __all__ = [
     "api_rollback_get",
     "api_rollback_post",
     "api_service",
+    "api_ssh_restart",
     "api_status",
     "api_update_apply",
     "api_update_check",

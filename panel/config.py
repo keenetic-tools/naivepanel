@@ -35,7 +35,7 @@ CONF_KEYS = frozenset({
     "NAIVEPROXY_DIR", "NAIVEPROXY_INIT", "NAIVEPROXY_LOG", "NAIVEPROXY_PID",
     "NAIVEPROXY_BIN", "NAIVEPROXY_SRC_REPO", "NAIVEPROXY_SRC_API",
     "NAIVEPROXY_UPDATE_LOG",
-    "NAIVEPANEL_INIT", "NAIVEPANEL_THREADS",
+    "NAIVEPANEL_INIT", "NAIVEPANEL_THREADS", "NAIVEPANEL_SSH_INIT",
     "NAIVEPANEL_LOG", "NAIVEPANEL_LOG_MAX", "NAIVEPANEL_LOG_KEEP",
     "NAIVEPANEL_WATCHDOG", "NAIVEPANEL_WATCHDOG_INTERVAL",
     "NAIVEPANEL_E2E_URL",
@@ -120,6 +120,22 @@ PANEL_BIND = os.environ.get("NAIVEPANEL_BIND", "127.0.0.1:8089")
 ALLOWED_HOSTS = {h.strip() for h in os.environ.get("NAIVEPANEL_HOSTS", "").split(",") if h.strip()}
 # Init-скрипт самой панели — для self-restart после обновления файлов.
 PANEL_INIT = Path(os.environ.get("NAIVEPANEL_INIT", "/opt/etc/init.d/S99naivepanel"))
+
+# --- SSH-сервер роутера (dropbear из Entware) --------------------------------
+# Панель умеет только перезапускать SSH, не останавливать: stop из браузера
+# означал бы потерю единственного удалённого доступа к роутеру, а start после
+# перезагрузки и так делает init. Явный путь задаётся в panel.conf
+# (NAIVEPANEL_SSH_INIT); без него берём первый существующий из кандидатов —
+# штатный dropbear Entware на Keenetic, затем OpenSSH и OpenWrt.
+_SSH_INIT_RAW = os.environ.get("NAIVEPANEL_SSH_INIT", "").strip()
+SSH_INIT: Path | None = Path(_SSH_INIT_RAW) if _SSH_INIT_RAW else None
+SSH_INIT_CANDIDATES = (
+    Path("/opt/etc/init.d/S51dropbear"),   # Entware dropbear (Keenetic), по умолчанию
+    Path("/opt/etc/init.d/S50dropbear"),   # старый Entware
+    Path("/opt/etc/init.d/S51sshd"),       # OpenSSH из Entware
+    Path("/etc/init.d/dropbear"),          # OpenWrt
+    Path("/etc/init.d/ssh"),               # Debian-подобные
+)
 # Прод-сервер waitress, если установлен; иначе — dev-сервер Werkzeug.
 # На роутере (LAN-bind) waitress ограничивает число потоков и переживает
 # медленных клиентов; в dev/Mac падать не должен.
@@ -388,6 +404,7 @@ __all__ = [
     "NAIVE_SRC_API", "NAIVE_UPDATE_LOG", "NAIVE_UPDATE_STATE",
     "_NAIVE_CHECK_TTL", "_NAIVE_ERR_TTL", "_NAIVE_STALE_S",
     "PANEL_ADMIN_PASS", "PANEL_BIND", "ALLOWED_HOSTS", "PANEL_INIT",
+    "SSH_INIT", "SSH_INIT_CANDIDATES", "_SSH_INIT_RAW",
     "_THREADS_RAW", "WAITRESS_THREADS", "_THREADS_INVALID",
     "PANEL_LOG", "LOG_TRIM_INTERVAL", "_LOG_MAX_RAW", "_LOG_KEEP_RAW",
     "_int_or_default", "LOG_TRIM_MAX", "_LOG_MAX_INVALID",

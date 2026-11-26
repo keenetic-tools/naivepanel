@@ -224,6 +224,12 @@
       <button data-action="rollbackOpen"
               title="Откат панели или бинарника naive на сохранённую версию — без SSH">Откат версий…</button>
     </div>
+    <h2 class="sect">SSH</h2>
+    <div id="sshInfo" style="font-size:12px;color:var(--mut);margin-top:10px">SSH: …</div>
+    <div class="actions" style="margin-top:8px">
+      <button class="ghost" data-action="sshRestart" id="btnSshRestart" disabled
+              title="Перезапустить SSH-сервер роутера (dropbear из Entware). Текущие SSH-сессии, включая туннель к панели, оборвутся">Перезапустить SSH</button>
+    </div>
     <h2 class="sect" id="sec-settings">Настройки</h2>
     <div class="actions" style="margin-top:10px">
       <button class="ghost danger" data-action="pwOpen" id="btnPwChange" hidden

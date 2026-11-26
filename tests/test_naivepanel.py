@@ -152,6 +152,14 @@ def test_conf_quotes_stripped(conf_env):
     assert m.PANEL_BIND == "127.0.0.1:8095"
 
 
+def test_conf_ssh_init_path(conf_env):
+    # NAIVEPANEL_SSH_INIT — allowlisted: путь к dropbear/sshd не должен
+    # молча попадать в _CONF_SKIPPED и оставлять автопоиск.
+    conf_env.write_text('NAIVEPANEL_SSH_INIT="/opt/etc/init.d/S51dropbear"\n')
+    m = _reload()
+    assert str(m.SSH_INIT) == "/opt/etc/init.d/S51dropbear"
+
+
 def test_conf_missing_file_uses_defaults(env, monkeypatch):
     monkeypatch.setenv("NAIVEPANEL_CONF", str(env / "absent.conf"))
     m = _reload()
@@ -759,6 +767,95 @@ def test_service_restart_and_activate_are_serialized(client, app, env, monkeypat
 
     _run_concurrently(restart, activate_backup)
     assert state["max"] == 1, "service-операции выполнились параллельно"
+
+
+# --- SSH-сервер роутера: только рестарт --------------------------------------
+
+def test_ssh_status_autodetects_first_existing_init(app, env, monkeypatch):
+    first = env / "S51dropbear"
+    second = env / "S50dropbear"
+    second.write_text("#!/bin/sh\n")
+    monkeypatch.setattr(app.cfg, "SSH_INIT", None)
+    monkeypatch.setattr(app.cfg, "SSH_INIT_CANDIDATES", (first, second))
+    st = app.svc._ssh_status()
+    assert st["available"] is True
+    assert st["init_script"] == str(second), "берём первый существующий кандидат"
+
+
+def test_ssh_status_missing_script(app, env, monkeypatch):
+    monkeypatch.setattr(app.cfg, "SSH_INIT", None)
+    monkeypatch.setattr(app.cfg, "SSH_INIT_CANDIDATES", (env / "absent-dropbear",))
+    st = app.svc._ssh_status()
+    assert st == {"available": False, "init_script": None}
+    assert app.mon._status()["ssh"] == st
+
+
+def test_ssh_status_uses_explicit_path_from_conf(app, env):
+    # NAIVEPANEL_SSH_INIT (panel.conf) важнее автопоиска — в т.ч. отсутствующий
+    # путь, чтобы UI честно показал «не найден», а не подставил чужой dropbear.
+    app.cfg.SSH_INIT = env / "custom-ssh-init"
+    st = app.svc._ssh_status()
+    assert st == {"available": False, "init_script": str(env / "custom-ssh-init")}
+
+
+def test_ssh_restart_requires_csrf(client):
+    assert client.post("/api/ssh/restart").status_code == 403
+
+
+def test_ssh_restart_uses_configured_init_and_audits(client, app, env, monkeypatch):
+    stub, marker = _stub_init(env, "ssh-init-calls.txt")
+    app.cfg.SSH_INIT = stub
+    r = client.post("/api/ssh/restart", headers=CSRF)
+    assert r.status_code == 200
+    d = r.get_json()
+    assert d["rc"] == 0 and d["init_script"] == str(stub)
+    assert marker.read_text() == "restart\n"
+    assert "ssh.restart" in [e["event"] for e in _audit_lines(env)]
+
+
+def test_ssh_restart_without_script_returns_503(client, app, env, monkeypatch):
+    monkeypatch.setattr(app.cfg, "SSH_INIT", None)
+    monkeypatch.setattr(app.cfg, "SSH_INIT_CANDIDATES", (env / "absent-dropbear",))
+    r = client.post("/api/ssh/restart", headers=CSRF)
+    assert r.status_code == 503
+    assert "NAIVEPANEL_SSH_INIT" in r.get_json()["error"]
+
+
+def test_ssh_restart_reports_failed_init(client, app, env):
+    # rc != 0 — не HTTP-ошибка: UI показывает stderr и не выдаёт рестарт за успех
+    stub = env / "ssh-init-fail.sh"
+    stub.write_text('#!/bin/sh\necho "dropbear: bad config" >&2\nexit 3\n')
+    stub.chmod(0o755)
+    app.cfg.SSH_INIT = stub
+    r = client.post("/api/ssh/restart", headers=CSRF)
+    assert r.status_code == 200
+    d = r.get_json()
+    assert d["rc"] == 3 and "bad config" in d["stderr"]
+
+
+def test_ssh_restart_is_serialized(client, app, env, monkeypatch):
+    guard = threading.Lock()
+    state = {"depth": 0, "max": 0}
+    stub = env / "ssh-stub.sh"
+    stub.write_text("#!/bin/sh\n")
+    stub.chmod(0o755)
+    app.cfg.SSH_INIT = stub
+
+    def fake_run(cmd, timeout=10):
+        with guard:
+            state["depth"] += 1
+            state["max"] = max(state["max"], state["depth"])
+        time.sleep(0.05)
+        with guard:
+            state["depth"] -= 1
+        return {"rc": 0, "stdout": "", "stderr": ""}
+
+    monkeypatch.setattr(app.svc, "_run", fake_run)
+    _run_concurrently(
+        lambda: app.app.test_client().post("/api/ssh/restart", headers=CSRF),
+        lambda: app.app.test_client().post("/api/ssh/restart", headers=CSRF),
+    )
+    assert state["max"] == 1, "два рестарта SSH пошли одновременно"
 
 
 def test_activate_failed_restart_restores_previous(client, app, env, monkeypatch):
@@ -6904,6 +7001,19 @@ def test_p0_service_buttons_state(app):
     assert "init_present" in fn
     assert "svcBusy" in fn and "e2eBusy" in fn
     assert "focused.hidden" in fn, "фокус не должен теряться при скрытии кнопки"
+
+
+def test_p0_ssh_restart_control(app):
+    html = _ui_html()
+    assert 'id="btnSshRestart"' in html and 'data-action="sshRestart"' in html
+    assert 'id="sshInfo"' in html
+    render = _ui_fn(html, "renderSsh")
+    assert "st.ssh" in render and "available" in render
+    assert "offline" in render and "sshBusy" in render
+    act = _ui_fn(html, "sshRestart")
+    assert "askConfirm" in act and "SSH-сессии" in act
+    assert "/api/ssh/restart" in act
+    assert "sshRestart: () => sshRestart()" in html
 
 
 def test_p0_stop_confirm_and_activate_guard(app):

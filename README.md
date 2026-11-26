@@ -122,6 +122,10 @@ HTML page — no CDN, no build step. MIT-licensed.
   «Отправить тест» — без правки `panel.conf` и перезапуска панели.
 - Смена пароля администратора из UI (v0.16): текущий пароль + новый, запись
   `admin.pass` атомарно — без SSH и `htpasswd`.
+- Перезапуск SSH-сервера роутера из «Системы» одной кнопкой: dropbear из
+  Entware (`/opt/etc/init.d/S51dropbear restart`) или найденный dropbear/
+  OpenSSH-скрипт; путь переопределяется в `panel.conf`. Остановить SSH
+  из UI нельзя намеренно — это потеря удалённого доступа.
 - Три колонки на широких экранах (v0.12): слева статус, пресеты и фейловер,
   в центре редактор с логом, справа — бинарник, панель, уведомления,
   обновления/откат. Средние экраны — две колонки, телефон — одна с тем же
@@ -164,6 +168,7 @@ HTML page — no CDN, no build step. MIT-licensed.
 | `GET` | `/api/e2e/history?last=120` | история периодических проверок монитора: `{entries:[{t,ok,ms}], stats:{availability, avg_ms, window_s}}` (спарклайн в статус-карте) |
 | `GET`/`PUT`/`DELETE` | `/api/failover` | цепочка автофейловера: `PUT {"enabled":true,"chain":["home","backup"],"auto_return":true}` — имена валидируются, цепочка проверяется и при `enabled:false`, а без `chain` при `enabled:false` сохраняется текущая; `enabled` — строго JSON-булево (`"true"` → 400); `DELETE` остаётся для совместимости API; ответ — конфиг + состояние монитора (`monitor`, `chain_max`, `fails`, `switches`, `returns`, `return_watch`, `last_ok`, …) |
 | `POST` | `/api/service/{start,stop,restart}` | управление через S99naiveproxy |
+| `POST` | `/api/ssh/restart` | перезапустить SSH-сервер роутера его init-скриптом (dropbear из Entware, путь ищется автоматически или задаётся `NAIVEPANEL_SSH_INIT`): `{rc, stdout, stderr, init_script}`; `503` — init-скрипт не найден; текущие SSH-сессии оборвутся |
 | `POST` | `/api/panel/restart` | перезапуск самой панели (после обновления файлов); `409`, если свежий интерпретатор её не поднимет (сломанный рантайм) — перед spawn синхронная проверка, после починки по SSH клик сразу проходит |
 | `GET` | `/api/update/check?force=1` | сверить версию с последним релизом GitHub (`{current, latest, available, notes, url}`; кэш 6ч, `force` обходит; сеть недоступна → 200 с `error`) |
 | `POST` | `/api/update/apply` | запустить self-update: spawn отсоединённого `install.sh --yes --from-update --ref <тег>`; `202 {started:true, attempt_started, pid, target, current, log}`, повторный запуск при живой попытке → `409`; перед заменой файлов установщик проверяет зависимости свежим интерпретатором и чинит их (см. «Сломанный рантайм») |
@@ -818,6 +823,32 @@ ln -sf /opt/etc/init.d/S99naivepanel /opt/etc/rc.d/S99naivepanel
 и повтор. Меняется только запись текущего пользователя в `admin.pass`, файл
 пишется атомарно; после смены браузер переспросит креды. Доступно только при
 включённой auth (`admin.pass` существует).
+
+### Перезапуск SSH-сервера из UI
+
+«Обслуживание → Система → SSH → Перезапустить SSH» выполняет тот же
+`<init-скрипт> restart`, что и команда в консоли роутера. По умолчанию это
+dropbear из Entware — `/opt/etc/init.d/S51dropbear`; панель ищет его сама,
+затем `S50dropbear`, `S51sshd` (OpenSSH), `/etc/init.d/dropbear` (OpenWrt) и
+`/etc/init.d/ssh`. Если скрипт лежит в другом месте, путь задаётся в
+`/opt/etc/naive/panel/panel.conf`:
+
+```ini
+NAIVEPANEL_SSH_INIT="/opt/etc/init.d/S51dropbear"
+```
+
+В UI видно, какой скрипт найден; если ни один не найден, кнопка выключена, а
+подсказка предлагает задать `NAIVEPANEL_SSH_INIT`. Результат (`rc`, stdout,
+stderr) показывается тостом и пишется в аудит как `ssh.restart`.
+
+Остановить или запустить SSH из панели нельзя намеренно: `stop` из браузера —
+это потеря удалённого доступа к роутеру, а `start` при загрузке делает init.
+Текущие SSH-сессии (включая SSH-туннель, через который открыта панель)
+оборвутся; если панель слушается по HTTP напрямую, на неё это не влияет.
+
+> Это init-скрипт **Entware**, а не встроенный SSH-сервер KeeneticOS.
+> Встроенный SSH (порт 22) управляется прошивкой и этой кнопкой не
+> перезапускается — панель работает с dropbear/sshd, установленным в Entware.
 
 ### Доступ из LAN
 

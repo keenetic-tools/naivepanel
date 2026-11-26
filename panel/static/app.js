@@ -288,6 +288,7 @@ let lastSysHtml = '';
 let svcKey = '';
 let svcBusy = false; // идёт POST /api/service — не перерисовывать кнопки включёнными
 let e2eBusy = false; // идёт POST /api/e2e
+let sshBusy = false; // идёт POST /api/ssh/restart
 
 // 502/503/504 — прокси/шлюз не достучался до панели: для пользователя это
 // такой же обрыв, как Failed to fetch. 401/500 — «панель ответила», баннер не
@@ -323,6 +324,7 @@ function setOffline(on) {
     // offline уже true: предикат в renderServiceButtons выключит кнопки и
     // заодно уведёт фокус с кнопки, которую сейчас скроет.
     renderServiceButtons(lastStatus || {}, true);
+    renderSsh(lastStatus || {});
     syncBannerHeight();
   }
 }
@@ -335,6 +337,7 @@ function noteOk() {
   // force только при восстановлении: ключ состояния мог не измениться, а
   // кнопки были выключены offline'ом.
   if (wasOffline) renderServiceButtons(lastStatus || {}, true);
+  if (wasOffline) renderSsh(lastStatus || {});
   if (wasOffline) flash('Связь с панелью восстановлена', true);
   return wasOffline;
 }
@@ -419,9 +422,36 @@ function renderServiceButtons(st, force) {
   for (const b of [$('btnStart'), $('btnStop'), $('btnRestart')]) b.title = why;
 }
 
+// SSH-сервер роутера: кнопка «Перезапустить SSH» активна, только если панель
+// нашла init-скрипт (status.ssh). Действие штатное, но рвёт SSH-сессии —
+// поэтому ghost + confirm, без danger-окраски.
+function renderSsh(st) {
+  const sh = (st && st.ssh) || null;
+  const btn = $('btnSshRestart');
+  if (!btn) return;
+  const available = !!(sh && sh.available);
+  const path = (sh && sh.init_script) || '';
+  btn.disabled = !available || sshBusy || offline;
+  const name = path.split('/').pop() || path;
+  $('sshInfo').textContent = available
+    ? 'SSH: ' + name
+    : 'SSH: init-скрипт не найден';
+  $('sshInfo').title = available
+    ? 'SSH-сервер роутера, init-скрипт: ' + path
+    : (path
+       ? 'init-скрипт не найден: ' + path
+         + ' — задайте NAIVEPANEL_SSH_INIT в panel.conf'
+       : 'init-скрипт SSH не найден — задайте путь в panel.conf (NAIVEPANEL_SSH_INIT)');
+  btn.title = available
+    ? 'Перезапустить SSH-сервер роутера (' + path
+      + '). Текущие SSH-сессии, включая туннель к панели, оборвутся'
+    : 'init-скрипт SSH не найден — задайте NAIVEPANEL_SSH_INIT в panel.conf';
+}
+
 function renderStatus(st) {
   lastStatus = st;
   renderServiceButtons(st);
+  renderSsh(st);
   // смена активного пресета (в т.ч. автофейловером) отражается в списке пресетов
   if (st.current !== activeName) { activeName = st.current; foRerender(); }
   // а свежие цифры фейловера приходят в каждом статусе — обновляем строку,
@@ -1479,6 +1509,34 @@ async function svc(action) {
   }
 }
 
+async function sshRestart() {
+  if (sshBusy) return;
+  if (!(await askConfirm(
+      'Перезапустить SSH-сервер роутера?\n'
+      + 'Текущие SSH-сессии оборвутся. Если панель открыта через SSH-туннель, '
+      + 'связь с ней пропадёт — туннель нужно будет поднять заново.',
+      {ok: 'Перезапустить'}))) return;
+  sshBusy = true;
+  renderSsh(lastStatus || {});
+  try {
+    const d = await jpost('/api/ssh/restart', null);
+    const failed = typeof d.rc === 'number' && d.rc !== 0;
+    flash('SSH-сервер ' + (failed
+      ? 'НЕ перезапустился: ' + (d.stderr || d.stdout || ('rc=' + d.rc))
+      : 'перезапущен'), !failed);
+  } catch (e) {
+    // Через SSH-туннель ответ может не дойти: dropbear уже перезапущен, а
+    // соединение оборвано — это не ошибка панели и не «нет связи» насовсем.
+    if (!e.httpStatus) {
+      flash('Связь оборвалась — вероятно, SSH уже перезапускается. '
+            + 'Проверьте подключение к роутеру.', false, 12000);
+    } else flash(e.message, false);
+  } finally {
+    sshBusy = false;
+    renderSsh(lastStatus || {});
+  }
+}
+
 async function panelRestart() {
   if (!(await askConfirm('Перезапустить саму панель? Страница перезагрузится, когда сервер поднимется.', {ok:'Перезапустить'}))) return;
   try {
@@ -2175,6 +2233,7 @@ const ACTIONS = {
   foUp: (arg) => foMove(arg, -1),
   foDown: (arg) => foMove(arg, 1),
   panelRestart: () => panelRestart(),
+  sshRestart: () => sshRestart(),
   rtFix: () => runtimeRepair(),
   rtRecheck: () => runtimeRecheck(),
   // одна кнопка на поток: есть обновление → применить, нет → перепроверить

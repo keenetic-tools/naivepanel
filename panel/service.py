@@ -52,6 +52,50 @@ def _service(action: str) -> dict[str, Any]:
     return _run(["/bin/sh", str(cfg.INIT_SCRIPT), action], timeout=30)
 
 
+# --- SSH-сервер роутера: только рестарт -------------------------------------
+# В отличие от naive, SSH-сервис не start/stop-аем из UI: stop кнопкой в
+# браузере — это гарантированная потеря удалённого доступа к роутеру (особенно
+# если панель открыта через SSH-туннель), а start после загрузки делает init.
+# Путь пересчитывается на каждый вызов: автопоиск увидит скрипт, появившийся
+# позже, без перезапуска панели (а NAIVEPANEL_SSH_INIT из panel.conf, как и
+# остальные настройки, применяется после рестарта самой панели).
+_SSH_LOCK = threading.Lock()  # два клика не должны рестартовать SSH одновременно
+
+
+def _ssh_init() -> Path | None:
+    """Init-скрипт SSH: явный путь из panel.conf или первый найденный кандидат."""
+    if cfg.SSH_INIT is not None:
+        return cfg.SSH_INIT
+    for candidate in cfg.SSH_INIT_CANDIDATES:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _ssh_status() -> dict[str, Any]:
+    """Блок `ssh` для /api/status: есть ли чем перезапускать (кнопка активна)."""
+    path = _ssh_init()
+    return {"available": bool(path and path.exists()),
+            "init_script": str(path) if path else None}
+
+
+def _ssh_restart() -> dict[str, Any]:
+    """Перезапустить SSH-сервер роутера: `<init> restart`, как из консоли.
+
+    Таймаут как у naive-сервиса: stop+start dropbear на слабом роутере иногда
+    занимает несколько секунд, а убитый посреди рестарта /bin/sh оставил бы
+    SSH в неопределённом состоянии. 503 — скрипта нет (подсказка в тексте).
+    """
+    path = _ssh_init()
+    if path is None or not path.exists():
+        abort(503, description=(
+            "SSH init script not found — set NAIVEPANEL_SSH_INIT in panel.conf "
+            "(default: /opt/etc/init.d/S51dropbear)"))
+    with _SSH_LOCK:
+        result = _run(["/bin/sh", str(path), "restart"], timeout=30)
+    return {**result, "init_script": str(path)}
+
+
 def _pid_is_naive(pid: int) -> bool:
     """Анти-pid-reuse: сверяем имя процесса, если /proc доступен.
 
@@ -324,6 +368,7 @@ def _runtime_restart_block() -> str | None:
 
 
 __all__ = ["PANEL_STARTED", "_pid_is_naive", "_proxy_running", "_run", "_service",
+           "_ssh_init", "_ssh_status", "_ssh_restart",
            "_runtime_modules", "_runtime_reason", "_runtime_override", "_runtime_run",
            "_runtime_hint", "_runtime_probe", "_runtime_refresh", "_runtime_status",
            "_runtime_restart_block"]
