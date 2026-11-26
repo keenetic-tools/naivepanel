@@ -2349,6 +2349,19 @@ def test_status_runtime_carries_ssh_hint(app, monkeypatch):
     assert rt["hint"] == f"{sys.executable} -m pip install --no-cache-dir flask"
 
 
+def test_runtime_status_probes_on_fresh_boot(app, monkeypatch):
+    # time.monotonic() на только что загруженной машине меньше RECHECK_S:
+    # probed_at=0.0 делал первый статус «свежим» и не запускал фоновый
+    # пробник — forced-broken вердикт оставался ok (CI на свежих раннерах).
+    monkeypatch.setattr(app.svc, "time", types.SimpleNamespace(monotonic=lambda: 3.0))
+    monkeypatch.setenv("NAIVEPANEL_RUNTIME_OVERRIDE", "broken")
+    first = app.svc._runtime_status()
+    assert first["checking"] is True
+    app.svc._RUNTIME["thread"].join(10)
+    rt = app.svc._runtime_status()
+    assert rt["state"] == "broken" and "flask" in rt["detail"]
+
+
 def test_status_surfaces_broken_runtime_after_background_probe(app, monkeypatch):
     svc = _runtime_real(app, monkeypatch)
     monkeypatch.setenv("NAIVEPANEL_RUNTIME_OVERRIDE", "broken")
