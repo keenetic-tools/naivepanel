@@ -1522,6 +1522,63 @@ def test_duplicate_without_name_keeps_auto_naming(client):
     assert r.status_code == 201 and r.get_json()["name"] == "home-copy3"
 
 
+# --- пустой listen = адрес по умолчанию ----------------------------------------
+
+def _stored(app, name):
+    return json.loads((app.CONF_D / f"{name}.json").read_text())
+
+
+def test_empty_listen_saves_default(client, app, env):
+    """Пустое поле Listen → socks://127.0.0.1:1080 записанным адресом, а не
+    отсутствующим ключом: пресет остаётся полноценным для остального кода."""
+    default = app.pres._DEFAULT_LISTEN
+    assert default == "socks://127.0.0.1:1080"
+    for i, bad in enumerate(("", "  \n ", [])):
+        r, _ = _create(client, name=f"d{i}", listen=bad)
+        assert r.status_code == 201
+        assert _stored(app, f"d{i}")["listen"] == default
+    payload = {"name": "nokey", "upstream": "proxy.example.com",
+               "username": "user", "password": "p"}
+    assert client.post("/api/configs", json=payload, headers=CSRF).status_code == 201
+    assert _stored(app, "nokey")["listen"] == default
+    listed = {p["name"]: p for p in client.get("/api/configs").get_json()}
+    assert (listed["d0"]["listen"], listed["d0"]["listen_count"]) == (default, 1)
+    # активируется как любой другой: config.json получает тот же адрес
+    stub, _ = _stub_init(env)
+    app.cfg.INIT_SCRIPT = stub
+    assert client.post("/api/configs/d0/activate", headers=CSRF).status_code == 200
+    active = json.loads(app.cfg.ACTIVE_CONFIG.read_text())
+    assert active["listen"] == default
+    # upstream по-прежнему обязателен
+    r, _ = _create(client, name="noproxy", listen="", upstream="")
+    assert r.status_code == 400
+    assert r.get_json()["error"] == "name, upstream are required"
+
+
+def test_put_empty_listen_resets_to_default(client, app):
+    _create(client, listen="127.0.0.1:1080,http://127.0.0.1:8080")
+    assert isinstance(_stored(app, "home")["listen"], list)
+    r = client.put("/api/configs/home", headers=CSRF, json={
+        "name": "home", "listen": "\n", "upstream": "proxy.example.com",
+        "username": "user", "password": ""})  # пароль — прежний
+    assert r.status_code == 200
+    assert _stored(app, "home") == {
+        "listen": "socks://127.0.0.1:1080",
+        "proxy": "https://user:p%40ss%3Aword@proxy.example.com"}
+
+
+def test_listen_default_applies_to_form_only(client, app):
+    """Умолчание — путь формы; хранимый формат остаётся строгим (listen
+    обязателен): активировать или импортировать конфиг без listen нельзя."""
+    app._ensure_dirs()
+    (app.CONF_D / "handmade.json").write_text('{"proxy": "https://h"}')
+    r = client.post("/api/configs/handmade/activate", headers=CSRF)
+    assert r.status_code == 400 and "listen" in r.get_json()["error"]
+    d = client.post("/api/configs/import", headers=CSRF,
+                    json={"presets": {"x": {"proxy": "https://h"}}}).get_json()
+    assert d["imported"] == [] and "listen" in d["skipped"][0]["reason"]
+
+
 # --- валидация перед активацией --------------------------------------------------
 
 def test_activate_rejects_broken_preset(client, app):
@@ -7005,6 +7062,15 @@ def test_ui_duplicate_name_hint_mirrors_server_rules(app):
     ru = _ui_fn(html, "ruError")
     assert "already exists" in ru and "is reserved" in ru
     assert "Пресет с таким именем уже есть." in html
+
+
+def test_ui_listen_field_is_optional(app):
+    html = _ui_all()
+    assert "по умолчанию 127.0.0.1:1080" in html  # placeholder пустого поля
+    quick = _ui_fn(html, "quickImport")
+    assert "проверьте имя и сохраните" in quick
+    # после разборки URI фокус — на имя, а не на необязательный listen
+    assert "$('f_name').select()" in quick and "$('f_listen').focus()" not in quick
 
 
 def test_p0_failover_order_is_a_dialog(app):

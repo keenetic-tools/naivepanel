@@ -120,11 +120,12 @@
       <label for="f_name">Имя пресета (латиница, цифры, _ - .; до 64 символов)</label>
       <input id="f_name" pattern="[a-zA-Z0-9_\-.]{1,64}" autocomplete="off" spellcheck="false">
 
-      <label for="f_listen">Listen — один или несколько адресов</label>
-      <textarea id="f_listen" rows="2" placeholder="127.0.0.1:1080&#10;http://127.0.0.1:8080" style="min-height:48px"></textarea>
+      <label for="f_listen">Listen — один или несколько адресов (можно оставить пустым)</label>
+      <textarea id="f_listen" rows="2" placeholder="по умолчанию 127.0.0.1:1080" style="min-height:48px"></textarea>
       <div style="font-size:11px;color:var(--mut);margin-top:4px">
-        По одному на строку или через запятую. Без схемы добавляется
-        <code style="color:var(--acc)">socks://</code>; разрешены схемы
+        Пустое поле — <code style="color:var(--acc)">127.0.0.1:1080</code>,
+        как у самого naive. По одному на строку или через запятую. Без схемы
+        добавляется <code style="color:var(--acc)">socks://</code>; разрешены схемы
         <code style="color:var(--acc)">socks://</code>,
         <code style="color:var(--acc)">socks5://</code>,
         <code style="color:var(--acc)">http://</code> (порт 1–65535,

@@ -244,7 +244,13 @@ grep -q 'p%40ss%3Aword' /opt/etc/naive/proxy/conf.d/home-renamed.json \
 code=\$(curl -s -o /dev/null -w '%{http_code}' \$H -H 'Content-Type: application/json' \
   -d '{"name":"home-renamed"}' http://127.0.0.1:8089/api/configs/home/duplicate)
 [ "\$code" = "409" ] || { echo "FAIL: duplicate onto existing name answered \$code (expect 409)"; exit 1; }
-echo "duplicate with custom name: OK"
+# пустой listen → socks://127.0.0.1:1080
+code=\$(curl -s -o /dev/null -w '%{http_code}' \$H -H 'Content-Type: application/json' \
+  -d '{"name":"dflt","upstream":"proxy.example.com","username":"user","password":"p@ss:word"}' \
+  http://127.0.0.1:8089/api/configs)
+[ "\$code" = "201" ] && grep -q '"listen": "socks://127.0.0.1:1080"' /opt/etc/naive/proxy/conf.d/dflt.json \
+  || { echo "FAIL: empty listen not defaulted (code=\$code)"; exit 1; }
+echo "duplicate with custom name + default listen: OK"
 # сервер: waitress, если установился, иначе Werkzeug — оба допустимы
 echo "server: \$(curl -sI http://127.0.0.1:8089/api/status | tr -d '\r' | sed -n 's/^[Ss]erver: //p')"
 

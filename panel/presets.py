@@ -171,6 +171,12 @@ def _list_presets() -> list[dict[str, Any]]:
     return out
 
 
+# Пустое поле listen в форме = этот адрес (умолчание бинарника naive,
+# DEFAULT_LISTEN). Пишем его в пресет явно, а не отсутствующим ключом:
+# тогда _validate_cfg, PAC и список продолжают видеть listen как обычно.
+_DEFAULT_LISTEN = "socks://127.0.0.1:1080"
+
+
 def _normalize_listen(raw: str) -> str | None:
     """Один listen-адрес → URI. Без схемы добавляет socks://.
 
@@ -191,6 +197,7 @@ def _build_payload(data: dict[str, Any], old_proxy: str | None = None) -> dict[s
     listen принимает строку (несколько адресов через запятую/перенос) или массив;
     при одном адресе → строка, при нескольких → массив. Пример массива:
       `{"listen": ["socks://127.0.0.1:1080","http://127.0.0.1:8080"], ...}`
+    Пустой listen — адрес по умолчанию (_DEFAULT_LISTEN).
 
     upstream поддерживает два формата:
       - `https://user:pass@host[:port]` — полный proxy URL, передаётся как есть
@@ -214,8 +221,10 @@ def _build_payload(data: dict[str, Any], old_proxy: str | None = None) -> dict[s
         parts = []
     listen_uris = [u for u in (_normalize_listen(p) for p in parts) if u]
 
-    if not (name and listen_uris and upstream):
-        abort(400, description="name, listen, upstream are required")
+    if not (name and upstream):
+        abort(400, description="name, upstream are required")
+    if not listen_uris:
+        listen_uris = [_DEFAULT_LISTEN]
 
     # Один адрес → строка (компактнее), несколько → массив
     listen = listen_uris[0] if len(listen_uris) == 1 else listen_uris
@@ -437,7 +446,7 @@ def _upstream_endpoint(upstream: str) -> tuple[str, int] | None:
 
 
 __all__ = [
-    "_LISTEN_MAX", "_LISTEN_SCHEMES", "_active_name", "_build_payload",
+    "_DEFAULT_LISTEN", "_LISTEN_MAX", "_LISTEN_SCHEMES", "_active_name", "_build_payload",
     "_for_edit", "_listen_problem", "_list_presets", "_load_json",
     "_mask_creds", "_name_suggest", "_normalize_listen", "_save_json",
     "_split_proxy", "_summary", "_upstream_endpoint", "_validate_cfg",
