@@ -233,6 +233,18 @@ bad=\$(curl -s -o /tmp/bad.json -w '%{http_code}' \$H -H 'Content-Type: applicat
   http://127.0.0.1:8089/api/configs)
 echo "scheme reject=\$bad (expect 400)"
 [ "\$bad" = "400" ] || { echo "FAIL: file:// scheme accepted"; cat /tmp/bad.json; exit 1; }
+# имя копии в теле duplicate («переименование» через копию): пароль перенесён,
+# занятое имя не затирается
+code=\$(curl -s -o /tmp/dup.json -w '%{http_code}' \$H -H 'Content-Type: application/json' \
+  -d '{"name":"home-renamed"}' http://127.0.0.1:8089/api/configs/home/duplicate)
+[ "\$code" = "201" ] && grep -q 'home-renamed' /tmp/dup.json \
+  || { echo "FAIL: duplicate with custom name answered \$code"; cat /tmp/dup.json; exit 1; }
+grep -q 'p%40ss%3Aword' /opt/etc/naive/proxy/conf.d/home-renamed.json \
+  || { echo "FAIL: copy lost the password"; exit 1; }
+code=\$(curl -s -o /dev/null -w '%{http_code}' \$H -H 'Content-Type: application/json' \
+  -d '{"name":"home-renamed"}' http://127.0.0.1:8089/api/configs/home/duplicate)
+[ "\$code" = "409" ] || { echo "FAIL: duplicate onto existing name answered \$code (expect 409)"; exit 1; }
+echo "duplicate with custom name: OK"
 # сервер: waitress, если установился, иначе Werkzeug — оба допустимы
 echo "server: \$(curl -sI http://127.0.0.1:8089/api/status | tr -d '\r' | sed -n 's/^[Ss]erver: //p')"
 

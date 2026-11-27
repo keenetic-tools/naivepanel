@@ -1482,6 +1482,46 @@ def test_duplicate_counter_and_missing(client):
     assert client.post("/api/configs/home/duplicate").status_code == 403
 
 
+def test_duplicate_with_custom_name(client, app, env):
+    """Имя копии в теле — способ «переименовать»: rename у имени-ключа нет."""
+    _create(client)
+    r = client.post("/api/configs/home/duplicate", headers=CSRF, json={"name": " office "})
+    assert r.status_code == 201
+    assert r.get_json() == {"name": "office", "copied_from": "home"}
+    copy = json.loads((app.CONF_D / "office.json").read_text())
+    assert copy == json.loads((app.CONF_D / "home.json").read_text())  # с паролем
+    assert not (app.CONF_D / "home-copy.json").exists()  # автоимя не использовано
+    events = [e for e in _audit_lines(env) if e["event"] == "preset.duplicate"]
+    assert (events[0]["name"], events[0]["copied_from"]) == ("office", "home")
+
+
+def test_duplicate_custom_name_validation(client, app):
+    _create(client)
+    _create(client, name="work")
+    url = "/api/configs/home/duplicate"
+    # правила те же, что у create
+    assert client.post(url, headers=CSRF, json={"name": "bad name!"}).status_code == 400
+    assert client.post(url, headers=CSRF, json={"name": "export"}).status_code == 400
+    assert client.post(url, headers=CSRF, json={"name": 5}).status_code == 400
+    # занято — включая имя самого источника: копия не затирает оригинал
+    for taken in ("work", "home"):
+        r = client.post(url, headers=CSRF, json={"name": taken})
+        assert r.status_code == 409, taken
+    assert sorted(p.stem for p in app.CONF_D.glob("*.json")) == ["home", "work"]
+
+
+def test_duplicate_without_name_keeps_auto_naming(client):
+    _create(client)
+    # без тела (старый клиент) и с пустым именем — прежние name-copy, name-copy2
+    assert client.post("/api/configs/home/duplicate", headers=CSRF) \
+        .get_json()["name"] == "home-copy"
+    assert client.post("/api/configs/home/duplicate", headers=CSRF, json={"name": ""}) \
+        .get_json()["name"] == "home-copy2"
+    # не-объект в теле — как отсутствие поля, а не 500
+    r = client.post("/api/configs/home/duplicate", headers=CSRF, json=["x"])
+    assert r.status_code == 201 and r.get_json()["name"] == "home-copy3"
+
+
 # --- валидация перед активацией --------------------------------------------------
 
 def test_activate_rejects_broken_preset(client, app):
@@ -6933,6 +6973,38 @@ def test_p0_preset_menu_has_labelled_actions(app):
         assert label in menu, label
     assert "isActivePreset" in menu
     assert "presetMenuDlg" in menu or "showModal" in menu
+
+
+def test_ui_duplicate_dialog_asks_for_copy_name(app):
+    """«Дублировать» — диалог с именем копии (переименование через копию),
+    а не мгновенное name-copy: имя предлагается, но заменяется вводом."""
+    html = _ui_html()
+    assert 'id="dupDlg"' in html and 'aria-labelledby="dupTitle"' in html
+    assert 'id="dupName"' in html and 'id="btnDup"' in html
+    assert 'data-action="dupClose"' in html
+    assert "dupClose: () => $('dupDlg').close()" in html
+    opener = _ui_fn(html, "dupPreset")
+    assert "suggestCopyName" in opener and "showModal" in opener
+    assert "$('dupName').select()" in opener  # ввод заменяет предложенное имя
+    submit = _ui_fn(html, "submitDuplicate")
+    assert "/duplicate" in submit and "{name: wanted}" in submit
+    # предложенное имя — схема сервера: name-copy, при занятости name-copy2
+    assert "slice(0, 58)" in _ui_fn(html, "suggestCopyName")
+    # отмена возвращает фокус на триггер («⋯» строки)
+    closing = re.search(r"\$\('dupDlg'\)\.addEventListener\('close'[\s\S]*?\n\}\);", html)
+    assert closing and "focusPresetMenuTrigger" in closing.group(0)
+
+
+def test_ui_duplicate_name_hint_mirrors_server_rules(app):
+    html = _ui_html()
+    check = _ui_fn(html, "nameProblem")
+    assert "NAME_RE.test(name)" in check
+    for taken in ("'export'", "'import'", "nameTaken(name)"):
+        assert taken in check, taken
+    # серверные ответы о занятом/служебном имени — по-русски
+    ru = _ui_fn(html, "ruError")
+    assert "already exists" in ru and "is reserved" in ru
+    assert "Пресет с таким именем уже есть." in html
 
 
 def test_p0_failover_order_is_a_dialog(app):

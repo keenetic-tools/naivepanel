@@ -369,6 +369,11 @@ def api_configs_duplicate(name: str):
     Через UI (GET → форма → POST) пароль не переносится: GET его не отдаёт,
     а create требует креды для host-only upstream. Копирование файла на
     сервере сохраняет работоспособный конфиг без повторного ввода секрета.
+
+    Имя копии — необязательное поле `name` в теле. Имя пресета — ключ файла,
+    `.active` и цепочки фейловера, отдельного rename нет: «переименовать» —
+    это копия под новым именем, правка остальных полей и удаление старого.
+    Правила те же, что у create; без поля — name-copy, name-copy2…
     """
     if not cfg.NAME_RE.match(name):
         abort(400, description="invalid name")
@@ -376,15 +381,28 @@ def api_configs_duplicate(name: str):
     if not src.exists():
         abort(404, description=f"preset {name!r} not found")
     cfgd = pres._load_json(src)
-    # имя копии: name-copy, при занятости name-copy2, name-copy3… cfg.NAME_RE
-    # допускает 64 символа — урезаем базу, чтобы суффикс всегда влез
-    base = f"{name}-copy"[:58]
-    candidate, n = base, 2
-    while (cfg.CONF_D / f"{candidate}.json").exists():
-        if n > 99:
-            abort(409, description=f"too many copies of {name!r}")
-        candidate = f"{base}{n}"
-        n += 1
+    data = request.get_json(silent=True)
+    wanted = data.get("name") if isinstance(data, dict) else None
+    if wanted is not None and not isinstance(wanted, str):
+        abort(400, description="invalid name")
+    candidate = (wanted or "").strip()
+    if candidate:
+        if not cfg.NAME_RE.match(candidate):
+            abort(400, description="invalid name")
+        if candidate in cfg.RESERVED_NAMES:
+            abort(400, description=f"name {candidate!r} is reserved")
+        if (cfg.CONF_D / f"{candidate}.json").exists():
+            abort(409, description=f"preset {candidate!r} already exists")
+    else:
+        # имя копии: name-copy, при занятости name-copy2, name-copy3…
+        # cfg.NAME_RE допускает 64 символа — урезаем базу, чтобы суффикс влез
+        base = f"{name}-copy"[:58]
+        candidate, n = base, 2
+        while (cfg.CONF_D / f"{candidate}.json").exists():
+            if n > 99:
+                abort(409, description=f"too many copies of {name!r}")
+            candidate = f"{base}{n}"
+            n += 1
     pres._save_json(cfg.CONF_D / f"{candidate}.json", cfgd)
     sec._audit("preset.duplicate", name=candidate, copied_from=name)
     return jsonify({"name": candidate, "copied_from": name}), 201

@@ -52,6 +52,11 @@ function ruError(msg, status) {
   if (msg && ERROR_RU[msg]) return ERROR_RU[msg];
   if (typeof msg === 'string' && /^preset .+ not found$/.test(msg))
     return 'Пресет не найден — обновите список.';
+  // имена в этих ответах — имена пресетов (NAME_RE), кавычки — repr Python
+  if (typeof msg === 'string' && /^preset '.+' already exists$/.test(msg))
+    return 'Пресет с таким именем уже есть.';
+  if (typeof msg === 'string' && /^name '.+' is reserved$/.test(msg))
+    return 'Это имя занято служебными адресами панели (export, import).';
   if (status === 401) return 'Неверный пароль. Войдите заново.';
   if (status === 403) return 'Доступ запрещён.';
   if (status === 429) return 'Слишком много запросов. Попробуйте позже.';
@@ -1080,14 +1085,104 @@ async function closeEditor() {
   if (!focusPresetRow(name)) $('search').focus();
 }
 
-async function dupPreset(name) {
+// --- Дублирование с именем копии ---------------------------------------------
+// Имя пресета — идентификатор (файл, .active, цепочка фейловера), отдельного
+// rename нет: «переименовать» = копия под новым именем, правка остальных
+// полей, удаление старого. Диалог предлагает name-copy — имя можно заменить.
+let dupSrc = null;  // какой пресет дублируем
+let dupDone = false; // закрыт после успешного запроса (фокус решает редактор)
+
+// Правила имени — зеркала серверных NAME_RE и RESERVED_NAMES: подсказка по
+// ходу ввода, окончательно решает сервер (400/409 придут в ту же строку).
+const NAME_RE = /^[a-zA-Z0-9_\-.]{1,64}$/;
+const nameTaken = name => lastPresets.some(p => p.name === name);
+function nameProblem(name) {
+  if (!name) return 'введите имя';
+  if (!NAME_RE.test(name)) return 'латиница, цифры, _ - .; до 64 символов';
+  if (name === 'export' || name === 'import') return 'имя занято служебным адресом панели';
+  if (nameTaken(name)) return 'пресет с таким именем уже есть';
+  return '';
+}
+
+// Предложение имени копии — схема сервера без поля name: name-copy, при
+// занятости name-copy2… (база урезана, чтобы суффикс влез в 64 символа).
+function suggestCopyName(name) {
+  const base = (name + '-copy').slice(0, 58);
+  let candidate = base;
+  for (let n = 2; nameTaken(candidate); n++) candidate = base + n;
+  return candidate;
+}
+
+// «⋯» строки пресета — триггер диалога дублирования; фокус после закрытия
+// возвращается сюда по имени (кнопка могла перерисоваться, пока диалог открыт).
+function focusPresetMenuTrigger(name) {
+  const kebab = [...document.querySelectorAll('ul.presets .kebab')]
+    .find(b => b.dataset.arg === name);
+  if (!kebab) return false;
+  kebab.focus({preventScroll:true});
+  return true;
+}
+
+function setDupHint(msg) {
+  $('dupHint').textContent = msg;
+  $('dupHint').classList.toggle('bad', !!msg);
+}
+
+function dupPreset(name) {
+  const p = lastPresets.find(x => x.name === name);
+  if (!p || $('dupDlg').open) return;
+  dupSrc = name;
+  dupDone = false;
+  let sub = 'Копия «' + name + '» перенесёт пароль.';
+  if (isActivePreset(p)) sub += ' Оригинал активен: удалить его можно будет после переключения на копию.';
+  if (foChainArr.includes(name)) sub += ' В цепочку фейловера копия не входит — добавьте её заново.';
+  $('dupSub').textContent = sub;
+  $('dupName').value = suggestCopyName(name);
+  setDupHint('');
+  $('btnDup').disabled = false;
+  $('dupDlg').showModal();
+  $('dupName').focus();
+  $('dupName').select(); // предложенное имя заменяется вводом
+}
+
+async function submitDuplicate(e) {
+  e.preventDefault();
+  if (!dupSrc) return;
+  const wanted = $('dupName').value.trim();
+  const problem = nameProblem(wanted);
+  if (problem) { setDupHint(problem); $('dupName').focus(); return; }
+  const btn = $('btnDup');
+  btn.disabled = true;
+  setDupHint('создаю…');
   try {
-    const d = await jpost('/api/configs/'+encodeURIComponent(name)+'/duplicate', null);
+    const d = await jpost('/api/configs/'+encodeURIComponent(dupSrc)+'/duplicate', {name: wanted});
+    dupDone = true;
+    $('dupDlg').close();
     flash('Скопирован: '+d.name+' (пароль перенесён)', true);
     await refreshAll();
-    selectPreset(d.name);
-  } catch (e) { flash(e.message, false); }
+    await selectPreset(d.name);
+    // Редактор не открылся (подтверждение на грязном черновике отменено):
+    // список перерисован, фокус остался на удалённой кнопке «⋯» или на <body>.
+    if (current !== d.name) focusPresetMenuTrigger(dupSrc);
+  } catch (err) {
+    setDupHint(err.message);
+    btn.disabled = false;
+    $('dupName').focus();
+    $('dupName').select();
+  }
 }
+$('dupForm').addEventListener('submit', submitDuplicate);
+$('dupName').addEventListener('input', () => {
+  const v = $('dupName').value.trim();
+  setDupHint(v ? nameProblem(v) : '');
+});
+// Отмена (Esc, «Отмена»): браузер возвращает фокус на элемент, бывший в фокусе
+// до showModal, — обычно это «⋯» (закрытое меню возвращает фокус синхронно).
+// Но строка могла перерисоваться, пока диалог был открыт: записанная кнопка
+// уже detached, и фокус ушёл бы на <body>. Возвращаем на «⋯» по имени.
+$('dupDlg').addEventListener('close', () => {
+  if (!dupDone) focusPresetMenuTrigger(dupSrc);
+});
 
 function togglePw() {
   const i = $('f_password'), b = $('btnPw');
@@ -2250,6 +2345,7 @@ const ACTIONS = {
   rbClose: () => $('rbDlg').close(),
   pwOpen: () => openPassword(),
   pwClose: () => $('pwDlg').close(),
+  dupClose: () => $('dupDlg').close(),
   logout: () => doLogout(),
   tgTest: () => testTelegram(),
   tgOff: () => offTelegram(),
