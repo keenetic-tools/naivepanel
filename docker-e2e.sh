@@ -16,8 +16,8 @@
 set -eu
 
 REPO_DIR=$(cd "$(dirname "$0")" && pwd)
-REF=v0.29.1
-NEXT_REF=v0.29.2
+REF=v0.30.0
+NEXT_REF=v0.30.1
 BASE_IMAGE="${BASE_IMAGE:-debian:bookworm-slim}"
 AUTH_FLAG=""
 MODE_FLAGS="--yes"
@@ -84,7 +84,7 @@ for root in (current, next_release):
                   flags=re.M)
     if root == next_release:
         config = root / "panel/config.py"
-        config.write_text(re.sub(r'^APP_VERSION = .*$', 'APP_VERSION = "0.29.2"',
+        config.write_text(re.sub(r'^APP_VERSION = .*$', 'APP_VERSION = "0.30.1"',
                                  config.read_text(encoding="utf-8"), flags=re.M),
                           encoding="utf-8")
         text = text.replace("set -u\n", """set -u
@@ -402,7 +402,7 @@ attempt = json.load(open("/tmp/self-update-first.json", encoding="utf-8"))
 assert attempt["started"] is True
 assert attempt["attempt_started"] > 0
 assert attempt["pid"] > 0
-assert attempt["target"] == "v0.29.2"
+assert attempt["target"] == "v0.30.1"
 PY
 phase=""
 for i in \$(seq 1 60); do
@@ -419,13 +419,13 @@ python3 - <<'PY'
 import json
 state = json.load(open("/tmp/self-update-first-state.json", encoding="utf-8"))["state"]
 assert state["exit_code"] == 3, state
-assert state["target"] == "v0.29.2", state
+assert state["target"] == "v0.30.1", state
 assert "code 3" in state["error"], state
 PY
 after=\$(sha256sum /opt/etc/naive/panel/naivepanel.py | cut -d' ' -f1)
 [ "\$before" = "\$after" ] || { echo "FAIL: failed attempt changed panel files"; exit 1; }
 curl -fsS "\$PANEL_URL/api/status" > /tmp/self-update-before-retry.json
-python3 -c 'import json; assert json.load(open("/tmp/self-update-before-retry.json"))["version"] == "0.29.1"'
+python3 -c 'import json; assert json.load(open("/tmp/self-update-before-retry.json"))["version"] == "0.30.0"'
 
 echo "==> self-update: manual retry installs the signed release"
 code=\$(curl -s -o /tmp/self-update-retry.json -w '%{http_code}' \$H -X POST \
@@ -438,14 +438,14 @@ first = json.load(open("/tmp/self-update-first.json", encoding="utf-8"))
 retry = json.load(open("/tmp/self-update-retry.json", encoding="utf-8"))
 assert retry["attempt_started"] >= first["attempt_started"]
 assert retry["pid"] != first["pid"]
-assert retry["target"] == "v0.29.2"
+assert retry["target"] == "v0.30.1"
 PY
 updated=0
 for i in \$(seq 1 120); do
   if curl -fsS --connect-timeout 2 --max-time 3 "\$PANEL_URL/api/status" \
       > /tmp/self-update-status.json 2>/dev/null; then
     version=\$(python3 -c 'import json; print(json.load(open("/tmp/self-update-status.json"))["version"])')
-    if [ "\$version" = "0.29.2" ]; then
+    if [ "\$version" = "0.30.1" ]; then
       updated=1
       break
     fi
@@ -453,7 +453,7 @@ for i in \$(seq 1 120); do
   sleep 1
 done
 [ "\$updated" = "1" ] || {
-  echo "FAIL: signed retry did not bring up v0.29.2"
+  echo "FAIL: signed retry did not bring up v0.30.1"
   cat /opt/var/log/naivepanel-update.log /opt/var/log/naivepanel.log; exit 1
 }
 curl -fsS "\$PANEL_URL/api/update/log?lines=60" > /tmp/self-update-final.json
@@ -461,11 +461,11 @@ python3 - <<'PY'
 import json
 state = json.load(open("/tmp/self-update-final.json", encoding="utf-8"))["state"]
 assert state["phase"] == "done", state
-assert state["target"] == "v0.29.2", state
+assert state["target"] == "v0.30.1", state
 PY
 grep -q 'release signature verified' /opt/var/log/naivepanel-update.log \
   || { echo "FAIL: retry did not verify the release signature"; exit 1; }
-echo "self-update: signed retry succeeded (v0.29.2, state done)"
+echo "self-update: signed retry succeeded (v0.30.1, state done)"
 
 echo "==> runtime gate: python deps broken under a running panel"
 # Имитируем то, что делает opkg upgrade со сменившимся minor Python: pip-пакеты
